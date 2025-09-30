@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
+    "types": [],
+    "outDir": "./dist/types/browser"
+  },
+  "include": [
+    "core/**/*.ts",
+    "groups/**/*.ts",
+    "index.ts"
+  ],
+  "exclude": [
+    "**/*.node.ts",
+    "tests/**/*",
+    "examples/**/*",
+    "benchmark/**/*"
+  ]
+}

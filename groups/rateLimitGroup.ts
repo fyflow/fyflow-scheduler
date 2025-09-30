@@ -1,0 +1,144 @@
+export interface RateWindow {
+  limit: number;      // Maximum requests allowed
+  windowMs: number;   // Time window in milliseconds
+}
+
+export class RateLimitGroup {
+  private windows: RateWindow[];
+  private requestCounts: Map<string, [number, number][]> = new Map(); // windowIndex -> [timestamp, count][]
+  private runningStartTimes: number[] = []; // Track start times of currently running tasks
+  private running = 0;
+
+  constructor(windows: RateWindow[]) {
+    this.windows = windows;
+    // Initialize request tracking for each window
+    this.windows.forEach((_, index) => {
+      this.requestCounts.set(index.toString(), []);
+    });
+  }
+
+  /**
+   * Check if a new request can be accepted based on all rate limit windows
+   */
+  canRun(): boolean {
+    const now = Date.now();
+
+    // Check each window to see if we're within limits
+    for (let i = 0; i < this.windows.length; i++) {
+      const window = this.windows[i];
+      const windowKey = i.toString();
+      const requests = this.requestCounts.get(windowKey)!;
+
+      // Clean up old completed requests outside the current window
+      const windowStart = now - window.windowMs;
+      const validCompletedRequests = requests.filter(([timestamp]) => timestamp >= windowStart);
+      this.requestCounts.set(windowKey, validCompletedRequests);
+
+      // Count currently running requests that started within this window
+      const validRunningRequests = this.runningStartTimes.filter(startTime => startTime >= windowStart);
+
+      // Total requests in window = completed + running
+      const totalRequestsInWindow = validCompletedRequests.length + validRunningRequests.length;
+
+      // Check if adding one more request would exceed the limit
+      if (totalRequestsInWindow >= window.limit) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Called when a task starts - tracks running count and reserves slot in rate limit
+   */
+  onStart(): void {
+    const now = Date.now();
+    this.running++;
+    this.runningStartTimes.push(now);
+  }
+
+  /**
+   * Called when a task finishes - records completion in rate limit windows and removes from running
+   */
+  onFinish(): void {
+    const now = Date.now();
+    this.running = Math.max(0, this.running - 1);
+
+    // Remove the oldest running start time (FIFO)
+    if (this.runningStartTimes.length > 0) {
+      this.runningStartTimes.shift();
+    }
+
+    // Record this completed request in all windows
+    this.windows.forEach((_, index) => {
+      const windowKey = index.toString();
+      const requests = this.requestCounts.get(windowKey)!;
+      requests.push([now, 1]);
+    });
+  }
+
+  /**
+   * Get current status for monitoring
+   */
+  getStatus() {
+    const now = Date.now();
+    const windowStatus = this.windows.map((window, index) => {
+      const windowKey = index.toString();
+      const requests = this.requestCounts.get(windowKey)!;
+      const windowStart = now - window.windowMs;
+
+      // Count completed requests in window
+      const completedInWindow = requests.filter(([timestamp]) => timestamp >= windowStart).length;
+
+      // Count running requests that started in window
+      const runningInWindow = this.runningStartTimes.filter(startTime => startTime >= windowStart).length;
+
+      // Total requests in window
+      const currentCount = completedInWindow + runningInWindow;
+
+      return {
+        limit: window.limit,
+        windowMs: window.windowMs,
+        current: currentCount,
+        completed: completedInWindow,
+        running: runningInWindow,
+        remaining: Math.max(0, window.limit - currentCount),
+        resetTime: windowStart + window.windowMs
+      };
+    });
+
+    return {
+      running: this.running,
+      windows: windowStatus,
+      canAcceptNew: this.canRun()
+    };
+  }
+
+  /**
+   * Clear all rate limit history (useful for testing or reset)
+   */
+  reset(): void {
+    this.requestCounts.clear();
+    this.windows.forEach((_, index) => {
+      this.requestCounts.set(index.toString(), []);
+    });
+    this.runningStartTimes = [];
+    this.running = 0;
+  }
+
+  /**
+   * Helper to create common rate limit configurations
+   */
+  static createWindows(configs: Array<{limit: number, seconds: number}>): RateWindow[] {
+    return configs.map(config => ({
+      limit: config.limit,
+      windowMs: config.seconds * 1000
+    }));
+  }
+}
+
+// Helper function to create rate limit group with common patterns
+export function createRateLimitGroup(configs: Array<{limit: number, seconds: number}>): RateLimitGroup {
+  return new RateLimitGroup(RateLimitGroup.createWindows(configs));
+}

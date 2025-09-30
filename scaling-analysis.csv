@@ -1,0 +1,5 @@
+Test Name,Task Count,CPU Slots,Worker Type,Max Threads,Max Concurrent Tasks,Total Duration (ms),Scheduler Overhead (ms),Async Execution Overhead (ms),Task Throughput (tasks/sec),Memory Delta (bytes),Peak Memory (bytes),Avg Dispatch Time (ms),Max Dispatch Time (ms),Dispatch Iterations,Groups,Group Limit
+"Large Volume - 1K Independent Tasks",1000,8,Inline,4,5,140.85,0.00,0.00,7180.02,2388392,8910936,0.0009,0.4846,2000,0,0
+"Large Volume - 10K Independent Tasks",10000,8,Inline,4,10,88.91,0.01,84.44,118431.35,10162272,19562416,0.0006,1.8720,20000,0,0
+"Large Volume - 50K Independent Tasks",50000,16,Inline,8,20,5915.08,0.05,5889.63,8489.50,75210664,98694624,0.0005,10.6912,100000,0,0
+"Memory Pressure - 100K Tasks",100000,16,Inline,8,50,19148.68,0.05,19128.70,5227.75,-27300320,87785152,0.0003,9.1438,200000,0,0

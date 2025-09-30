@@ -1,0 +1,40 @@
+{
+  "name": "@fyflow/scheduler",
+  "version": "0.1.0",
+  "description": "DAG-based task scheduler with resource management, worker pools, and cross-platform support",
+  "license": "MIT",
+  "homepage": "https://github.com/fyflow/fyflow-scheduler",
+  "repository": {
+    "type": "github",
+    "url": "https://github.com/fyflow/fyflow-scheduler"
+  },
+  "bugs": {
+    "url": "https://github.com/fyflow/fyflow-scheduler/issues"
+  },
+  "exports": {
+    ".": "./index.ts"
+  },
+  "publish": {
+    "exclude": [
+      "node_modules",
+      "dist",
+      "tests",
+      "examples",
+      "benchmark",
+      "*.config.js",
+      ".vscode",
+      ".claude",
+      "package*.json",
+      "tsconfig*.json"
+    ]
+  },
+  "compilerOptions": {
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "allowJs": false,
+    "checkJs": false
+  }
+}

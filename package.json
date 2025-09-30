@@ -1,0 +1,74 @@
+{
+  "name": "fyflow-scheduler",
+  "version": "0.1.0",
+  "description": "DAG-based task scheduler with resource management, worker pools, and cross-platform support",
+  "main": "./dist/node/index.js",
+  "browser": "./dist/browser/index.js",
+  "types": "./dist/types/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.js",
+    "build:dev": "node esbuild.config.js --dev",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build",
+    "test": "npm run build:dev && node dev-dist/node/tests/runner.js",
+    "test:core": "npm run build:dev && node dev-dist/node/tests/runner.js core",
+    "test:error": "npm run build:dev && node dev-dist/node/tests/runner.js error",
+    "test:performance": "npm run build:dev && node dev-dist/node/tests/runner.js performance",
+    "test:deno": "deno task test",
+    "test:deno:core": "deno task test:core",
+    "test:deno:error": "deno task test:error",
+    "test:browser": "npm run build:dev && npx playwright test",
+    "test:browser:headed": "npm run build:dev && npx playwright test --headed",
+    "test:browser:debug": "npm run build:dev && npx playwright test --debug",
+    "test:browser:chromium": "npm run build:dev && npx playwright test --project=chromium",
+    "test:browser:firefox": "npm run build:dev && npx playwright test --project=firefox",
+    "test:browser:webkit": "npm run build:dev && npx playwright test --project=webkit",
+    "test:all": "npm run test && npm run test:browser",
+    "serve:test": "npx http-server . -p 3000 -c-1 --cors",
+    "benchmark": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js",
+    "benchmark:quick": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --quick",
+    "benchmark:variance": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --quick --runs 3",
+    "benchmark:contention": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories contention",
+    "benchmark:overlapping": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories overlapping",
+    "benchmark:help": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --help"
+  },
+  "keywords": ["scheduler", "dag", "task", "worker", "async", "concurrency", "workflow", "parallel", "typescript"],
+  "author": "FyFlow Team",
+  "license": "MIT",
+  "homepage": "https://github.com/fyflow/fyflow-scheduler#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fyflow/fyflow-scheduler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fyflow/fyflow-scheduler/issues"
+  },
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/node/index.js"
+      },
+      "browser": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/browser/index.js"
+      },
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/node/index.js"
+    }
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "packageManager": "pnpm@10.12.1",
+  "devDependencies": {
+    "@playwright/test": "^1.55.1",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.10",
+    "http-server": "^14.1.1",
+    "typescript": "^5.9.2"
+  }
+}
