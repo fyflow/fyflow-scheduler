@@ -21,19 +21,19 @@ export default class CrashingWorker extends BaseWorker {
   }
 
   async setup(): Promise<void> {
-    console.log('CrashingWorker setup started');
+    // console.log('CrashingWorker setup started');
 
     if (this.shouldCrashInSetup) {
       throw new Error('Intentional crash during worker setup');
     }
 
-    console.log('CrashingWorker setup completed');
+    // console.log('CrashingWorker setup completed');
   }
 
   async run(payload: any, context?: TaskWorkerContext): Promise<any> {
     const { action } = payload;
 
-    console.log(`CrashingWorker executing action: ${action}`);
+    // console.log(`CrashingWorker executing action: ${action}`);
 
     switch (action) {
       case 'throw-error':
@@ -73,7 +73,7 @@ export default class CrashingWorker extends BaseWorker {
   }
 
   async teardown(): Promise<void> {
-    console.log('CrashingWorker teardown completed');
+    // console.log('CrashingWorker teardown completed');
   }
 }
 

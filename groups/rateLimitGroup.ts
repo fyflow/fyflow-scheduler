@@ -1,16 +1,26 @@
+import type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from './resourceGroup.ts';
+
 export interface RateWindow {
   limit: number;      // Maximum requests allowed
   windowMs: number;   // Time window in milliseconds
 }
 
-export class RateLimitGroup {
+export class RateLimitGroup extends EventTarget implements ResourceGroup {
+  readonly id: string;
+  readonly type = 'rate-limit' as const;
   private windows: RateWindow[];
   private requestCounts: Map<string, [number, number][]> = new Map(); // windowIndex -> [timestamp, count][]
   private runningStartTimes: number[] = []; // Track start times of currently running tasks
   private running = 0;
+  private stats = {
+    totalAcquired: 0,
+    totalReleased: 0
+  };
 
-  constructor(windows: RateWindow[]) {
+  constructor(windows: RateWindow[], id?: string) {
+    super();
     this.windows = windows;
+    this.id = id || `ratelimit-${Math.random().toString(36).substr(2, 9)}`;
     // Initialize request tracking for each window
     this.windows.forEach((_, index) => {
       this.requestCounts.set(index.toString(), []);
@@ -49,6 +59,25 @@ export class RateLimitGroup {
     return true;
   }
 
+  getMetrics(): ResourceGroupMetrics {
+    // For rate limiting, use the most restrictive window as the "limit"
+    const mostRestrictiveWindow = this.windows.reduce((min, w) => w.limit < min.limit ? w : min, this.windows[0]);
+
+    return {
+      limit: mostRestrictiveWindow.limit,
+      running: this.running,
+      available: Math.max(0, mostRestrictiveWindow.limit - this.running),
+      utilization: this.running / mostRestrictiveWindow.limit
+    };
+  }
+
+  getStats(): ResourceGroupStats {
+    return {
+      totalAcquired: this.stats.totalAcquired,
+      totalReleased: this.stats.totalReleased
+    };
+  }
+
   /**
    * Called when a task starts - tracks running count and reserves slot in rate limit
    */
@@ -56,6 +85,7 @@ export class RateLimitGroup {
     const now = Date.now();
     this.running++;
     this.runningStartTimes.push(now);
+    this.stats.totalAcquired++;
   }
 
   /**
@@ -64,6 +94,7 @@ export class RateLimitGroup {
   onFinish(): void {
     const now = Date.now();
     this.running = Math.max(0, this.running - 1);
+    this.stats.totalReleased++;
 
     // Remove the oldest running start time (FIFO)
     if (this.runningStartTimes.length > 0) {

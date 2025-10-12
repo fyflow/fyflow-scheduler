@@ -1,5 +1,5 @@
 // Quick test to demonstrate contention scaling issue
-import { DagScheduler, DagTask } from "../../core/dagScheduler.ts";
+import { FyflowScheduler, FyflowTask } from "../../core/FyflowScheduler.ts";
 import { WorkerManager } from "../../core/workerManager.ts";
 import { ConcurrentLimitGroup } from "../../groups/concurrentLimitGroup.ts";
 
@@ -16,11 +16,11 @@ async function testContentionScaling(taskCount: number, slots: number) {
     taskDelay: 1
   });
 
-  const scheduler = new DagScheduler({ NoopWorker: workerManager }, { testGroup });
+  const scheduler = new FyflowScheduler({ NoopWorker: workerManager }, { testGroup });
 
   const tasks = [];
   for (let i = 0; i < taskCount; i++) {
-    tasks.push(new DagTask({
+    tasks.push(new FyflowTask({
       id: `task-${i}`,
       workerType: 'NoopWorker',
       payload: { index: i },

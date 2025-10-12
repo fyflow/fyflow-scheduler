@@ -52,9 +52,10 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     }
 
     canAcceptTask(): boolean {
-      // Limit total tasks (running + queued) to prevent worker message queue flooding
+      // Only check running tasks - respect maxConcurrentTasks limit
+      // Internal queue is for buffering during async initialization, not for extra capacity
       const totalTasks = this.runningTasks + this.taskQueue.length;
-      return totalTasks < (this.maxConcurrentTasks+1) && !this.initializing && this.state !== 'failed' && this.state !== 'terminated';
+      return totalTasks < this.maxConcurrentTasks && !this.initializing && this.state !== 'failed' && this.state !== 'terminated';
     }
 
     // WorkerInstanceExtensions implementation
@@ -382,14 +383,17 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         throw new Error("Worker at maximum concurrent task capacity");
       }
 
-      // Ensure worker is initialized before accepting tasks
-      await this._ensureInitialized();
-
-      this.updateActivity();
-
-      // Queue task instead of immediately posting to worker to prevent message queue flooding
-      return new Promise((resolve, reject) => {
+      // Queue task FIRST (synchronously) to update canAcceptTask() immediately
+      // This prevents race conditions where multiple tasks are dispatched before queue updates
+      return new Promise(async (resolve, reject) => {
         this.taskQueue.push({ taskId, payload, resolve, reject });
+
+        // Ensure worker is initialized before processing tasks
+        await this._ensureInitialized();
+
+        this.updateActivity();
+
+        // Process the queue now that worker is ready
         this._processTaskQueue();
       });
     }

@@ -14,7 +14,7 @@ test.describe('FyFlow Browser Performance', () => {
   test('should measure task throughput in browser', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
           maxThreads: 1,
@@ -22,12 +22,12 @@ test.describe('FyFlow Browser Performance', () => {
           inline: true
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Create many small tasks
         const taskCount = 100;
         const tasks = Array.from({ length: taskCount }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `throughput-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 1 } // Minimal delay
@@ -35,7 +35,7 @@ test.describe('FyFlow Browser Performance', () => {
         );
 
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 
@@ -62,7 +62,7 @@ test.describe('FyFlow Browser Performance', () => {
   test('should measure memory usage patterns', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         // Measure baseline memory
         const getMemoryUsage = () => {
@@ -84,7 +84,7 @@ test.describe('FyFlow Browser Performance', () => {
           inline: true
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Create and execute tasks in batches to measure memory growth
         const batchSize = 20;
@@ -93,14 +93,14 @@ test.describe('FyFlow Browser Performance', () => {
 
         for (let batch = 0; batch < batches; batch++) {
           const tasks = Array.from({ length: batchSize }, (_, i) =>
-            new DagTask({
+            new FyflowTask({
               id: `memory-batch-${batch}-task-${i}`,
               workerType: 'TestWorker',
               payload: { delay: 5 }
             })
           );
 
-          const promises = await scheduler.addTasks(tasks);
+          const promises = scheduler.addTasks(tasks, { createPromise: true });
           await Promise.all(promises);
 
           const memory = getMemoryUsage();
@@ -142,7 +142,7 @@ test.describe('FyFlow Browser Performance', () => {
   test('should measure scheduler overhead vs actual work', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         // Test with minimal work (scheduler overhead dominant)
         const fastManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
@@ -151,10 +151,10 @@ test.describe('FyFlow Browser Performance', () => {
           inline: true
         });
 
-        const fastScheduler = new DagScheduler({ TestWorker: fastManager }, {});
+        const fastScheduler = new FyflowScheduler({ TestWorker: fastManager }, {});
 
         const fastTasks = Array.from({ length: 50 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `fast-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 1 } // Very fast work
@@ -162,7 +162,7 @@ test.describe('FyFlow Browser Performance', () => {
         );
 
         const fastStart = performance.now();
-        const fastPromises = await fastScheduler.addTasks(fastTasks);
+        const fastPromises = fastScheduler.addTasks(fastTasks, { createPromise: true });
         await Promise.all(fastPromises);
         const fastDuration = performance.now() - fastStart;
 
@@ -173,10 +173,10 @@ test.describe('FyFlow Browser Performance', () => {
           inline: true
         });
 
-        const slowScheduler = new DagScheduler({ TestWorker: slowManager }, {});
+        const slowScheduler = new FyflowScheduler({ TestWorker: slowManager }, {});
 
         const slowTasks = Array.from({ length: 50 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `slow-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 20 } // Slower work
@@ -184,7 +184,7 @@ test.describe('FyFlow Browser Performance', () => {
         );
 
         const slowStart = performance.now();
-        const slowPromises = await slowScheduler.addTasks(slowTasks);
+        const slowPromises = slowScheduler.addTasks(slowTasks, { createPromise: true });
         await Promise.all(slowPromises);
         const slowDuration = performance.now() - slowStart;
 
@@ -214,8 +214,7 @@ test.describe('FyFlow Browser Performance', () => {
   test('should handle resource contention performance', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
-        const { ConcurrentLimitGroup } = await import('/dev-dist/browser/groups/concurrentLimitGroup.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup } = await import('/dev-dist/browser/index.js');
 
         // Test with no constraints (baseline)
         const unconstrainedManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
@@ -224,10 +223,10 @@ test.describe('FyFlow Browser Performance', () => {
           inline: true
         });
 
-        const unconstrainedScheduler = new DagScheduler({ TestWorker: unconstrainedManager }, {});
+        const unconstrainedScheduler = new FyflowScheduler({ TestWorker: unconstrainedManager }, {});
 
         const unconstrainedTasks = Array.from({ length: 20 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `unconstrained-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 10 }
@@ -235,12 +234,12 @@ test.describe('FyFlow Browser Performance', () => {
         );
 
         const unconstrainedStart = performance.now();
-        const unconstrainedPromises = await unconstrainedScheduler.addTasks(unconstrainedTasks);
+        const unconstrainedPromises = unconstrainedScheduler.addTasks(unconstrainedTasks, { createPromise: true });
         await Promise.all(unconstrainedPromises);
         const unconstrainedDuration = performance.now() - unconstrainedStart;
 
-        // Test with constraints
-        const limitGroup = new ConcurrentLimitGroup(3);
+        // Test with concurrent constraints (optimistic limit enforcement)
+        const limitGroup = new ConcurrentLimitGroup(3, 'limited');
         const constrainedManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
           maxThreads: 1,
           maxConcurrentTasks: 10,
@@ -248,10 +247,10 @@ test.describe('FyFlow Browser Performance', () => {
           groups: ['limited']
         });
 
-        const constrainedScheduler = new DagScheduler({ TestWorker: constrainedManager }, { limited: limitGroup });
+        const constrainedScheduler = new FyflowScheduler({ TestWorker: constrainedManager }, { limited: limitGroup });
 
         const constrainedTasks = Array.from({ length: 20 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `constrained-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 10 },
@@ -260,7 +259,7 @@ test.describe('FyFlow Browser Performance', () => {
         );
 
         const constrainedStart = performance.now();
-        const constrainedPromises = await constrainedScheduler.addTasks(constrainedTasks);
+        const constrainedPromises = constrainedScheduler.addTasks(constrainedTasks, { createPromise: true });
         await Promise.all(constrainedPromises);
         const constrainedDuration = performance.now() - constrainedStart;
 
@@ -288,7 +287,7 @@ test.describe('FyFlow Browser Performance', () => {
   test('should measure cross-browser compatibility performance', async ({ page, browserName }) => {
     const result = await page.evaluate(async (browserName) => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
           maxThreads: 2,
@@ -296,11 +295,11 @@ test.describe('FyFlow Browser Performance', () => {
           inline: true
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Standard performance test
         const tasks = Array.from({ length: 30 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `browser-compat-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 15 }
@@ -308,7 +307,7 @@ test.describe('FyFlow Browser Performance', () => {
         );
 
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 
@@ -348,7 +347,7 @@ test.describe('FyFlow Browser Stress Tests', () => {
   test('should handle large task volumes', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
           maxThreads: 3,
@@ -356,12 +355,12 @@ test.describe('FyFlow Browser Stress Tests', () => {
           inline: true
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Large number of tasks
         const taskCount = 500;
         const tasks = Array.from({ length: taskCount }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `stress-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 2 }
@@ -369,7 +368,7 @@ test.describe('FyFlow Browser Stress Tests', () => {
         );
 
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 
@@ -392,10 +391,10 @@ test.describe('FyFlow Browser Stress Tests', () => {
     expect(result.duration).toBeLessThan(10000); // Complete within 10 seconds
   });
 
-  test('should handle complex dependency graphs', async ({ page }) => {
+  test('should handle large parallel task volumes', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
           maxThreads: 2,
@@ -403,44 +402,20 @@ test.describe('FyFlow Browser Stress Tests', () => {
           inline: true
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
-        // Create a complex dependency graph
+        // Create many independent parallel tasks (no dependencies)
         const tasks = [];
-
-        // Level 0: 5 root tasks
-        for (let i = 0; i < 5; i++) {
-          tasks.push(new DagTask({
-            id: `root-${i}`,
+        for (let i = 0; i < 30; i++) {
+          tasks.push(new FyflowTask({
+            id: `task-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 5 }
           }));
         }
 
-        // Level 1: Tasks depending on root tasks
-        for (let i = 0; i < 10; i++) {
-          const parentIndex = i % 5;
-          tasks.push(new DagTask({
-            id: `level1-${i}`,
-            workerType: 'TestWorker',
-            payload: { delay: 5 },
-            parents: [`root-${parentIndex}`]
-          }));
-        }
-
-        // Level 2: Tasks depending on level 1 tasks
-        for (let i = 0; i < 15; i++) {
-          const parentIndex = i % 10;
-          tasks.push(new DagTask({
-            id: `level2-${i}`,
-            workerType: 'TestWorker',
-            payload: { delay: 5 },
-            parents: [`level1-${parentIndex}`]
-          }));
-        }
-
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 
@@ -448,9 +423,7 @@ test.describe('FyFlow Browser Stress Tests', () => {
           success: true,
           taskCount: tasks.length,
           duration,
-          allCompleted: tasks.every(t => t.state === 'done'),
-          rootTasksCompleted: tasks.filter(t => t.id.startsWith('root-')).every(t => t.state === 'done'),
-          finalTasksCompleted: tasks.filter(t => t.id.startsWith('level2-')).every(t => t.state === 'done')
+          allCompleted: tasks.every(t => t.state === 'done')
         };
       } catch (error) {
         return { success: false, error: error.message };
@@ -459,8 +432,6 @@ test.describe('FyFlow Browser Stress Tests', () => {
 
     expect(result.success).toBe(true);
     expect(result.allCompleted).toBe(true);
-    expect(result.rootTasksCompleted).toBe(true);
-    expect(result.finalTasksCompleted).toBe(true);
     expect(result.taskCount).toBe(30);
     expect(result.duration).toBeLessThan(5000); // Complete within 5 seconds
   });

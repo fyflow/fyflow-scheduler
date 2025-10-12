@@ -10,7 +10,7 @@ export default class SelfTerminatingWorker extends BaseWorker {
   constructor(config: any = {}, workerContext?: BaseWorkerContext) {
     super(config, workerContext);
 
-    console.log('SelfTerminatingWorker initialized');
+    // console.log('SelfTerminatingWorker initialized');
 
     // Set up background monitoring that could trigger self-termination
     this.setupBackgroundMonitoring();
@@ -30,7 +30,7 @@ export default class SelfTerminatingWorker extends BaseWorker {
   }
 
   async setup(): Promise<void> {
-    console.log('SelfTerminatingWorker setup started');
+    // console.log('SelfTerminatingWorker setup started');
 
     // Check if we should terminate during setup
     if (this.config.terminateInSetup) {
@@ -41,14 +41,14 @@ export default class SelfTerminatingWorker extends BaseWorker {
       return;
     }
 
-    console.log('SelfTerminatingWorker setup completed');
+    // console.log('SelfTerminatingWorker setup completed');
   }
 
   async run(payload: any, context?: TaskWorkerContext): Promise<any> {
     const { action, canRestart, restartDelay, delay, taskCount } = payload;
     this.taskCounter++;
 
-    console.log(`SelfTerminatingWorker executing action: ${action} (task #${this.taskCounter})`);
+    // console.log(`SelfTerminatingWorker executing action: ${action} (task #${this.taskCounter})`);
 
     switch (action) {
       case 'self-terminate':
@@ -60,9 +60,9 @@ export default class SelfTerminatingWorker extends BaseWorker {
 
       case 'self-terminate-delayed':
         // Self-terminate after a delay
-        console.log('📡 self-terminate-delayed will terminate in', delay || 100);
+        // console.log('📡 self-terminate-delayed will terminate in', delay || 100);
         setTimeout(() => {
-          console.log('📡 self-terminate-delayed terminating worker.');
+          // console.log('📡 self-terminate-delayed terminating worker.');
           context?.terminateWithError(
             new Error('Worker self-terminated after delay'),
             { canRestart: true, restartDelay: 100 }
@@ -70,9 +70,9 @@ export default class SelfTerminatingWorker extends BaseWorker {
         }, delay || 100);
 
         // Keep the task running until termination
-        console.log('📡 self-terminate-delayed starting work');
+        // console.log('📡 self-terminate-delayed starting work');
         await new Promise(resolve => setTimeout(resolve, (delay || 100) + 50));
-        console.log('⚠️⚠️⚠️⚠️⚠️ self-terminate-delayed completed work');
+        // console.log('⚠️⚠️⚠️⚠️⚠️ self-terminate-delayed completed work');
         return { result: 'Task completed before termination' };
 
       case 'terminate-in-setup':
@@ -163,7 +163,7 @@ export default class SelfTerminatingWorker extends BaseWorker {
     if (this.backgroundMonitoringInterval) {
       clearInterval(this.backgroundMonitoringInterval);
     }
-    console.log('SelfTerminatingWorker teardown completed');
+    // console.log('SelfTerminatingWorker teardown completed');
   }
 }
 

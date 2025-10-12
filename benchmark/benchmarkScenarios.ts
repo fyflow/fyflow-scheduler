@@ -1,6 +1,6 @@
 // Benchmark scenario definitions and execution
 import { WorkerManager } from "../core/workerManager.ts";
-import { DagScheduler, DagTask } from "../core/dagScheduler.ts";
+import { FyflowScheduler, FyflowTask } from "../core/FyflowScheduler.ts";
 import { ConcurrentLimitGroup } from "../groups/concurrentLimitGroup.ts";
 import { PerfTimer, formatBytes, formatDuration, StatisticsCollector, RuntimeUtils, type PerfMeasurement } from "./perfUtils.ts";
 
@@ -26,6 +26,7 @@ export interface BenchmarkConfig {
         fanout?: number;
     };
     cpuSlots: number;
+    fireAndForget?: boolean; // If true, use event-driven completion without promises
 }
 
 export interface BenchmarkResult {
@@ -123,7 +124,7 @@ export class BenchmarkRunner {
             workerManagerOptions
         );
 
-        const scheduler = new DagScheduler({ NoopWorker: workerManager, ...(cpuWorker ? { CPUWorker: cpuWorker } : {}) }, groups);
+        const scheduler = new FyflowScheduler({ NoopWorker: workerManager, ...(cpuWorker ? { CPUWorker: cpuWorker } : {}) }, groups);
 
         const setupMeasurement = this.timer.end('setup');
         console.log(`⚙️  Setup completed in ${formatDuration(setupMeasurement.duration)}`);
@@ -158,21 +159,20 @@ export class BenchmarkRunner {
         // Track execution start time
         const _executionStart = performance.now();
 
-        // Add all tasks - use batch API for high volume scenarios to prevent Node.js worker_threads overflow
-
-        // if (tasks.length >= 10000) {
-        //     scheduler.addTasks(tasks);
-        // } else {
+        // Add all tasks - use fire-and-forget mode if configured
+        if (config.fireAndForget) {
+            // Fire-and-forget mode: no promises created
             for (const task of tasks) {
-                scheduler.addTask(task);
+                scheduler.addTask(task); // Default: createPromise: false
             }
-
-            
-        // }
+        } else {
+            // Promise mode: create promises for waiting
+            for (const task of tasks) {
+                scheduler.addTask(task, { createPromise: true });
+            }
+        }
 
         console.log("📋 Tasks added to scheduler");
-
-
 
         // Wait for completion
         await this.waitForCompletion(scheduler, config.taskCount);
@@ -238,26 +238,16 @@ export class BenchmarkRunner {
         return result;
     }
 
-    private generateTasks(config: BenchmarkConfig): DagTask[] {
+    private generateTasks(config: BenchmarkConfig): FyflowTask[] {
         // This method delegates to specific generators
-        const _tasks: DagTask[] = [];
+        const _tasks: FyflowTask[] = [];
 
-        switch (config.dependencyConfig?.type || 'none') {
-            case 'none':
-                return this.generateIndependentTasks(config);
-            case 'chain':
-                return this.generateChainTasks(config);
-            case 'tree':
-                return this.generateTreeTasks(config);
-            case 'mixed':
-                return this.generateMixedTasks(config);
-            default:
-                return this.generateIndependentTasks(config);
-        }
+        // Only independent tasks supported (no dependencies)
+        return this.generateIndependentTasks(config);
     }
 
-    private generateIndependentTasks(config: BenchmarkConfig): DagTask[] {
-        const tasks: DagTask[] = [];
+    private generateIndependentTasks(config: BenchmarkConfig): FyflowTask[] {
+        const tasks: FyflowTask[] = [];
 
         for (let i = 0; i < config.taskCount; i++) {
             const taskConfig: any = {
@@ -288,111 +278,14 @@ export class BenchmarkRunner {
                 taskConfig.workerGroups = workerGroups;
             }
 
-            tasks.push(new DagTask(taskConfig));
+            tasks.push(new FyflowTask(taskConfig));
         }
 
         return tasks;
     }
 
-    private generateChainTasks(config: BenchmarkConfig): DagTask[] {
-        const tasks: DagTask[] = [];
-        const depth = config.dependencyConfig?.depth || config.taskCount;
 
-        for (let i = 0; i < config.taskCount && i < depth; i++) {
-            const parents = i > 0 ? [`chain-task-${i-1}`] : [];
-
-            tasks.push(new DagTask({
-                id: `chain-task-${i}`,
-                workerType: 'NoopWorker',
-                payload: {
-                    taskId: `chain-task-${i}`,
-                    benchmarkData: { chainIndex: i }
-                },
-                parents
-            }));
-        }
-
-        return tasks;
-    }
-
-    private generateTreeTasks(config: BenchmarkConfig): DagTask[] {
-        const tasks: DagTask[] = [];
-        const fanout = config.dependencyConfig?.fanout || 10;
-        let taskId = 0;
-
-        // Root task
-        tasks.push(new DagTask({
-            id: `tree-task-${taskId++}`,
-            workerType: 'NoopWorker',
-            payload: {
-                taskId: `tree-task-0`,
-                benchmarkData: { treeLevel: 0, treeIndex: 0 }
-            }
-        }));
-
-        // Generate tree levels
-        let currentLevel = [`tree-task-0`];
-        let level = 1;
-
-        while (taskId < config.taskCount && currentLevel.length > 0) {
-            const nextLevel: string[] = [];
-
-            for (const parent of currentLevel) {
-                for (let i = 0; i < fanout && taskId < config.taskCount; i++) {
-                    const childId = `tree-task-${taskId++}`;
-                    nextLevel.push(childId);
-
-                    tasks.push(new DagTask({
-                        id: childId,
-                        workerType: 'NoopWorker',
-                        payload: {
-                            taskId: childId,
-                            benchmarkData: { treeLevel: level, treeIndex: i }
-                        },
-                        parents: [parent]
-                    }));
-                }
-            }
-
-            currentLevel = nextLevel;
-            level++;
-        }
-
-        return tasks;
-    }
-
-    private generateMixedTasks(config: BenchmarkConfig): DagTask[] {
-        const chainTasks = Math.floor(config.taskCount * 0.3);
-        const treeTasks = Math.floor(config.taskCount * 0.3);
-        const independentTasks = config.taskCount - chainTasks - treeTasks;
-
-        const tasks: DagTask[] = [];
-
-        // Add chain tasks
-        tasks.push(...this.generateChainTasks({
-            ...config,
-            taskCount: chainTasks,
-            dependencyConfig: { type: 'chain' }
-        }));
-
-        // Add tree tasks
-        tasks.push(...this.generateTreeTasks({
-            ...config,
-            taskCount: treeTasks,
-            dependencyConfig: { type: 'tree', fanout: 5 }
-        }));
-
-        // Add independent tasks
-        tasks.push(...this.generateIndependentTasks({
-            ...config,
-            taskCount: independentTasks,
-            dependencyConfig: { type: 'none' }
-        }));
-
-        return tasks;
-    }
-
-    private instrumentScheduler(scheduler: DagScheduler) {
+    private instrumentScheduler(scheduler: FyflowScheduler) {
         // Hook into the scheduler's dispatch loop to measure dispatch times
         // deno-lint-ignore no-explicit-any
         const originalDispatch = (scheduler as any)._dispatchLoop;
@@ -408,7 +301,7 @@ export class BenchmarkRunner {
         }
     }
 
-    private waitForCompletion(scheduler: DagScheduler, expectedTasks: number): Promise<void> {
+    private waitForCompletion(scheduler: FyflowScheduler, expectedTasks: number): Promise<void> {
         return new Promise((resolve) => {
             const checkCompletion = () => {
                 const stats = scheduler.stats;

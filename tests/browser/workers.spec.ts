@@ -60,7 +60,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
   test('should execute tasks with real Web Workers', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         // Create worker manager that uses actual Web Workers (not inline)
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testThreadWorker.js', {
@@ -69,17 +69,17 @@ test.describe('FyFlow Web Worker Functionality', () => {
           inline: false  // Force Web Worker usage
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Create a task that will run in a real Web Worker
-        const task = new DagTask({
+        const task = new FyflowTask({
           id: 'webworker-test',
           workerType: 'TestWorker',
           payload: { message: 'Hello from Web Worker!' }
         });
 
         const startTime = performance.now();
-        await scheduler.addTask(task);
+        await scheduler.addTask(task, { createPromise: true });
         const duration = performance.now() - startTime;
 
         return {
@@ -101,7 +101,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
   test('should handle concurrent Web Worker tasks', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testThreadWorker.js', {
           maxThreads: 3,
@@ -109,12 +109,12 @@ test.describe('FyFlow Web Worker Functionality', () => {
           inline: false
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Create multiple tasks to run concurrently in Web Workers
         const tasks = [];
         for (let i = 0; i < 5; i++) {
-          tasks.push(new DagTask({
+          tasks.push(new FyflowTask({
             id: `concurrent-worker-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 50, index: i }
@@ -122,7 +122,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
         }
 
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 
@@ -148,7 +148,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
   test('should handle Web Worker errors and cleanup', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testThreadWorker.js', {
           maxThreads: 1,
@@ -156,29 +156,29 @@ test.describe('FyFlow Web Worker Functionality', () => {
           inline: false
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Create a task that will cause an error in the Web Worker
-        const task = new DagTask({
+        const task = new FyflowTask({
           id: 'worker-error-test',
           workerType: 'TestWorker',
           payload: { shouldThrow: true }
         });
 
         try {
-          await scheduler.addTask(task);
+          await scheduler.addTask(task, { createPromise: true });
         } catch (error) {
           // Expected to fail
         }
 
         // Test that we can still create new tasks after error
-        const recoveryTask = new DagTask({
+        const recoveryTask = new FyflowTask({
           id: 'recovery-test',
           workerType: 'TestWorker',
           payload: { message: 'Recovery test' }
         });
 
-        await scheduler.addTask(recoveryTask);
+        await scheduler.addTask(recoveryTask, { createPromise: true });
 
         return {
           success: true,
@@ -203,7 +203,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
   test('should handle Web Worker termination and restart', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testThreadWorker.js', {
           maxThreads: 1,
@@ -212,28 +212,28 @@ test.describe('FyFlow Web Worker Functionality', () => {
           idleTimeout: 100 // Short timeout for testing
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Run a task
-        const task1 = new DagTask({
+        const task1 = new FyflowTask({
           id: 'first-task',
           workerType: 'TestWorker',
           payload: { message: 'First task' }
         });
 
-        await scheduler.addTask(task1);
+        await scheduler.addTask(task1, { createPromise: true });
 
         // Wait for worker to potentially idle out
         await new Promise(resolve => setTimeout(resolve, 150));
 
         // Run another task - should create new worker
-        const task2 = new DagTask({
+        const task2 = new FyflowTask({
           id: 'second-task',
           workerType: 'TestWorker',
           payload: { message: 'Second task' }
         });
 
-        await scheduler.addTask(task2);
+        await scheduler.addTask(task2, { createPromise: true });
 
         return {
           success: true,
@@ -253,7 +253,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
   test('should handle mixed inline and Web Worker execution', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         // Create both inline and Web Worker managers
         const inlineManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
@@ -268,29 +268,29 @@ test.describe('FyFlow Web Worker Functionality', () => {
           inline: false
         });
 
-        const scheduler = new DagScheduler({
+        const scheduler = new FyflowScheduler({
           InlineWorker: inlineManager,
           ThreadWorker: workerManager
         }, {});
 
         // Create tasks for both worker types
         const tasks = [
-          new DagTask({
+          new FyflowTask({
             id: 'inline-1',
             workerType: 'InlineWorker',
             payload: { delay: 20 }
           }),
-          new DagTask({
+          new FyflowTask({
             id: 'worker-1',
             workerType: 'ThreadWorker',
             payload: { delay: 30 }
           }),
-          new DagTask({
+          new FyflowTask({
             id: 'inline-2',
             workerType: 'InlineWorker',
             payload: { delay: 25 }
           }),
-          new DagTask({
+          new FyflowTask({
             id: 'worker-2',
             workerType: 'ThreadWorker',
             payload: { delay: 35 }
@@ -298,7 +298,7 @@ test.describe('FyFlow Web Worker Functionality', () => {
         ];
 
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 
@@ -335,7 +335,7 @@ test.describe('FyFlow Web Worker Performance', () => {
   test('should measure Web Worker vs inline performance', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         // Test inline performance
         const inlineManager = new WorkerManager('/dev-dist/browser/tests/workers/testInlineWorker.js', {
@@ -344,10 +344,10 @@ test.describe('FyFlow Web Worker Performance', () => {
           inline: true
         });
 
-        const inlineScheduler = new DagScheduler({ TestWorker: inlineManager }, {});
+        const inlineScheduler = new FyflowScheduler({ TestWorker: inlineManager }, {});
 
         const inlineTasks = Array.from({ length: 10 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `inline-perf-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 10 }
@@ -355,7 +355,7 @@ test.describe('FyFlow Web Worker Performance', () => {
         );
 
         const inlineStart = performance.now();
-        const inlinePromises = await inlineScheduler.addTasks(inlineTasks);
+        const inlinePromises = inlineScheduler.addTasks(inlineTasks, { createPromise: true });
         await Promise.all(inlinePromises);
         const inlineDuration = performance.now() - inlineStart;
 
@@ -366,10 +366,10 @@ test.describe('FyFlow Web Worker Performance', () => {
           inline: false
         });
 
-        const workerScheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const workerScheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         const workerTasks = Array.from({ length: 10 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `worker-perf-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 10 }
@@ -377,7 +377,7 @@ test.describe('FyFlow Web Worker Performance', () => {
         );
 
         const workerStart = performance.now();
-        const workerPromises = await workerScheduler.addTasks(workerTasks);
+        const workerPromises = workerScheduler.addTasks(workerTasks, { createPromise: true });
         await Promise.all(workerPromises);
         const workerDuration = performance.now() - workerStart;
 
@@ -406,7 +406,7 @@ test.describe('FyFlow Web Worker Performance', () => {
   test('should handle high concurrency Web Worker tasks', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
-        const { DagScheduler, DagTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+        const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
 
         const workerManager = new WorkerManager('/dev-dist/browser/tests/workers/testThreadWorker.js', {
           maxThreads: 4,
@@ -414,11 +414,11 @@ test.describe('FyFlow Web Worker Performance', () => {
           inline: false
         });
 
-        const scheduler = new DagScheduler({ TestWorker: workerManager }, {});
+        const scheduler = new FyflowScheduler({ TestWorker: workerManager }, {});
 
         // Create many tasks to test high concurrency
         const tasks = Array.from({ length: 20 }, (_, i) =>
-          new DagTask({
+          new FyflowTask({
             id: `high-concurrency-${i}`,
             workerType: 'TestWorker',
             payload: { delay: 25, index: i }
@@ -426,7 +426,7 @@ test.describe('FyFlow Web Worker Performance', () => {
         );
 
         const startTime = performance.now();
-        const promises = await scheduler.addTasks(tasks);
+        const promises = scheduler.addTasks(tasks, { createPromise: true });
         await Promise.all(promises);
         const duration = performance.now() - startTime;
 

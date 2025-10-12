@@ -1,4 +1,4 @@
-import { WorkerManager, DagScheduler, DagTask, ConcurrentLimitGroup } from "../index.ts";
+import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup } from "../index.ts";
 
 let simpleWorkerUrl: string;
 if (typeof Deno !== "undefined") {
@@ -14,9 +14,8 @@ if (typeof Deno !== "undefined") {
  * Getting Started Example
  *
  * Demonstrates:
- * - Basic DAG task creation and execution
+ * - Basic task creation and execution
  * - Simple worker setup
- * - Task dependencies
  * - Event listening
  * - Basic resource management
  */
@@ -41,7 +40,7 @@ const workerPools = {
 console.log('🏭 Created SimpleWorker pool (2 threads, 1 task each)');
 console.log('💻 Using CPU group with capacity: ', navigator.hardwareConcurrency);
 // Step 3: Create scheduler with CPU group for threaded workers
-const scheduler = new DagScheduler(
+const scheduler = new FyflowScheduler(
     workerPools,
     { cpu: new ConcurrentLimitGroup(navigator.hardwareConcurrency) } // Match worker capacity (2 threads × 1 task)
 );
@@ -58,34 +57,31 @@ scheduler.addEventListener('task.completed', (e: any) => {
 });
 
 
-// Step 5: Create tasks with dependencies
+// Step 5: Create independent tasks
 const tasks = [
-    new DagTask({
+    new FyflowTask({
         id: 'prepare-data',
         workerType: 'SimpleWorker',
         payload: { task: 'data-preparation', data: 'raw-dataset.csv' }
     }),
-    new DagTask({
+    new FyflowTask({
         id: 'validate-data',
         workerType: 'SimpleWorker',
-        payload: { task: 'data-validation', data: 'prepared-dataset.csv' },
-        parents: ['prepare-data'] // Wait for data preparation
+        payload: { task: 'data-validation', data: 'prepared-dataset.csv' }
     }),
-    new DagTask({
+    new FyflowTask({
         id: 'analyze-data',
         workerType: 'SimpleWorker',
-        payload: { task: 'data-analysis', data: 'validated-dataset.csv' },
-        parents: ['validate-data'] // Wait for validation
+        payload: { task: 'data-analysis', data: 'validated-dataset.csv' }
     }),
-    new DagTask({
+    new FyflowTask({
         id: 'generate-report',
         workerType: 'SimpleWorker',
-        payload: { task: 'report-generation', data: 'analysis-results.json' },
-        parents: ['analyze-data'] // Wait for analysis
+        payload: { task: 'report-generation', data: 'analysis-results.json' }
     })
 ];
 
-console.log('\n📋 Created task chain: prepare → validate → analyze → report\n');
+console.log('\n📋 Created 4 parallel tasks\n');
 
 // Step 6: Add tasks to scheduler
 tasks.forEach(task => {

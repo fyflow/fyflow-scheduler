@@ -12,7 +12,7 @@ export default class TestInlineWorker extends BaseWorker {
   }
 
   async setup() {
-    console.log('TestInlineWorker setup completed');
+    // console.log('TestInlineWorker setup completed');
   }
 
   async run(payload: any) {
@@ -34,6 +34,6 @@ export default class TestInlineWorker extends BaseWorker {
   }
 
   async teardown() {
-    console.log('TestInlineWorker teardown completed');
+    // console.log('TestInlineWorker teardown completed');
   }
 }

@@ -42,6 +42,19 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
         }
     },
 
+    {
+        name: "Large Volume - 100K Independent Tasks (Inline)",
+        description: "100,000 independent tasks - extreme stress test with promises - inline workers",
+        taskCount: 100000,
+        cpuSlots: 16,
+        workerConfig: {
+            maxThreads: 8,
+            maxConcurrentTasks: 20,
+            inline: true,
+            taskDelay: 0
+        }
+    },
+
     // 1b. Threading Scalability Scenarios - CPU Workers with controlled workload
     {
         name: "Threading Scalability - 200 Tasks, 2 Threads",
@@ -83,6 +96,49 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
             cpuWorker: true,
             taskDelay: 0
         }
+    },
+
+    // 1c. Fire-and-Forget Mode Scenarios (Optional Promise Creation Optimization)
+    {
+        name: "Fire-and-Forget - 10K Tasks (Inline)",
+        description: "10,000 tasks using event-driven completion (no promises created) - tests optional promise optimization",
+        taskCount: 10000,
+        cpuSlots: 8,
+        workerConfig: {
+            maxThreads: 4,
+            maxConcurrentTasks: 10,
+            inline: true,
+            taskDelay: 0
+        },
+        fireAndForget: true
+    },
+
+    {
+        name: "Fire-and-Forget - 50K Tasks (Inline)",
+        description: "50,000 tasks using event-driven completion (no promises created) - stress test for optimization",
+        taskCount: 50000,
+        cpuSlots: 16,
+        workerConfig: {
+            maxThreads: 8,
+            maxConcurrentTasks: 20,
+            inline: true,
+            taskDelay: 0
+        },
+        fireAndForget: true
+    },
+
+    {
+        name: "Fire-and-Forget - 100K Tasks (Inline)",
+        description: "100,000 tasks using event-driven completion (no promises created) - extreme scale test",
+        taskCount: 100000,
+        cpuSlots: 16,
+        workerConfig: {
+            maxThreads: 8,
+            maxConcurrentTasks: 20,
+            inline: true,
+            taskDelay: 0
+        },
+        fireAndForget: true
     },
 
     // 2. High Group Contention Scenarios
@@ -445,13 +501,25 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
 
 // Scenario categories for organized testing
 export const SCENARIO_CATEGORIES = {
-    QUICK: BENCHMARK_SCENARIOS.slice(0, 6), // Include both inline (0-2) and threaded (3-5) scenarios
-    CONTENTION: BENCHMARK_SCENARIOS.slice(6, 9),
-    GROUP_SCALING: BENCHMARK_SCENARIOS.slice(9, 12),
-    DEPENDENCIES: BENCHMARK_SCENARIOS.slice(12, 15),
-    MIXED: BENCHMARK_SCENARIOS.slice(15, 16),
-    OVERLAPPING: BENCHMARK_SCENARIOS.slice(16, 19),
-    STRESS: BENCHMARK_SCENARIOS.slice(19, 20)
+    QUICK: BENCHMARK_SCENARIOS.slice(0, 7), // Include both inline (0-3) and threaded (4-6) scenarios
+    FIRE_AND_FORGET: BENCHMARK_SCENARIOS.slice(7, 10), // Fire-and-forget optimization tests (7-9)
+    CONTENTION: BENCHMARK_SCENARIOS.slice(10, 13),
+    GROUP_SCALING: BENCHMARK_SCENARIOS.slice(13, 16),
+    DEPENDENCIES: BENCHMARK_SCENARIOS.slice(16, 19),
+    MIXED: BENCHMARK_SCENARIOS.slice(19, 20),
+    OVERLAPPING: BENCHMARK_SCENARIOS.slice(20, 23),
+    STRESS: BENCHMARK_SCENARIOS.slice(23, 24),
+    // Baseline category - comprehensive baseline tests for regression detection
+    BASELINE: [
+        BENCHMARK_SCENARIOS[1],  // Large Volume - 10K Independent Tasks (Inline)
+        BENCHMARK_SCENARIOS[2],  // Large Volume - 50K Independent Tasks (Inline)
+        BENCHMARK_SCENARIOS[7],  // Fire-and-Forget - 10K Tasks (Inline)
+        BENCHMARK_SCENARIOS[8],  // Fire-and-Forget - 50K Tasks (Inline)
+        BENCHMARK_SCENARIOS[4],  // Threading Scalability - 200 Tasks, 2 Threads
+        BENCHMARK_SCENARIOS[5],  // Threading Scalability - 200 Tasks, 4 Threads
+        BENCHMARK_SCENARIOS[10], // High Contention - 1K Tasks, 4 Slots
+        BENCHMARK_SCENARIOS[11]  // High Contention - 10K Tasks, 4 Slots
+    ]
 };
 
 export function getScenariosByCategory(category: keyof typeof SCENARIO_CATEGORIES): BenchmarkConfig[] {

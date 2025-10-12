@@ -56,7 +56,9 @@ export default class CpuWorker extends BaseWorker {
 
     private computePrimes(limit: number) {
         const primes = [];
-        for (let n = 2; n < limit && primes.length < 1000; n++) {
+        let count = 0;
+        for (let n = 2; n < limit && primes.length < 1000000; n++) {
+            count++;
             let isPrime = true;
             for (let i = 2; i * i <= n; i++) {
                 if (n % i === 0) {

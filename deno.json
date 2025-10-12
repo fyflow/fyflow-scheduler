@@ -23,6 +23,7 @@
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",
       "benchmark:quick": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick",
+      "benchmark:baseline": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories baseline",
       "benchmark:variance": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick --runs 3",
       "benchmark:contention": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories contention",
       "benchmark:overlapping": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories overlapping",

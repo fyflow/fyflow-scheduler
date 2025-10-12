@@ -17,7 +17,6 @@ export interface WorkerManagerOptions {
 
 export class WorkerManager extends EventTarget {
   threads: WorkerInstance[] = [];
-  taskQueue: {id:string, payload:any, resolve:(value:any)=>void, reject:(reason?:any)=>void}[] = [];
   maxThreads: number;
   maxConcurrentTasks: number;
   scriptUrl: string;
@@ -34,10 +33,8 @@ export class WorkerManager extends EventTarget {
   // Track ALL event listeners for cleanup
   private allListeners = new Map<any, {event: string; listener: Function}[]>();
 
-  // Smart dispatch state tracking
-  private predictiveCapacity = 0; // Future capacity from initializing threads
+  // Track initializing threads
   private initializingThreads = new Set<WorkerInstance>();
-  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Centralized idle management
   private idleCheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -59,126 +56,57 @@ export class WorkerManager extends EventTarget {
     this._setupWorkerFailureHandling();
   }
 
-  enqueue(task: {id:string, payload:any, resolve:(value:any)=>void, reject:(reason?:any)=>void}) {
-    this.taskQueue.push(task);
-    this._dispatchTasks();
-  }
+  // Direct execution without internal queueing
+  async enqueueNoQueue(taskId: string, payload: any): Promise<any> {
+    // Find an available thread
+    let targetThread = this.threads.find(t =>
+      t.canAcceptTask && t.canAcceptTask()
+    );
 
-  _dispatchTasks(): number {
-    let dispatched = 0;
+    // If no available thread, create one if under limit
+    // Note: initializingThreads tracks threads being created to prevent race conditions
+    if (!targetThread && (this.threads.length + this.initializingThreads.size) < this.maxThreads) {
+      const newThread = this.inline
+        ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config)
+        : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config);
 
-    while (this.taskQueue.length > 0) {
-      // 1. Try existing ready threads first (excludes initializing threads)
-      let availableThread = this.threads.find(t =>
-        t.canAcceptTask() && !this.initializingThreads.has(t)
-      );
+      // Track as initializing to prevent other tasks from creating duplicate threads
+      this.initializingThreads.add(newThread);
 
-      if (availableThread) {
-        this._dispatchTaskToThread(availableThread);
-        dispatched++;
-        continue;
+      // Set up event listeners
+      this._setupWorkerEventListeners(newThread);
+
+      // Add to threads array and start idle timer
+      this.threads.push(newThread);
+      this.startIdleTimer();
+
+      // For inline workers, thread is ready immediately
+      if (this.inline) {
+        this.initializingThreads.delete(newThread);
+        targetThread = newThread;
+      } else {
+        // For threaded workers, wait for initialization
+        await new Promise<void>((resolve) => {
+          const checkInit = () => {
+            if (newThread.canAcceptTask && newThread.canAcceptTask()) {
+              this.initializingThreads.delete(newThread);
+              resolve();
+            } else {
+              setTimeout(checkInit, 10); // Poll every 10ms
+            }
+          };
+          checkInit();
+        });
+        targetThread = newThread;
       }
-
-      // 2. Check if we need more threads (simplified capacity planning)
-      const currentCapacity = this._getAvailableCapacity();
-      const futureCapacity = currentCapacity + this.predictiveCapacity;
-      const queuedTasks = this.taskQueue.length;
-
-      // For lazy initialization, be more conservative about thread creation
-      if (currentCapacity === 0 && this._canCreateThread()) {
-        if (this._shouldCreateThread()) {
-          this._createPredictiveThread();
-          continue; // Try to dispatch to the newly created thread
-        } else {
-          // Can't create thread due to resource constraints - wait for resources
-          this._scheduleSmartRetry();
-          break;
-        }
-      } else if (futureCapacity < queuedTasks && this._canCreateThread()) {
-        if (this._shouldCreateThread()) {
-          this._createPredictiveThread();
-          continue; // Try to dispatch to the newly created thread
-        } else {
-          // Can't create thread due to resource constraints - wait for resources
-          this._scheduleSmartRetry();
-          break;
-        }
-      }
-
-      // 3. Sufficient future capacity exists - wait for threads to initialize
-      if (this.initializingThreads.size > 0) {
-        // For inline workers, don't delay - they initialize instantly
-        if (this.inline) {
-          break; // Inline workers don't need retry delays
-        } else {
-          // During high-volume scenarios, we need to be more aggressive about waiting for initialization
-          // instead of just breaking, schedule a retry to revisit dispatch when threads are ready
-          this._scheduleSmartRetry();
-          break;
-        }
-      }
-
-      // 4. No threads initializing and no capacity - schedule smart retry
-      // For inline workers, avoid unnecessary delays
-      if (!this.inline) {
-        this._scheduleSmartRetry();
-      }
-      break;
     }
 
-    return dispatched;
-  }
-
-  private _dispatchTaskToThread(thread: WorkerInstance) {
-    const task = this.taskQueue.shift()!;
-
-    // Double-check that thread can still accept tasks (race condition protection)
-    if (!thread.canAcceptTask()) {
-      // Put task back and retry later
-      this.taskQueue.unshift(task);
-      this._scheduleSmartRetry();
-      return;
+    if (!targetThread) {
+      throw new Error(`No worker thread available (${this.threads.length}/${this.maxThreads})`);
     }
 
-    // For threaded workers, track initialization state when first task is dispatched
-    if (!this.inline && !this.initializingThreads.has(thread) && !(thread as ThreadWrapper).initialized) {
-      this.initializingThreads.add(thread);
-      this.predictiveCapacity += this.maxConcurrentTasks;
-      this._setupInitializationTracking(thread);
-    }
-
-    thread.runTask(task.id, task.payload)
-      .then(task.resolve)
-      .catch((error) => {
-        // All errors are real task failures now
-        task.reject(error);
-      })
-      .finally(() => {
-        // Resume dispatch for queued tasks
-        if (this.taskQueue.length > 0) {
-          this._dispatchTasks();
-        }
-      });
-  }
-
-  private _getAvailableCapacity(): number {
-    return this.threads
-      .filter(t => !this.initializingThreads.has(t))
-      .reduce((total, thread) => {
-        const running = thread.runningTasks || 0;
-        const capacity = thread.maxConcurrentTasks || this.maxConcurrentTasks;
-        return total + Math.max(0, capacity - running);
-      }, 0);
-  }
-
-  private _canCreateThread(): boolean {
-    return this.threads.length < this.maxThreads;
-  }
-
-  private _shouldCreateThread(): boolean {
-    // Always allow thread creation up to maxThreads
-    // CPU constraints are handled at the group level now
-    return true;
+    // Execute task directly on thread
+    return targetThread.runTask(taskId, payload);
   }
 
   private _createPredictiveThread(): WorkerInstance {
@@ -195,52 +123,8 @@ export class WorkerManager extends EventTarget {
     return thread;
   }
 
-  private _setupInitializationTracking(worker: WorkerInstance) {
-    const onInitComplete = () => {
-      this.initializingThreads.delete(worker);
-      this.predictiveCapacity -= this.maxConcurrentTasks;
-
-      // Resume dispatch now that thread is ready
-      if (this.taskQueue.length > 0) {
-        this._dispatchTasks();
-      }
-    };
-
-    const onInitFailed = () => {
-      this.initializingThreads.delete(worker);
-      this.predictiveCapacity -= this.maxConcurrentTasks;
-      this.threads = this.threads.filter(t => t !== worker);
-
-      // Emit failure event for monitoring
-      this.dispatchEvent(new CustomEvent('worker.initialization.failed', {
-        detail: { workerId: worker.id, workerType: this.inline ? 'inline' : 'thread' }
-      }));
-
-      // Retry dispatch for queued tasks
-      if (this.taskQueue.length > 0) {
-        this._dispatchTasks();
-      }
-    };
-
-    worker.addEventListener('worker.initialization.completed', onInitComplete);
-    worker.addEventListener('worker.initialization.failed', onInitFailed);
-  }
-
-  private _scheduleSmartRetry() {
-    if (this.retryTimer) return; // Already scheduled
-
-    // Adaptive retry delay based on workload pattern
-    const retryDelay = this.maxConcurrentTasks > 1 ? 5 : 20; // ms
-
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      if (this.taskQueue.length > 0) {
-        this._dispatchTasks();
-      }
-    }, retryDelay);
-  }
-
   // Override addEventListener to track ALL listeners for cleanup
+  //TODO: likely unneccesary, verify
   override addEventListener(event: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void {
     super.addEventListener(event, listener, options);
     this._trackListener(this, event, listener as Function);
@@ -277,14 +161,8 @@ export class WorkerManager extends EventTarget {
     // Track all worker listeners for cleanup
     const listeners = [
       { event: 'task.started', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.started', { detail: e.detail })) },
-      { event: 'task.completed', handler: (e: any) => {
-        this.dispatchEvent(new CustomEvent('task.completed', { detail: e.detail }));
-        if (this.taskQueue.length > 0) this._scheduleSmartRetry();
-      }},
-      { event: 'task.failed', handler: (e: any) => {
-        this.dispatchEvent(new CustomEvent('task.failed', { detail: e.detail }));
-        if (this.taskQueue.length > 0) this._scheduleSmartRetry();
-      }},
+      { event: 'task.completed', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.completed', { detail: e.detail })) },
+      { event: 'task.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.failed', { detail: e.detail })) },
       { event: 'task.progress', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.progress', { detail: e.detail })) },
       { event: 'task.spawn_request', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.spawn_request', { detail: e.detail })) },
       { event: 'worker.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.failed', { detail: e.detail })) },
@@ -339,7 +217,7 @@ export class WorkerManager extends EventTarget {
     runningTaskIds.forEach(taskId => {
       // Only requeue if both manager allows requeuing AND worker can be restarted
       if (this.requeueFailedTasks && canRestart !== false) {
-        // Emit task.requeue_required event for DagScheduler to handle
+        // Emit task.requeue_required event for FyflowScheduler to handle
         this.dispatchEvent(new CustomEvent('task.requeue_required', {
           detail: { taskId, originalError: error, workerId }
         }));
@@ -477,7 +355,6 @@ export class WorkerManager extends EventTarget {
       ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config)
       : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config);
 
-    this._setupInitializationTracking(newWorker);
     this._setupWorkerEventListeners(newWorker);
     this.threads.push(newWorker);
     this.startIdleTimer(); // Ensure idle timer is running
@@ -564,9 +441,6 @@ export class WorkerManager extends EventTarget {
 
     // Stop the centralized idle timer
     this.stopIdleTimer();
-
-    // Stop accepting new tasks
-    this.taskQueue = [];
 
     // Remove ALL event listeners to prevent process hanging
     this._removeAllListeners();

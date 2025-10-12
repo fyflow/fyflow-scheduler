@@ -10,7 +10,7 @@
  * - Enhanced worker communication protocol
  */
 
-import { DagScheduler, DagTask } from "../core/dagScheduler.ts";
+import { FyflowScheduler, FyflowTask } from "../core/FyflowScheduler.ts";
 import { WorkerManager } from "../core/workerManager.ts";
 import { ConcurrentLimitGroup } from "../groups/concurrentLimitGroup.ts";
 
@@ -32,7 +32,7 @@ const dataProcessorManager = new WorkerManager(
 );
 
 // Create scheduler with worker pools
-const scheduler = new DagScheduler({
+const scheduler = new FyflowScheduler({
     ProgressWorker: progressWorkerManager,
     DataProcessor: dataProcessorManager
 }, {
@@ -75,7 +75,7 @@ async function runDemo() {
     console.log("-".repeat(40));
 
     // Create a task that demonstrates progress reporting
-    const progressTask = new DagTask({
+    const progressTask = new FyflowTask({
         id: "progress-demo",
         workerType: "ProgressWorker",
         payload: {
@@ -93,7 +93,7 @@ async function runDemo() {
     console.log("-".repeat(50));
 
     // Create a task that demonstrates dynamic spawning
-    const spawnTask = new DagTask({
+    const spawnTask = new FyflowTask({
         id: "spawn-demo",
         workerType: "DataProcessor",
         payload: {

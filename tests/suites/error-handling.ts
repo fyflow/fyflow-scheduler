@@ -1,7 +1,7 @@
 // Comprehensive Error Handling Tests for FyFlow
 // Tests worker crashes, self-termination, and error recovery scenarios
 
-import { WorkerManager, DagScheduler, DagTask } from '../../index.ts';
+import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
 import { ConcurrentLimitGroup } from '../../groups/concurrentLimitGroup.ts';
 
 // Node.js process declaration for cross-platform compatibility
@@ -19,11 +19,11 @@ class ErrorHandlingTestSuite {
   private startTime = 0;
   private crashWorkerUrl: string = "";
   private selfTerminatingWorkerUrl: string = "";
-  private schedulers: DagScheduler[] = []; // Track all created schedulers for cleanup
+  private schedulers: FyflowScheduler[] = []; // Track all created schedulers for cleanup
 
   // Helper method to create scheduler and track it for cleanup
-  private createScheduler(workerPools: any, groups: Record<string, any> = {}): DagScheduler {
-    const scheduler = new DagScheduler(workerPools, groups);
+  private createScheduler(workerPools: any, groups: Record<string, any> = {}): FyflowScheduler {
+    const scheduler = new FyflowScheduler(workerPools, groups);
     this.schedulers.push(scheduler);
     return scheduler;
   }
@@ -160,14 +160,14 @@ class ErrorHandlingTestSuite {
       restartMetadata = e.detail.metadata;
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'self-terminate-no-restart',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
     });
 
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
       throw new Error('Task should have failed due to worker self-termination');
     } catch (error: any) {
       // Expected
@@ -198,14 +198,14 @@ class ErrorHandlingTestSuite {
       });
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'self-terminate-setup',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'normal-task' } // Try normal task, but worker will terminate in setup
     });
 
     // Start task in background
-    const taskPromise = scheduler.addTask(task).catch(() => {
+    const taskPromise = scheduler.addTask(task, { createPromise: true })!.catch(() => {
       // Expected to fail
     });
 
@@ -244,7 +244,7 @@ class ErrorHandlingTestSuite {
       });
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'crash-test',
       workerType: 'CrashingWorker',
       payload: { action: 'throw-error' }
@@ -252,7 +252,7 @@ class ErrorHandlingTestSuite {
 
     // Task should fail but worker should remain healthy
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
       throw new Error('Task should have failed due to runtime error');
     } catch (error: any) {
       // Expected - task should fail
@@ -276,14 +276,14 @@ class ErrorHandlingTestSuite {
     const workerIds = workerManager.getWorkerIds();
     if (workerIds.length === 0) throw new Error('Worker should still exist after task crash');
 
-    const healthyTask = new DagTask({
+    const healthyTask = new FyflowTask({
       id: 'healthy-test',
       workerType: 'CrashingWorker',
       payload: { action: 'normal-task' }
     });
 
     // Worker should be able to process a normal task after the crash
-    const result = await scheduler.addTask(healthyTask);
+    const result = await scheduler.addTask(healthyTask, { createPromise: true });
     if (!result || !result.result) throw new Error('Worker should be able to process tasks after a task crash');
   }
 
@@ -303,14 +303,14 @@ class ErrorHandlingTestSuite {
       initFailedEmitted = true;
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'init-failure-test',
       workerType: 'CrashingWorker',
       payload: { action: 'crash-on-init' }
     });
 
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
       throw new Error('Task should have failed due to initialization failure');
     } catch (error: any) {
       // Expected
@@ -342,14 +342,14 @@ class ErrorHandlingTestSuite {
       });
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'setup-failure-test',
       workerType: 'CrashingWorker',
       payload: { action: 'normal-task' } // Try normal task, but setup will crash
     });
 
     // Start task in background
-    const taskPromise = scheduler.addTask(task).catch((error) => {
+    const taskPromise = scheduler.addTask(task, { createPromise: true })!.catch((error) => {
       // Expected to fail due to setup crash
       return { taskFailed: true, error: error.message };
     });
@@ -389,7 +389,7 @@ class ErrorHandlingTestSuite {
       taskRequeuedEmitted = true;
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'requeue-test',
       workerType: 'SelfTerminatingWorker',
       retryPolicy: { maxRetries: 1 },
@@ -436,7 +436,7 @@ class ErrorHandlingTestSuite {
 
     // Add multiple tasks that will be running when worker terminates
     for (let i = 0; i < 3; i++) {
-      const task = new DagTask({
+      const task = new FyflowTask({
         id: `multi-requeue-${i}`,
         workerType: 'SelfTerminatingWorker',
         payload: { action: 'self-terminate-after-tasks', taskCount: 3 }
@@ -463,7 +463,7 @@ class ErrorHandlingTestSuite {
     const scheduler = this.createScheduler({ SelfTerminatingWorker: workerManager }, { testGroup: group });
 
     // Start a task that will cause worker to terminate
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'resource-release-test',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
@@ -490,14 +490,14 @@ class ErrorHandlingTestSuite {
 
     const scheduler = this.createScheduler({ SelfTerminatingWorker: workerManager });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'slot-management-test',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
     });
 
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
     } catch (error: any) {
       // Expected
     }
@@ -528,14 +528,14 @@ class ErrorHandlingTestSuite {
       eventDetails = e.detail;
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'event-emission-test',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
     });
 
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
     } catch (error: any) {
       // Expected
     }
@@ -566,14 +566,14 @@ class ErrorHandlingTestSuite {
       eventDetails = e.detail;
     });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'self-terminated-event-test',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
     });
 
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
     } catch (error: any) {
       // Expected
     }
@@ -596,14 +596,14 @@ class ErrorHandlingTestSuite {
 
     const scheduler = this.createScheduler({ SelfTerminatingWorker: workerManager });
 
-    const task = new DagTask({
+    const task = new FyflowTask({
       id: 'status-inspection-test',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
     });
 
     try {
-      await scheduler.addTask(task);
+      await scheduler.addTask(task, { createPromise: true });
     } catch (error: any) {
       // Expected
     }
@@ -633,14 +633,14 @@ class ErrorHandlingTestSuite {
 
     const scheduler = this.createScheduler({ SelfTerminatingWorker: workerManager });
 
-    const task1 = new DagTask({
+    const task1 = new FyflowTask({
       id: 'restart-test-1',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'self-terminate', canRestart: false }
     });
 
     try {
-      await scheduler.addTask(task1);
+      await scheduler.addTask(task1, { createPromise: true });
     } catch (error: any) {
       // Expected
     }
@@ -661,13 +661,13 @@ class ErrorHandlingTestSuite {
     if (newWorkerIds[0] === originalWorkerId) throw new Error('Worker ID should be different after restart');
 
     // Test that new worker can execute tasks
-    const task2 = new DagTask({
+    const task2 = new FyflowTask({
       id: 'restart-test-2',
       workerType: 'SelfTerminatingWorker',
       payload: { action: 'normal-task' }
     });
 
-    await scheduler.addTask(task2); // Should succeed with new worker
+    await scheduler.addTask(task2, { createPromise: true }); // Should succeed with new worker
   }
 }
 

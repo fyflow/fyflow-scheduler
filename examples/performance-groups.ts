@@ -1,4 +1,4 @@
-import { WorkerManager, DagScheduler, DagTask, ConcurrentLimitGroup, RateLimitGroup } from "../index.ts";
+import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup } from "../index.ts";
 
 let cpuWorkerUrl: any;
 let asyncWorkerUrl: any;
@@ -106,7 +106,7 @@ const workerPools = {
     )
 };
 
-const scheduler = new DagScheduler(workerPools, {
+const scheduler = new FyflowScheduler(workerPools, {
     gpu: gpuGroup,
     database: databaseGroup,
     api: apiGroup
@@ -121,7 +121,7 @@ console.log('  • SimpleWorker: 4×3 inline, no constraints');
 
 // Step 3: Create workloads that test different resource scenarios
 const gpuTasks = Array.from({ length: 12 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `gpu-task-${i}`,
         workerType: 'GpuWorker',
         payload: {
@@ -132,7 +132,7 @@ const gpuTasks = Array.from({ length: 12 }, (_, i) =>
 );
 
 const databaseTasks = Array.from({ length: 20 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `db-task-${i}`,
         workerType: 'DatabaseWorker',
         payload: {
@@ -143,7 +143,7 @@ const databaseTasks = Array.from({ length: 20 }, (_, i) =>
 );
 
 const apiTasks = Array.from({ length: 25 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `api-task-${i}`,
         workerType: 'ApiWorker',
         payload: {
@@ -154,7 +154,7 @@ const apiTasks = Array.from({ length: 25 }, (_, i) =>
 );
 
 const heavyTasks = Array.from({ length: 8 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `heavy-task-${i}`,
         workerType: 'HeavyWorker',
         payload: {
@@ -165,7 +165,7 @@ const heavyTasks = Array.from({ length: 8 }, (_, i) =>
 );
 
 const simpleTasks = Array.from({ length: 15 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `simple-task-${i}`,
         workerType: 'SimpleWorker',
         payload: {

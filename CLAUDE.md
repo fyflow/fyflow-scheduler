@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-FyFlow is a Deno-based distributed task processing framework that provides DAG (Directed Acyclic Graph) scheduling capabilities with resource management. The framework enables complex workflow orchestration with features like dynamic task spawning, CPU/GPU resource management, worker pooling, and retry mechanisms.
+FyFlow is a Deno-based distributed task processing framework that provides parallel task execution with resource management. The framework enables high-performance workflow orchestration with features like dynamic task spawning, CPU/GPU resource management, worker pooling, and retry mechanisms.
 
 > **Task Management**: Development tasks are tracked in `TODO_CHECKLIST.md` with a standardized lifecycle process (Refinement → Implementation → Completion). Claude references this file when performing changes to ensure alignment with project priorities and follows the established completion procedures including documentation updates and task archival.
 
@@ -12,12 +12,12 @@ FyFlow is a Deno-based distributed task processing framework that provides DAG (
 
 ### Core Components
 
-**Task Scheduler (`core/dagScheduler.ts`)**
-- Central orchestrator for DAG-based task execution
-- Manages task dependencies and execution order
+**Task Scheduler (`core/FyflowScheduler.ts`)**
+- Central orchestrator for parallel task execution
 - Handles task states: pending → running → completed/failed
 - Supports dynamic task spawning from completed tasks
 - Event-driven architecture with custom event dispatching
+- All tasks execute in parallel (subject to resource constraints)
 
 **Resource Management**
 - **Group-based constraints**: CPU limiting through ConcurrentLimitGroup instead of global singleton
@@ -48,31 +48,44 @@ FyFlow is a Deno-based distributed task processing framework that provides DAG (
 - **Event-driven monitoring**: Lifecycle events for initialization, setup, teardown
 - Configurable concurrent task limits per worker instance
 
-**Resource Groups (`groups/exampleGroup.ts`)**
-- Constraint-based execution groups (e.g., GPU pools)
-- Concurrent execution limits per group
-- Group-based resource allocation
+**Resource Groups**
+- **ConcurrentLimitGroup** (`groups/concurrentLimitGroup.ts`): Optimistic soft limits with race-tolerant allocation
+  - Best for: CPU scheduling, throughput limiting, load balancing
+  - May briefly exceed limit by up to `maxThreads × maxConcurrentTasks`
+  - Synchronous acquisition via `onStart()` / `onFinish()`
+- **RateLimitGroup** (`groups/rateLimitGroup.ts`): Time-window based rate limiting
+  - Best for: API rate limits, request throttling
+  - Supports multiple overlapping time windows
+  - Tracks both running and completed requests
+- **Unified Interface**: All groups implement `ResourceGroup` interface with `getMetrics()` and `getStats()` for monitoring
 
 ## Features
 
-### 1. DAG Task Scheduling
-- **Dependency Management**: Tasks can have parent/child relationships
-- **Automatic Ordering**: Tasks execute only when dependencies are satisfied
-- **Parallel Execution**: Independent tasks run concurrently
+### 1. Parallel Task Execution
+- **High Concurrency**: All tasks execute in parallel subject to resource constraints
+- **Parallel Execution**: Independent tasks run concurrently across worker pools
 - **State Tracking**: Real-time task state monitoring (pending/running/done/failed)
+- **Fire-and-forget**: Tasks can be added without waiting for completion
 
 ### 2. Dynamic Task Spawning
 - **Runtime Generation**: Tasks can spawn new tasks based on their results
 - **Conditional Workflows**: Dynamic branching based on task outcomes
 - **Cascading Execution**: Multi-level task generation
-- **Relationship Tracking**: Parent-child task relationship monitoring
+- **Descendant Tracking**: `await task.onCompleteDescendants()` waits for task + all spawned children
 
 ### 3. Resource Management
-- **Group-based CPU Management**: ConcurrentLimitGroup-based CPU constraints replace global singleton
+- **Optimistic Allocation (ConcurrentLimitGroup)**:
+  - Synchronous, fast allocation with race-tolerant over-allocation
+  - Perfect for soft limits like CPU scheduling where brief overage is acceptable
+  - May exceed limit by up to `maxThreads × maxConcurrentTasks` during race conditions
+- **Rate Limiting (RateLimitGroup)**:
+  - Time-window based request throttling
+  - Multiple overlapping windows (e.g., 10/sec, 100/min simultaneously)
+  - Tracks running and completed requests
 - **Worker-level Group Assignment**: Groups specified at WorkerManager level for cleaner API
-- **Resource Groups**: GPU/memory pool constraints with concurrent execution limits
-- **Configurable Limits**: Per-worker-type and per-group resource allocation
-- **Automatic Release**: Resource cleanup on task completion
+- **Mixed Group Support**: Tasks can use multiple resource groups simultaneously
+- **Automatic Resource Cleanup**: Resource release on task completion/failure
+- **Real-time Monitoring**: `scheduler.getResourceMetrics()` and `scheduler.getResourceStats()` for observability
 
 ### 4. Worker Pool Management
 - **Multiple Pool Types**: Different worker pools for different task types
@@ -119,9 +132,8 @@ FyFlow is a Deno-based distributed task processing framework that provides DAG (
 deno task start
 
 # Run specific examples
-deno run --allow-read --allow-net examples/getting-started.ts      # Basic usage
-deno run --allow-read --allow-net examples/advanced-features.ts    # Dynamic spawning
-deno run --allow-read --allow-net examples/enhanced-features.ts    # Progress reporting & enhanced communication
+deno run --allow-read --allow-net examples/getting-started.ts      # Basic parallel execution
+deno run --allow-read --allow-net examples/enhanced-features.ts    # Progress reporting & dynamic spawning
 deno run --allow-read --allow-net examples/worker-types.ts         # Worker comparison
 deno run --allow-read --allow-net examples/performance-groups.ts   # Resource management
 
@@ -157,13 +169,14 @@ deno fmt .
 ```
 fyflow-new/
 ├── core/                         # Core execution engine
-│   ├── dagScheduler.ts           # Main task scheduler
+│   ├── FyflowScheduler.ts           # Main task scheduler
 │   ├── workerManager.ts          # Worker pool management
 │   ├── threadWrapper.ts          # Worker thread wrapper
 │   ├── inlineWrapper.ts          # Inline worker implementation
 │   └── workerInterface.ts        # Worker interface definitions
 ├── groups/                       # Resource group implementations
-│   ├── concurrentLimitGroup.ts   # Concurrent execution groups
+│   ├── concurrentLimitGroup.ts   # Optimistic soft limits (race-tolerant)
+│   ├── strictLimitGroup.ts       # Hard limits with async tokens (never exceeds)
 │   └── rateLimitGroup.ts         # Rate limiting groups
 ├── examples/                     # Example implementations
 │   ├── workers/                  # Essential worker implementations
@@ -174,7 +187,8 @@ fyflow-new/
 │   ├── getting-started.ts        # Basic usage and task dependencies
 │   ├── advanced-features.ts      # Dynamic spawning and resource groups
 │   ├── worker-types.ts           # Inline vs threaded comparison
-│   └── performance-groups.ts     # Resource management and constraints
+│   ├── performance-groups.ts     # Resource management and constraints
+│   └── strict-limits.ts          # Strict resource limits (GPU/API)
 ├── benchmark/                    # Performance benchmarking suite
 │   ├── perfUtils.ts              # Performance measurement utilities
 │   ├── benchmarkScenarios.ts     # Benchmark execution framework
@@ -194,40 +208,41 @@ fyflow-new/
 
 ### Getting Started
 For basic usage, see `examples/getting-started.ts` which demonstrates:
-- Simple task creation and dependencies
+- Simple parallel task creation
 - Worker setup and configuration
 - Event listening and monitoring
 - Basic resource management
 
-### Basic Task Creation (NEW API)
+### Basic Task Creation
 ```typescript
-// Configure WorkerManager with groups (NEW: cleaner API)
+// Configure WorkerManager with groups
 const cpuGroup = new ConcurrentLimitGroup(4); // CPU constraint group
 const workerManager = new WorkerManager(scriptUrl, {
   maxThreads: 4,
   maxConcurrentTasks: 1,
-  groups: ['cpu']  // Groups specified once at pool level
+  groups: ['cpu']  // Groups specified at pool level
 });
 
-// Tasks automatically inherit groups from their WorkerManager
-const task = new DagTask({
+// Create parallel tasks (no dependencies)
+const task = new FyflowTask({
   id: 'process-data',
   workerType: 'DataProcessor',
-  payload: { data: 'raw-input' },
-  parents: ['data-fetch']
-  // No workerGroups needed - inherited from WorkerManager!
+  payload: { data: 'raw-input' }
+  // Groups inherited from WorkerManager, or override with workerGroups
 });
+
+// All tasks execute in parallel
+scheduler.addTask(task);
 ```
 
-### Backward Compatibility
+### Task-Level Group Override
 ```typescript
-// OLD API still works for transition
-const task = new DagTask({
-  id: 'process-data',
+// Override worker manager groups at task level if needed
+const task = new FyflowTask({
+  id: 'gpu-intensive-task',
   workerType: 'DataProcessor',
-  payload: { data: 'raw-input' },
-  parents: ['data-fetch'],
-  workerGroups: ['gpu']    // Task-level groups still supported
+  payload: { data: 'large-batch' },
+  workerGroups: ['gpu', 'memory']  // Task-level override
 });
 ```
 
@@ -238,12 +253,6 @@ For enhanced worker features, see `examples/enhanced-features.ts` which demonstr
 - Workflow completion tracking with `onCompleteDescendants()`
 - Enhanced event-driven monitoring and observability
 
-### Advanced Features
-For complex workflows, see `examples/advanced-features.ts` which demonstrates:
-- Dynamic task spawning based on results
-- Resource groups and constraints
-- Event-driven workflow orchestration
-- Complex data processing pipelines
 
 ### Worker Types
 For understanding different worker patterns, see `examples/worker-types.ts` which demonstrates:
@@ -258,6 +267,14 @@ For resource management, see `examples/performance-groups.ts` which demonstrates
 - Resource contention handling
 - Performance monitoring
 - Load balancing strategies
+
+### Strict Resource Limits (GPU/API)
+For hard resource constraints, see `examples/strict-limits.ts` which demonstrates:
+- StrictLimitGroup for GPU memory (never exceeds 4GB)
+- Mixed strict + optimistic groups (GPU strict, CPU optimistic)
+- Real-time resource monitoring and violation detection
+- Async token-based resource acquisition
+- Wait queue statistics and timeout handling
 
 ### Progress Reporting
 Workers can report real-time progress during execution:
@@ -288,7 +305,6 @@ async run(payload: any, context?: WorkerContext): Promise<any> {
     id: 'child-task-1',
     workerType: 'ProcessorWorker',
     payload: { data: processedData },
-    parents: [], // Optional parent dependencies
     workerGroups: ['cpu'] // Optional resource groups
   });
 
@@ -302,14 +318,13 @@ scheduler.addEventListener('task.spawn_request', (e) => {
 });
 ```
 
-
 ### Workflow Completion Tracking
 Wait for complete workflows including all spawned descendants:
 ```typescript
 // Wait for task + all spawned children/grandchildren/etc
 await dataAnalysisTask.onCompleteDescendants();
 
-// vs regular completion (just the parent task)
+// vs regular completion (just this task)
 await scheduler.addTask(dataAnalysisTask);
 ```
 
@@ -368,27 +383,56 @@ if (typeof self !== 'undefined' && 'postMessage' in self) {
 ```
 
 ### Resource Configuration
-```typescript
-const cpuGroup = new ConcurrentLimitGroup(16); // 16 CPU slots
-const gpuGroup = new ConcurrentLimitGroup(4);  // 4 concurrent GPU tasks
 
-// Configure worker managers with concurrent execution and class-based workers
+#### Optimistic Limits (ConcurrentLimitGroup)
+Best for soft limits where brief overage is acceptable:
+```typescript
+const cpuGroup = new ConcurrentLimitGroup(16, 'cpu'); // ~16 CPU cores (may briefly exceed)
+
 const cpuPool = new WorkerManager(scriptUrl, {
   maxThreads: 4,
   maxConcurrentTasks: 1,
-  idleTimeout: 5000,
-  groups: ['cpu'],  // Groups specified at WorkerManager level
-  config: { /* worker-specific config */ }
-});     // 4 threads, 1 task each
+  groups: ['cpu']  // Optimistic allocation
+});
+// May briefly use 17/16 CPU during race conditions, but resolves quickly
+```
 
-const asyncPool = new WorkerManager(scriptUrl, {
-  maxThreads: 2,
-  maxConcurrentTasks: 10,
-  idleTimeout: 5000,
-  inline: true,
-  config: { /* worker-specific config */ }
-}); // 2 inline workers, 10 concurrent tasks each
-// Total capacity: 4 + 20 = 24 concurrent tasks
+#### Strict Limits (StrictLimitGroup)
+Best for hard constraints that must NEVER be exceeded:
+```typescript
+const gpuMemory = new StrictLimitGroup(4, 'gpu'); // Exactly 4GB GPU memory (NEVER exceeds)
+const apiLimit = new StrictLimitGroup(10, 'api'); // Exactly 10 concurrent API calls
+
+const gpuPool = new WorkerManager(scriptUrl, {
+  maxThreads: 4,
+  maxConcurrentTasks: 2, // 8 total capacity
+  groups: ['gpu', 'api']  // Strict allocation - tasks block until slots available
+});
+// Tasks wait in FIFO queue when GPU/API slots full - guaranteed never to exceed
+```
+
+#### Mixed Groups (Strict + Optimistic)
+Combine both strategies for optimal performance:
+```typescript
+const gpuMemory = new StrictLimitGroup(4, 'gpu');    // STRICT: GPU memory
+const cpuCores = new ConcurrentLimitGroup(8, 'cpu');  // OPTIMISTIC: CPU
+
+const scheduler = new FyflowScheduler(
+  { MLWorker: new WorkerManager(scriptUrl, {
+    maxThreads: 4,
+    maxConcurrentTasks: 2,
+    groups: ['gpu', 'cpu']  // Both strict and optimistic
+  })},
+  { gpu: gpuMemory, cpu: cpuCores }
+);
+
+// Monitor resources in real-time
+const metrics = scheduler.getResourceMetrics();
+console.log(`GPU: ${metrics.gpu.running}/${metrics.gpu.limit} (${(metrics.gpu.utilization * 100).toFixed(1)}%)`);
+
+// Get detailed stats for strict groups
+const stats = scheduler.getResourceStats();
+console.log(`GPU avg wait: ${stats.gpu.avgWaitTime}ms, queue depth: ${stats.gpu.currentWaiting}`);
 ```
 
 ## Performance Benchmarking
@@ -435,10 +479,6 @@ deno task benchmark:overlapping
 deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories group_scaling
 ```
 
-**Dependencies** (3 scenarios): Complex DAG dependency patterns
-```bash
-deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories dependencies
-```
 
 **Stress Tests** (1 scenario): 100K+ tasks for memory pressure testing
 ```bash

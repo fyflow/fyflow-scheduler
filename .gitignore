@@ -1,10 +1,11 @@
 # IDE and Editor
-.claude/
 .vscode/
 .idea/
 *.swp
 *.swo
+.claude/
 
+TODO_CHECKLIST.md
 # Node.js
 node_modules/
 npm-debug.log*

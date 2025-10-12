@@ -1,4 +1,4 @@
-import { WorkerManager, DagScheduler, DagTask } from "../index.ts";
+import { WorkerManager, FyflowScheduler, FyflowTask } from "../index.ts";
 
 /**
  * Worker Types Example
@@ -64,7 +64,7 @@ const workerPools = {
     )
 };
 
-const scheduler = new DagScheduler(workerPools);
+const scheduler = new FyflowScheduler(workerPools);
 
 console.log('🏭 Created worker pools:');
 console.log('  • CpuThreaded: 4 threads × 1 task = 4 CPU tasks (uses 4 CPU slots)');
@@ -75,7 +75,7 @@ console.log('  📊 Total theoretical capacity: 34 concurrent tasks using 6/8 CP
 
 // Step 3: Create diverse workloads
 const cpuTasks = Array.from({ length: 6 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `cpu-intensive-${i}`,
         workerType: 'CpuThreaded',
         payload: {
@@ -86,7 +86,7 @@ const cpuTasks = Array.from({ length: 6 }, (_, i) =>
 );
 
 const asyncTasks = Array.from({ length: 15 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `async-io-${i}`,
         workerType: 'AsyncInline',
         payload: {
@@ -97,7 +97,7 @@ const asyncTasks = Array.from({ length: 15 }, (_, i) =>
 );
 
 const simpleThreadedTasks = Array.from({ length: 4 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `simple-threaded-${i}`,
         workerType: 'SimpleThreaded',
         payload: {
@@ -108,7 +108,7 @@ const simpleThreadedTasks = Array.from({ length: 4 }, (_, i) =>
 );
 
 const simpleInlineTasks = Array.from({ length: 10 }, (_, i) =>
-    new DagTask({
+    new FyflowTask({
         id: `simple-inline-${i}`,
         workerType: 'SimpleInline',
         payload: {

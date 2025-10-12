@@ -28,6 +28,7 @@
     "serve:test": "npx http-server . -p 3000 -c-1 --cors",
     "benchmark": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js",
     "benchmark:quick": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --quick",
+    "benchmark:baseline": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories baseline",
     "benchmark:variance": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --quick --runs 3",
     "benchmark:contention": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories contention",
     "benchmark:overlapping": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories overlapping",

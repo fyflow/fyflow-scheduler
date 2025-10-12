@@ -12,7 +12,7 @@ export default class TestThreadWorker extends BaseWorker {
   }
 
   async setup() {
-    console.log('TestThreadWorker setup completed');
+    // console.log('TestThreadWorker setup completed');
   }
 
   async run(payload: any) {
@@ -35,6 +35,6 @@ export default class TestThreadWorker extends BaseWorker {
   }
 
   async teardown() {
-    console.log('TestThreadWorker teardown completed');
+    // console.log('TestThreadWorker teardown completed');
   }
 }

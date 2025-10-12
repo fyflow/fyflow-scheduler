@@ -1,6 +1,6 @@
 # FyFlow Scheduler
 
-Zero-dependency DAG task scheduler with resource management and cross-platform support.
+Zero-dependency parallel task scheduler with resource management and cross-platform support.
 
 [![npm version](https://badge.fury.io/js/fyflow-scheduler.svg)](https://badge.fury.io/js/fyflow-scheduler)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -9,7 +9,7 @@ Zero-dependency DAG task scheduler with resource management and cross-platform s
 
 ## Overview
 
-FyFlow is a self-contained DAG (Directed Acyclic Graph) task scheduler with resource management. Fully in-memory operation with zero dependencies. Extensible APIs allow enhancement for persistence, distributed execution, or multi-machine coordination.
+FyFlow is a self-contained parallel task scheduler with resource management. Fully in-memory operation with zero dependencies. Extensible APIs allow enhancement for persistence, distributed execution, or multi-machine coordination.
 
 ## Installation
 
@@ -27,21 +27,21 @@ deno add @fyflow/scheduler
 ## Quick Start
 
 ```typescript
-import { DagScheduler, DagTask, WorkerManager, ConcurrentLimitGroup } from 'fyflow-scheduler';
+import { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup } from 'fyflow-scheduler';
 
 // Create worker pool
 const workerPool = new WorkerManager('./worker.js', { maxThreads: 2 });
 
 // Create scheduler with CPU constraints
-const scheduler = new DagScheduler(
+const scheduler = new FyflowScheduler(
   { MyWorker: workerPool },
   { cpu: new ConcurrentLimitGroup(4) }
 );
 
-// Create task chain
+// Create parallel tasks
 const tasks = [
-  new DagTask({ id: 'task1', workerType: 'MyWorker', payload: { data: 'input' } }),
-  new DagTask({ id: 'task2', workerType: 'MyWorker', payload: { data: 'processed' }, parents: ['task1'] })
+  new FyflowTask({ id: 'task1', workerType: 'MyWorker', payload: { data: 'input' } }),
+  new FyflowTask({ id: 'task2', workerType: 'MyWorker', payload: { data: 'processed' } })
 ];
 
 // Execute
@@ -50,7 +50,7 @@ tasks.forEach(task => scheduler.addTask(task));
 
 ## Key Features
 
-- **DAG Scheduling**: Automatic dependency resolution and parallel execution
+- **Parallel Task Execution**: High-performance concurrent task processing
 - **Resource Management**: CPU/GPU constraints with concurrent execution limits
 - **Dynamic Task Spawning**: Workers can create new tasks at runtime
 - **Cross-Platform**: Node.js, Browser, and Deno support
@@ -87,15 +87,18 @@ export default class MyWorker extends BaseWorker {
 }
 ```
 
-### Task Dependencies
+### Parallel Task Execution
 
 ```typescript
 const tasks = [
-  new DagTask({ id: 'fetch', workerType: 'DataWorker', payload: { url: 'api/data' } }),
-  new DagTask({ id: 'validate', workerType: 'ValidationWorker', payload: {}, parents: ['fetch'] }),
-  new DagTask({ id: 'process', workerType: 'ProcessWorker', payload: {}, parents: ['validate'] }),
-  new DagTask({ id: 'save', workerType: 'SaveWorker', payload: {}, parents: ['process'] })
+  new FyflowTask({ id: 'fetch', workerType: 'DataWorker', payload: { url: 'api/data' } }),
+  new FyflowTask({ id: 'validate', workerType: 'ValidationWorker', payload: { url: 'api/data2' } }),
+  new FyflowTask({ id: 'process', workerType: 'ProcessWorker', payload: { batch: 1 } }),
+  new FyflowTask({ id: 'save', workerType: 'SaveWorker', payload: { batch: 2 } })
 ];
+
+// All tasks execute in parallel (subject to resource constraints)
+tasks.forEach(task => scheduler.addTask(task));
 ```
 
 ### Resource Groups
@@ -104,7 +107,7 @@ const tasks = [
 const cpuGroup = new ConcurrentLimitGroup(8);  // Max 8 concurrent CPU tasks
 const gpuGroup = new ConcurrentLimitGroup(2);  // Max 2 concurrent GPU tasks
 
-const scheduler = new DagScheduler(workerPools, {
+const scheduler = new FyflowScheduler(workerPools, {
   cpu: cpuGroup,
   gpu: gpuGroup
 });
@@ -136,16 +139,17 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 
 ### Core Classes
 
-**DagScheduler(workerPools, resourceGroups)**
+**FyflowScheduler(workerPools, resourceGroups)**
 - `addTask(task)`: Add task to execution queue
 - `stats`: Current execution statistics
 - `addEventListener(event, handler)`: Event monitoring
 
-**DagTask(config)**
+**FyflowTask(config)**
 - `id`: Unique task identifier
 - `workerType`: Worker pool to use
 - `payload`: Data passed to worker
-- `parents`: Array of parent task IDs
+- `workerGroups`: Optional resource group names
+- `optional`: Mark task as optional (failures don't block workflow)
 
 **WorkerManager(scriptUrl, options)**
 - `maxThreads`: Maximum worker threads
@@ -199,10 +203,10 @@ npm run benchmark:quick    # Quick performance test
 ## Examples
 
 See the `examples/` directory for comprehensive usage examples:
-- `getting-started.ts`: Basic task chains
-- `advanced-features.ts`: Dynamic spawning and resource groups
-- `enhanced-features.ts`: Progress reporting and event monitoring
+- `getting-started.ts`: Basic parallel task execution
+- `enhanced-features.ts`: Progress reporting and dynamic task spawning
 - `worker-types.ts`: Thread vs inline worker comparison
+- `performance-groups.ts`: Resource management and constraints
 
 ## License
 
