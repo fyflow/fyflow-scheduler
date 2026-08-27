@@ -76,7 +76,14 @@ parentPort?.on('message', async (data: any) => {
 
             // Initialize worker instance with BaseWorkerContext
             workerInstance = new WorkerClass(config, baseWorkerContext);
+
+            // Report setup timing so ThreadWrapper can emit the same
+            // worker.setup.* events an inline worker emits
+            sendMessage({ type: 'setup_started' });
+            const setupStart = Date.now();
             await workerInstance.setup?.();
+            sendMessage({ type: 'setup_completed', data: { duration: Date.now() - setupStart } });
+
             sendMessage({ type: 'init' });
         } else if (action === 'run' && workerInstance && workerId) {
             // Create TaskWorkerContext with both worker and task capabilities

@@ -10,6 +10,16 @@ import path from "node:path";
 const args = process.argv.slice(2);
 const buildType = args.includes('--dev') ? 'development' : 'library';
 
+// Clear the output directory before building. Without this, declarations and
+// bundles for deleted modules survive - dist/types/core/dagScheduler.d.ts
+// outlived its source by months, and package.json ships dist/**/*, so it would
+// have been published.
+const outputDir = buildType === 'development' ? 'dev-dist' : 'dist';
+if (fs.existsSync(outputDir)) {
+  fs.rmSync(outputDir, { recursive: true, force: true });
+  console.log(`🧹 Cleared ${outputDir}/`);
+}
+
 const workerPlugin = {
   name: "worker-loader",
   setup(build) {
@@ -81,6 +91,9 @@ if (buildType === 'development') {
       "tests/runner.ts",
       "tests/suites/core.ts",
       "tests/suites/error-handling.ts",
+      "tests/suites/spawning.ts",
+      "tests/suites/docs.ts",
+      "tests/performance/contention-scaling.ts",
       "benchmark/runBenchmarks.ts"
     ],
     bundle: true,

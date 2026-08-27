@@ -197,6 +197,11 @@ export class BenchmarkRunner {
 
         // Calculate coordination overhead: Total time - time if all work was sequential
         const totalWorkerTime = this.workerExecutionTimes.reduce((sum, time) => sum + time, 0);
+        // Guard against the timing feed silently breaking: without per-task execution
+        // times, both coordination overhead and overall efficiency are meaningless.
+        if (this.workerExecutionTimes.length === 0) {
+            console.warn(`⚠️  No worker execution times collected - 'task.completed' events carried no executionTime. Coordination overhead and overall efficiency are not measurable for this run.`);
+        }
         // For truly concurrent execution, the minimum possible time would be totalWorkerTime / maxConcurrency
         const maxPossibleConcurrency = config.workerConfig.inline
             ? config.workerConfig.maxConcurrentTasks

@@ -1,7 +1,7 @@
 {
   "name": "@fyflow/scheduler",
   "version": "0.1.0",
-  "description": "DAG-based task scheduler with resource management, worker pools, and cross-platform support",
+  "description": "Parallel task scheduler with resource management, worker pools, and cross-platform support",
   "license": "MIT",
   "homepage": "https://github.com/fyflow/fyflow-scheduler",
   "repository": {

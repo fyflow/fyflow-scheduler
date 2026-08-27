@@ -1,8 +1,15 @@
 // FyFlow Test Runner - Unified test execution for all test suites
 // Supports running individual suites or all tests
 
+// Node.js process declaration for cross-platform compatibility
+declare const process: any;
+
 class TestRunner {
-  private suiteRan = false;
+  private failedSuites: string[] = [];
+
+  get hasFailures(): boolean {
+    return this.failedSuites.length > 0;
+  }
 
   async runSuite(name: string, suitePath: string): Promise<void> {
     console.log(`\n🧪 Running ${name} test suite...`);
@@ -16,7 +23,12 @@ class TestRunner {
         const suite = new module.default();
         try {
           // Prevent the suite from exiting the process
-          await suite.runAllTests(false);
+          const result = await suite.runAllTests(false);
+          // Class-based suites report their own failure counts - surface them
+          // so the runner can exit non-zero for CI/CD.
+          if (result && result.failed > 0) {
+            this.failedSuites.push(`${name} (${result.failed}/${result.totalTests} tests failed)`);
+          }
         } finally {
           // Cleanup the suite to prevent resource leaks and infinite loops
           if (typeof suite.cleanup === 'function') {
@@ -24,14 +36,22 @@ class TestRunner {
           }
         }
       } else {
-        // It's a direct script - importing it runs the tests
+        // It's a direct script - importing it runs the tests, and a failing
+        // script throws, which lands in the catch below.
         console.log("Direct test script execution completed.");
       }
-      this.suiteRan = true;
 
     } catch (error) {
       console.error(`❌ Failed to run ${name} suite:`, error);
-      this.suiteRan = false;
+      this.failedSuites.push(name);
+    }
+  }
+
+  reportFailures(): void {
+    if (this.failedSuites.length === 0) return;
+    console.error(`\nFailed suites (${this.failedSuites.length}):`);
+    for (const suite of this.failedSuites) {
+      console.error(`  - ${suite}`);
     }
   }
 
@@ -50,6 +70,12 @@ class TestRunner {
       // Run error handling tests
       await this.runSuite('Error Handling', `./suites/error-handling${ext}`);
 
+      // Run spawning and descendant tracking tests
+      await this.runSuite('Spawning', `./suites/spawning${ext}`);
+
+      // Run the executable documentation examples
+      await this.runSuite('Documentation Examples', `./suites/docs${ext}`);
+
       console.log('\n🎉 All test suites completed!');
     } catch (error) {
       console.error('❌ Test runner failed:', error);
@@ -65,6 +91,8 @@ class TestRunner {
       'core': `./suites/core${ext}`,
       'error': `./suites/error-handling${ext}`,
       'error-handling': `./suites/error-handling${ext}`,
+      'spawning': `./suites/spawning${ext}`,
+      'docs': `./suites/docs${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
 
@@ -99,6 +127,8 @@ async function main() {
     console.log('Available suites:');
     console.log('  core        - Core functionality tests');
     console.log('  error       - Error handling tests');
+    console.log('  spawning    - Task spawning and descendant tracking tests');
+    console.log('  docs        - Executable documentation examples');
     console.log('  performance - Performance tests');
     console.log('');
     console.log('Browser testing:');
@@ -114,6 +144,16 @@ async function main() {
   } else {
     // Run specific suite
     await runner.runSpecificSuite(args[0]);
+  }
+
+  // Surface failures to CI/CD via the process exit code
+  if (runner.hasFailures) {
+    runner.reportFailures();
+    if (typeof Deno !== 'undefined') {
+      Deno.exit(1);
+    } else {
+      process.exit(1);
+    }
   }
 }
 

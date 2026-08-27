@@ -11,6 +11,7 @@ export type { FyflowSchedulerOptions, AddTaskOptions } from "./core/FyflowSchedu
 // Groups
 export { ConcurrentLimitGroup } from "./groups/concurrentLimitGroup.ts";
 export { RateLimitGroup } from "./groups/rateLimitGroup.ts";
+export type { RateWindow } from "./groups/rateLimitGroup.ts";
 export type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from "./groups/resourceGroup.ts";
 
 // Worker management
@@ -20,6 +21,16 @@ export { InlineWrapper } from "./core/inlineWrapper.ts";
 
 // Types and interfaces
 export type { WorkerManagerOptions } from "./core/workerManager.ts";
-export type { WorkerInterface, WorkerConfig, BaseWorkerContext, TaskWorkerContext } from "./core/workerInterface.ts";
-export { BaseWorker } from "./core/workerInterface.ts";
+export type {
+  WorkerInterface,
+  WorkerConfig,
+  BaseWorkerContext,
+  TaskWorkerContext,
+  WorkerContext,
+  SpawnTaskConfig,
+  ProgressData,
+  WorkerStatus,
+  WorkerInstanceState
+} from "./core/workerInterface.ts";
+export { BaseWorker, WorkerTerminationError } from "./core/workerInterface.ts";
 

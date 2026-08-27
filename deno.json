@@ -1,6 +1,6 @@
 {
     "compilerOptions": {
-      "lib": ["dom", "dom.iterable", "esnext"],
+      "lib": ["deno.ns", "dom", "dom.iterable", "esnext"],
       "checkJs": false,
       "jsx": "react",
       "strict": true
@@ -17,9 +17,12 @@
     },
     "tasks": {
       "start": "deno run --allow-read --allow-net examples/getting-started.ts",
+      "check": "deno check index.ts tests/runner.ts core/ groups/ tests/suites/ tests/workers/ tests/performance/ benchmark/ examples/",
       "test": "deno run --allow-read --allow-net tests/runner.ts",
       "test:core": "deno run --allow-read --allow-net tests/runner.ts core",
       "test:error": "deno run --allow-read --allow-net tests/runner.ts error",
+      "test:spawning": "deno run --allow-read --allow-net tests/runner.ts spawning",
+      "test:docs": "deno run --allow-read --allow-net tests/runner.ts docs",
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",
       "benchmark:quick": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick",

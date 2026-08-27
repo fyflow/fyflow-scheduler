@@ -97,6 +97,9 @@ export class ReportGenerator {
             md.push(`- **Total Duration**: ${formatDuration(result.metrics.totalDuration)}`);
             md.push(`- **Scheduler Overhead**: ${formatDuration(result.metrics.schedulerOverhead)}`);
             md.push(`- **Async Execution Overhead**: ${formatDuration(result.metrics.asyncExecutionOverhead)}`);
+            md.push(`- **Coordination Overhead**: ${formatDuration(result.metrics.coordinationOverhead)}`);
+            md.push(`- **Total Worker Time**: ${formatDuration(result.metrics.totalWorkerTime)}`);
+            md.push(`- **Overall Efficiency**: ${result.metrics.overallEfficiency.toFixed(1)}%`);
             md.push(`- **Task Throughput**: ${result.metrics.taskThroughput.toFixed(2)} tasks/sec`);
             md.push(`- **Memory Delta**: ${formatBytes(result.metrics.memoryUsage.delta)}`);
             md.push(`- **Peak Memory**: ${formatBytes(result.metrics.memoryUsage.peak)}`);
@@ -155,6 +158,9 @@ export class ReportGenerator {
             'Total Duration (ms)',
             'Scheduler Overhead (ms)',
             'Async Execution Overhead (ms)',
+            'Coordination Overhead (ms)',
+            'Total Worker Time (ms)',
+            'Overall Efficiency (%)',
             'Task Throughput (tasks/sec)',
             'Memory Delta (bytes)',
             'Peak Memory (bytes)',
@@ -175,6 +181,9 @@ export class ReportGenerator {
             result.metrics.totalDuration.toFixed(2),
             result.metrics.schedulerOverhead.toFixed(2),
             result.metrics.asyncExecutionOverhead.toFixed(2),
+            result.metrics.coordinationOverhead.toFixed(2),
+            result.metrics.totalWorkerTime.toFixed(2),
+            result.metrics.overallEfficiency.toFixed(1),
             result.metrics.taskThroughput.toFixed(2),
             result.metrics.memoryUsage.delta,
             result.metrics.memoryUsage.peak,

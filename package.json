@@ -1,7 +1,7 @@
 {
   "name": "fyflow-scheduler",
   "version": "0.1.0",
-  "description": "DAG-based task scheduler with resource management, worker pools, and cross-platform support",
+  "description": "Parallel task scheduler with resource management, worker pools, and cross-platform support",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
   "types": "./dist/types/index.d.ts",
@@ -14,10 +14,13 @@
     "test": "npm run build:dev && node dev-dist/node/tests/runner.js",
     "test:core": "npm run build:dev && node dev-dist/node/tests/runner.js core",
     "test:error": "npm run build:dev && node dev-dist/node/tests/runner.js error",
+    "test:spawning": "npm run build:dev && node dev-dist/node/tests/runner.js spawning",
+    "test:docs": "npm run build:dev && node dev-dist/node/tests/runner.js docs",
     "test:performance": "npm run build:dev && node dev-dist/node/tests/runner.js performance",
     "test:deno": "deno task test",
     "test:deno:core": "deno task test:core",
     "test:deno:error": "deno task test:error",
+    "test:deno:spawning": "deno task test:spawning",
     "test:browser": "npm run build:dev && npx playwright test",
     "test:browser:headed": "npm run build:dev && npx playwright test --headed",
     "test:browser:debug": "npm run build:dev && npx playwright test --debug",
@@ -34,7 +37,7 @@
     "benchmark:overlapping": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories overlapping",
     "benchmark:help": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --help"
   },
-  "keywords": ["scheduler", "dag", "task", "worker", "async", "concurrency", "workflow", "parallel", "typescript"],
+  "keywords": ["scheduler", "task", "worker", "async", "concurrency", "workflow", "parallel", "typescript"],
   "author": "FyFlow Team",
   "license": "MIT",
   "homepage": "https://github.com/fyflow/fyflow-scheduler#readme",
@@ -62,9 +65,12 @@
   "files": [
     "dist/**/*",
     "README.md",
-    "LICENSE"
+    "AGENTS.md"
   ],
   "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=22"
+  },
   "devDependencies": {
     "@playwright/test": "^1.55.1",
     "@types/node": "^22.0.0",

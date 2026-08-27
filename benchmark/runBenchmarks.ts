@@ -167,7 +167,7 @@ async function main() {
     // Generate report
     const suite = reportGenerator.generateSuiteReport(
         "FyFlow Scheduler Performance Benchmark",
-        "Comprehensive performance analysis of DAG scheduler and worker management",
+        "Comprehensive performance analysis of the FyFlow scheduler and worker management",
         results
     );
 

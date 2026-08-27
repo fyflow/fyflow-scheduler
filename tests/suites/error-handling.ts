@@ -14,6 +14,15 @@ interface TestResult {
   error?: string;
 }
 
+interface TestSuiteResult {
+  platform: string;
+  totalTests: number;
+  passed: number;
+  failed: number;
+  duration: number;
+  results: TestResult[];
+}
+
 class ErrorHandlingTestSuite {
   private results: TestResult[] = [];
   private startTime = 0;
@@ -81,7 +90,7 @@ class ErrorHandlingTestSuite {
     }
   }
 
-  async runAllTests(exitOnComplete = true): Promise<void> {
+  async runAllTests(exitOnComplete = true): Promise<TestSuiteResult> {
     const platform = typeof globalThis !== 'undefined' && 'Deno' in globalThis ? 'Deno' : 'Node.js';
     console.log(`🚀 FyFlow Error Handling Test Suite - ${platform}`);
     console.log('='.repeat(60));
@@ -96,6 +105,7 @@ class ErrorHandlingTestSuite {
     // Core Worker Crash Tests
     this.results.push(await this.runTest('Worker Runtime Crash during Task Execution', () => this.testWorkerRuntimeCrash()));
     this.results.push(await this.runTest('Worker Setup Method Failure', () => this.testWorkerSetupFailure()));
+    this.results.push(await this.runTest('Worker Initialization Failure', () => this.testWorkerInitializationFailure()));
 
     // Core Event Emission Tests
     this.results.push(await this.runTest('Worker Failed Event Emission', () => this.testWorkerFailedEventEmission()));
@@ -139,6 +149,15 @@ class ErrorHandlingTestSuite {
     } else {
       console.log('\n🎉 All error handling tests passed!');
     }
+
+    return {
+      platform,
+      totalTests: this.results.length,
+      passed,
+      failed,
+      duration: totalDuration,
+      results: this.results
+    };
   }
 
 
@@ -292,7 +311,10 @@ class ErrorHandlingTestSuite {
     const workerManager = new WorkerManager(this.crashWorkerUrl, {
       maxThreads: 1,
       maxConcurrentTasks: 1,
-      inline: false
+      inline: false,
+      // crashOnInit is read from worker config, not the task payload - the
+      // constructor throws before any task runs
+      config: { crashOnInit: true }
     });
 
     const scheduler = this.createScheduler({ CrashingWorker: workerManager });
@@ -318,8 +340,11 @@ class ErrorHandlingTestSuite {
 
     await new Promise(resolve => setTimeout(resolve, 200));
 
-    // Note: Initialization failures are handled at worker creation, so we might not get this event
-    // The important thing is that the task fails gracefully
+    // worker.initialization.failed is forwarded by WorkerManager, so a crash
+    // during worker creation is observable rather than silent
+    if (!initFailedEmitted) {
+      throw new Error('worker.initialization.failed event not emitted');
+    }
   }
 
   // Test worker setup method failure

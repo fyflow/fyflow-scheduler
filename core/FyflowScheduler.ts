@@ -1,10 +1,33 @@
+/**
+ * A unit of work handed to a worker pool.
+ *
+ * Tasks are independent - there is no dependency graph. A task runs as soon as
+ * its worker pool has capacity and every resource group it belongs to has a
+ * free slot.
+ *
+ * ```typescript
+ * const task = new FyflowTask({
+ *   id: 'resize-image-42',
+ *   workerType: 'ImageWorker',     // key in the scheduler's workerPools
+ *   payload: { path: '/tmp/42.png' }
+ * });
+ * const result = await scheduler.addTask(task, { createPromise: true });
+ * ```
+ */
 export class FyflowTask {
     id: string;
     workerType: string;
     payload: any;
     optional: boolean;
     retryPolicy?: {maxRetries:number, backoffMs:number};
+    /** Retry attempts used so far, counted against `retryPolicy.maxRetries`. */
     attempts = 0;
+    /**
+     * `pending` -> `running` -> `done` | `failed`.
+     *
+     * A non-optional task that fails with no retries left ends in `user_action`,
+     * signalling that something outside the scheduler has to intervene.
+     */
     state: string = "pending";
     result?: any;
     error?: string; // Error message if task failed
@@ -14,11 +37,31 @@ export class FyflowTask {
     handleRejection: boolean; // If true (default), silently handle rejections for fire-and-forget
     startTime?: number; // Timestamp when task started execution
     endTime?: number; // Timestamp when task completed
+    /**
+     * Worker-measured execution time in ms (high resolution), set on completion.
+     * Unlike `endTime - startTime` this excludes time spent waiting for a worker
+     * slot. Cleared when a task is requeued or retried.
+     */
+    executionTime?: number;
     _resourcesPreAllocated?: boolean; // Flag to track if resources are pre-allocated
 
     // Private fields for resource management
     _scheduler?: FyflowScheduler; // Reference to scheduler for descendant tracking
 
+    /**
+     * @param config.id Unique task id. Reusing an id overwrites the earlier entry.
+     * @param config.workerType Key into the scheduler's `workerPools`. An unknown
+     *   value makes `addTask` throw.
+     * @param config.payload Passed verbatim to the worker's `run()`.
+     * @param config.optional Default `false`. An optional task that fails
+     *   resolves `null` instead of rejecting.
+     * @param config.retryPolicy `{ maxRetries, backoffMs }`. Omitted means no retries.
+     * @param config.workerGroups Resource groups for this task, *in addition* to
+     *   the groups its WorkerManager declares.
+     * @param config.handleRejection Default `true`. Attaches a silent catch so a
+     *   fire-and-forget failure does not surface as an unhandled rejection;
+     *   `task.failed` is still emitted.
+     */
     constructor({id, workerType, payload, optional = false, retryPolicy, workerGroups = [], handleRejection = true}: any) {
       this.id = id;
       this.workerType = workerType;
@@ -29,6 +72,11 @@ export class FyflowTask {
       this.handleRejection = handleRejection;
     }
 
+    /**
+     * Promise for this task alone, resolving with its result and rejecting if it
+     * fails. Prefer `addTask(task, { createPromise: true })`, which wires this up
+     * for you. Use `onCompleteDescendants()` to also wait for spawned tasks.
+     */
     onCompletePromise(): Promise<any> {
       return new Promise((resolve, reject) => {
         this.resolve = resolve;
@@ -36,27 +84,79 @@ export class FyflowTask {
       });
     }
 
-    // onCompleteDescendants(): Promise<any> {
-    //   return new Promise((resolve, reject) => {
-    //     // If task isn't added to scheduler yet, can't track descendants
-    //     if (!this._scheduler) {
-    //       reject(new Error('Task must be added to scheduler before tracking descendants'));
-    //       return;
-    //     }
+    /**
+     * Wait for this task AND every task spawned from it (children, grandchildren, ...)
+     * to reach a terminal state.
+     *
+     * Descendants come from runtime spawning via `context.spawnTask()` - this is
+     * lineage, not a scheduling dependency, and does not affect dispatch order.
+     *
+     * Resolves with this task's result once the whole workflow has settled. A failed
+     * descendant does not reject - descendant failures surface via `task.failed`
+     * events - but this task failing rejects, matching `onCompletePromise()`.
+     *
+     * Must be called after the task has been added to a scheduler.
+     */
+    onCompleteDescendants(): Promise<any> {
+      return new Promise((resolve, reject) => {
+        // If task isn't added to scheduler yet, can't track descendants
+        if (!this._scheduler) {
+          reject(new Error('Task must be added to a scheduler before tracking descendants'));
+          return;
+        }
 
-    //     this._scheduler._trackDescendants(this, resolve, reject);
-    //   });
-    // }
+        this._scheduler._trackDescendants(this, resolve, reject);
+      });
+    }
   }
   
   export interface FyflowSchedulerOptions {
     periodicRetryIntervalMs?: number; // Default: 50ms - retry interval for blocked tasks
+    /**
+     * Maximum number of terminal (done/failed/user_action) tasks to keep in
+     * `scheduler.tasks`. Once exceeded, the oldest-completed tasks are evicted
+     * along with their payloads, results and spawn lineage.
+     *
+     * Default: undefined - keep everything, which is what most workloads want
+     * since task counts are bounded and completed tasks stay inspectable. Set
+     * this for long-lived schedulers, where retention is otherwise unbounded.
+     *
+     * `stats` counts every task regardless, and in-flight tasks are never
+     * evicted.
+     */
+    maxCompletedTasks?: number;
   }
 
   export interface AddTaskOptions {
     createPromise?: boolean; // Default: false (fire-and-forget, no promise created)
   }
 
+  interface DescendantTracker {
+    rootId: string;
+    // Held by reference, not looked up by id, so that evicting the task from
+    // `scheduler.tasks` cannot change how the wait settles
+    rootTask: FyflowTask;
+    resolve: Function;
+    reject: Function;
+    pendingDescendants: Set<string>;
+  }
+
+  /**
+   * Runs tasks in parallel across worker pools, subject to resource groups.
+   *
+   * ```typescript
+   * const scheduler = new FyflowScheduler(
+   *   { ImageWorker: new WorkerManager(workerUrl, { maxThreads: 4, groups: ['cpu'] }) },
+   *   { cpu: new ConcurrentLimitGroup(8, 'cpu') }
+   * );
+   * scheduler.addTask(task);              // fire-and-forget
+   * await scheduler.shutdown();           // always shut down when finished
+   * ```
+   *
+   * Emits: `task.running`, `task.completed`, `task.failed`, `task.progress`,
+   * `task.user_action`, `task.spawn_request`, `task.spawn_failed` and
+   * `scheduler.completed`.
+   */
   export class FyflowScheduler extends EventTarget {
     tasks = new Map<string, FyflowTask>();
     readyQueuesByWorker = new Map<string, FyflowTask[]>(); // Per-worker-type queues for O(1) dispatch
@@ -65,7 +165,16 @@ export class FyflowTask {
     groups: Record<string, any>;
     stats = {queued:0, running:0, done:0, failed:0};
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
-    private descendantTrackers = new Map<string, { resolve: Function, reject: Function, pendingDescendants: Set<string> }>;
+    // Active onCompleteDescendants() waits, keyed by tracker id so one task can be
+    // awaited more than once. Empty unless onCompleteDescendants() is used.
+    private descendantTrackers = new Map<number, DescendantTracker>();
+    private nextTrackerId = 0;
+    // Spawn lineage: parent task id -> ids of tasks spawned from it. Populated only
+    // when workers spawn tasks; carries no scheduling meaning.
+    private spawnedChildren = new Map<string, Set<string>>();
+    // Terminal task ids in completion order, used only when maxCompletedTasks is
+    // set. A Set preserves insertion order, so the oldest entry is its first.
+    private completedTaskIds = new Set<string>();
     private options: FyflowSchedulerOptions;
 
     // Track ALL event listeners for cleanup
@@ -89,49 +198,62 @@ export class FyflowTask {
       this._setupGroupEventListeners();
     }
 
+    // Any task waiting on a resource group. Blocked tasks are subtracted from
+    // stats.queued when they leave the ready queue, so they are invisible to the
+    // stats alone.
+    private _hasBlockedTasks(): boolean {
+      for (const queue of this.blockedQueues.values()) {
+        if (queue.length > 0) return true;
+      }
+      return false;
+    }
+
     _checkCompletion() {
-      if (this.stats.queued === 0 && this.stats.running === 0 && this.stats.done > 0) {
+      const hasBlockedTasks = this._hasBlockedTasks();
+
+      if (this.stats.queued === 0 && this.stats.running === 0 && !hasBlockedTasks && this.stats.done > 0) {
         this._clearPeriodicRetry(); // Stop retries when all tasks are done
         this.dispatchEvent(new CustomEvent('scheduler.completed', {detail: this.stats}));
+      } else if (hasBlockedTasks && this.stats.queued === 0 && this.stats.running === 0) {
+        // Nothing is running to release resources on completion, so the periodic
+        // retry is the only thing that can ever unblock these tasks - for example
+        // a rate limit window expiring. Make sure it is still armed.
+        this._schedulePeriodicRetry();
       } else if (this.stats.queued > 0 && this.stats.running === 0) {
-        // Tasks are queued but none running - recover stuck dispatched tasks and retry
-        const allTasks = Array.from(this.tasks.values());
-        const dispatchedTasks = allTasks.filter(t => t.state === 'dispatched');
-
-        if (dispatchedTasks.length > 0) {
-          // Only recover dispatched tasks after a reasonable timeout to avoid interfering with normal operation
-          // This prevents recovery from interfering with tests and normal scheduler operation
-          setTimeout(() => {
-            if (this.stats.queued > 0 && this.stats.running === 0) {
-              dispatchedTasks.forEach(task => {
-                if (task.state === 'dispatched') {
-                  task.state = 'pending';
-                  const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-                  if (workerQueue) {
-                    workerQueue.push(task);
-                  }
-                }
-              });
-              this._retryBlockedTasks();
-            }
-          }, 5000); // 5 second delay before recovery
-        }
-
+        // Tasks are queued but none running - retry so they get picked up.
+        //
+        // This branch used to also scan every task ever created looking for a
+        // 'dispatched' state to recover. That state stopped being assigned in
+        // dd57083, so the scan could only ever produce an empty array - while
+        // still costing O(tasks) on every call (12ms at a million retained
+        // tasks). Tasks stuck mid-flight are covered by task.requeue_required
+        // and the periodic retry instead.
         this._retryBlockedTasks();
         this._schedulePeriodicRetry();
       }
     }
   
+    /**
+     * Queue a task and start dispatching.
+     *
+     * Fire-and-forget by default: returns `undefined` unless
+     * `{ createPromise: true }` is passed, in which case it returns a promise
+     * that resolves with the task's result or rejects if it fails.
+     *
+     * @throws if `task.workerType` is not a key in the scheduler's `workerPools`.
+     */
     addTask(task: FyflowTask, options?: AddTaskOptions): Promise<any> | void {
-      this.tasks.set(task.id, task);
-
-      // Add to per-worker-type queue
+      // Validate before registering anything, so a rejected task leaves no orphan
+      // entry behind in the task map
       const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-      if (workerQueue) {
-        workerQueue.push(task);
-      } else {
+      if (!workerQueue) {
         throw new Error(`Unknown worker type: ${task.workerType}`);
       }
+
+      // Set scheduler reference for descendant tracking
+      task._scheduler = this;
+      this.tasks.set(task.id, task);
+      workerQueue.push(task);
 
       this.stats.queued++;
       this._dispatchLoop();
@@ -153,11 +275,36 @@ export class FyflowTask {
     }
 
     /**
-     * Add multiple tasks in batch - optimized for high-volume scenarios.
-     * Prevents Node.js worker_threads message passing overflow by batching dispatch calls.
-     * Use this for bulk task additions (>1000 tasks) to avoid overwhelming the runtime.
+     * Queue many tasks with a single dispatch pass - use this for bulk additions
+     * (>1000 tasks) instead of calling `addTask` in a loop, which would run the
+     * dispatch loop once per task.
+     *
+     * Like `addTask`, returns nothing unless `{ createPromise: true }` is passed;
+     * with it, returns one promise per task in the same order:
+     *
+     * ```typescript
+     * const results = await Promise.all(
+     *   scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]
+     * );
+     * ```
+     *
+     * @throws if any task's `workerType` is not a key in the scheduler's
+     *   `workerPools`. The batch is validated up front, so a rejected call
+     *   queues nothing at all.
      */
     addTasks(tasks: FyflowTask[], options?: AddTaskOptions): Promise<any>[] | void {
+      // Validate the whole batch before touching any state. Previously an
+      // unknown worker type was skipped while still counting towards
+      // stats.queued, leaving a task that could never dispatch and a queued
+      // count that never returned to 0 - so scheduler.completed never fired
+      // again. Rejecting up front also keeps the call atomic: either every task
+      // is queued or none is.
+      for (const task of tasks) {
+        if (!this.readyQueuesByWorker.has(task.workerType)) {
+          throw new Error(`Unknown worker type: ${task.workerType}`);
+        }
+      }
+
       const promises: Promise<any>[] = [];
 
       for (const task of tasks) {
@@ -167,10 +314,7 @@ export class FyflowTask {
         this.tasks.set(task.id, task);
 
         // Queue task immediately (no dependency tracking)
-        const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-        if (workerQueue) {
-          workerQueue.push(task);
-        }
+        this.readyQueuesByWorker.get(task.workerType)!.push(task);
         this.stats.queued++;
 
         // Only create promise if explicitly requested
@@ -345,6 +489,7 @@ export class FyflowTask {
             // Revert state and stats changes
             task.state = 'pending';
             task.startTime = undefined;
+            task.executionTime = undefined; // Discard timing from the abandoned attempt
             this.stats.running--;
             this.stats.queued++;
 
@@ -406,7 +551,8 @@ export class FyflowTask {
       task.resolve?.(result);
 
       // Check descendant trackers
-      // this._checkDescendantTrackers(task.id);
+      this._settleDescendantTrackers(task.id);
+      this._recordTerminalTask(task.id);
 
       // Emit events
       this.dispatchEvent(new CustomEvent('task.completed', { detail: task }));
@@ -426,6 +572,7 @@ export class FyflowTask {
         task.attempts++;
         task.state = 'pending';
         task.startTime = undefined;
+        task.executionTime = undefined; // Discard timing from the abandoned attempt
         this.stats.running--;
         this.stats.queued++;
 
@@ -441,6 +588,19 @@ export class FyflowTask {
         this.stats.running--;
         this.stats.failed++;
         this.dispatchEvent(new CustomEvent('task.failed', { detail: task }));
+
+        // Settle the caller's promise. Failures that arrive as a worker
+        // `task.failed` event are rejected by the pool listener, but failures
+        // that only surface here - a worker that cannot initialize, for
+        // instance - reached no other rejection path and hung forever.
+        if (task.optional) {
+          task.resolve?.(null);
+        } else {
+          task.reject?.(error instanceof Error ? error : new Error(task.error || 'Task failed'));
+        }
+
+        this._settleDescendantTrackers(task.id);
+        this._recordTerminalTask(task.id);
         this._checkCompletion();
       }
     }
@@ -526,7 +686,7 @@ export class FyflowTask {
         this.retryTimer = setTimeout(() => {
           this._retryBlockedTasks();
           this._schedulePeriodicRetry(); // Schedule next retry
-        }, this.options.periodicRetryIntervalMs!); // Configurable retry interval (default 100ms)
+        }, this.options.periodicRetryIntervalMs!); // Configurable retry interval (default 50ms)
       }
     }
 
@@ -627,17 +787,36 @@ export class FyflowTask {
               id: spawnConfig.id,
               workerType: spawnConfig.workerType,
               payload: spawnConfig.payload,
-              parents: spawnConfig.parents || [task.id], // Default to parent task
               optional: spawnConfig.optional || false,
               retryPolicy: spawnConfig.retryPolicy,
               workerGroups: spawnConfig.workerGroups || []
             });
 
-            // Add the spawned task to the scheduler
-            this.addTask(childTask);
+            // Add the spawned task to the scheduler. This runs inside a worker's
+            // event dispatch, so a rejected spawn (e.g. an unknown worker type)
+            // must fail only this spawn rather than propagate out and take the
+            // scheduler down with it.
+            try {
+              this.addTask(childTask);
+            } catch (error: any) {
+              this.dispatchEvent(new CustomEvent('task.spawn_failed', {
+                detail: {
+                  parentTask: task,
+                  spawnConfig,
+                  error,
+                  workerId: e.detail.workerId,
+                  workerType: e.detail.workerType,
+                  timestamp: Date.now()
+                }
+              }));
+              return;
+            }
 
-            // Add to descendant trackers
-            // this._addSpawnedTaskToTrackers(task.id, childTask.id);
+            // Record spawn lineage and attach the child to any active descendant
+            // trackers. Safe to do after addTask: task completion always resolves
+            // through a promise callback, so the child cannot have finished yet.
+            this._recordSpawn(task.id, childTask.id);
+            this._addSpawnedTaskToTrackers(task.id, childTask);
           }
         };
         this._addInternalListener(pool, 'task.spawn_request', taskSpawnListener);
@@ -661,6 +840,7 @@ export class FyflowTask {
             // Reset task state for requeuing
             task.state = 'pending';
             task.startTime = undefined; // Clear start time since task is being requeued
+            task.executionTime = undefined; // Discard timing from the abandoned attempt
             task._resourcesPreAllocated = undefined; // Clear pre-allocation flag for retry
             this.stats.running--;
             this.stats.queued++;
@@ -685,9 +865,16 @@ export class FyflowTask {
             // _onTaskComplete (called from promise resolution) handles state updates
             // and emits the proper task.completed event with correct state.
             // Forwarding here would cause duplicate events with stale task state.
+            //
+            // We only record the worker-measured execution time, which is emitted
+            // synchronously by the worker just before it resolves the task promise.
+            // _onTaskComplete therefore sees it and includes it on the task it emits.
+            if (e.detail.executionTime !== undefined) {
+              task.executionTime = e.detail.executionTime;
+            }
           }
         };
-        // this._addInternalListener(pool, 'task.completed', taskCompletedListener); // DISABLED - causes duplicate events
+        this._addInternalListener(pool, 'task.completed', taskCompletedListener);
 
         const taskFailedListener = (e: any) => {
           const task = this.tasks.get(e.detail.taskId);
@@ -700,6 +887,7 @@ export class FyflowTask {
               task.attempts++;
               task.state = 'pending';
               task.startTime = undefined; // Clear start time for retry attempt
+              task.executionTime = undefined; // Discard timing from the abandoned attempt
               task._resourcesPreAllocated = undefined; // Clear pre-allocation flag for retry
               this.stats.queued++;
               const workerQueue = this.readyQueuesByWorker.get(task.workerType);
@@ -714,9 +902,13 @@ export class FyflowTask {
               this.dispatchEvent(new CustomEvent('task.failed', {detail: {...task, error: e.detail.error}}));
               // Reject the task promise since it failed without retries
               task.reject?.(e.detail.error || new Error('Task failed'));
+              this._settleDescendantTrackers(task.id);
+              this._recordTerminalTask(task.id);
               this._checkCompletion();
             } else {
               task.resolve?.(null);
+              this._settleDescendantTrackers(task.id);
+              this._recordTerminalTask(task.id);
               this._checkCompletion();
             }
           }
@@ -725,64 +917,123 @@ export class FyflowTask {
       });
     }
 
-    // _trackDescendants(task: FyflowTask, resolve: Function, reject: Function) {
-    //   // Start tracking this task and all its descendants
-    //   const pendingDescendants = new Set<string>();
+    // --- Descendant tracking -------------------------------------------------
+    // Descendants are tasks created at runtime via context.spawnTask(). This is
+    // lineage only: it never influences dispatch order or readiness.
 
-    //   // Add the task itself
-    //   if (task.state !== 'done' && task.state !== 'failed') {
-    //     pendingDescendants.add(task.id);
-    //   }
+    private static readonly TERMINAL_STATES = new Set(['done', 'failed', 'user_action']);
 
-    //   // Add all existing children recursively
-    //   this._addDescendantsToSet(task, pendingDescendants);
+    private _isTerminal(state: string): boolean {
+      return FyflowScheduler.TERMINAL_STATES.has(state);
+    }
 
-    //   // If nothing to track, resolve immediately
-    //   if (pendingDescendants.size === 0) {
-    //     resolve(task.result || null);
-    //     return;
-    //   }
+    // Record that childId was spawned from parentId
+    private _recordSpawn(parentId: string, childId: string) {
+      let children = this.spawnedChildren.get(parentId);
+      if (!children) {
+        children = new Set<string>();
+        this.spawnedChildren.set(parentId, children);
+      }
+      children.add(childId);
+    }
 
-    //   // Store tracker for this task
-    //   this.descendantTrackers.set(task.id, { resolve, reject, pendingDescendants });
-    // }
+    _trackDescendants(task: FyflowTask, resolve: Function, reject: Function) {
+      // Seed with the task itself plus every descendant already spawned from it,
+      // so tracking can start at any point in the workflow
+      const pendingDescendants = new Set<string>();
+      this._collectPendingDescendants(task.id, pendingDescendants, new Set<string>());
 
-    // _addDescendantsToSet(task: FyflowTask, pendingSet: Set<string>) {
-    //   for (const childId of task.children) {
-    //     const child = this.tasks.get(childId);
-    //     if (child && child.state !== 'done' && child.state !== 'failed') {
-    //       pendingSet.add(childId);
-    //       this._addDescendantsToSet(child, pendingSet); // Recursive for grandchildren
-    //     }
-    //   }
-    // }
+      // Nothing left to wait for - the workflow has already settled
+      if (pendingDescendants.size === 0) {
+        this._settleTracker({ rootId: task.id, rootTask: task, resolve, reject, pendingDescendants });
+        return;
+      }
 
-    // _checkDescendantTrackers(completedTaskId: string) {
-    //   // Check all descendant trackers to see if any are now complete
-    //   for (const [rootTaskId, tracker] of this.descendantTrackers) {
-    //     tracker.pendingDescendants.delete(completedTaskId);
+      this.descendantTrackers.set(this.nextTrackerId++, {
+        rootId: task.id,
+        rootTask: task,
+        resolve,
+        reject,
+        pendingDescendants
+      });
+    }
 
-    //     if (tracker.pendingDescendants.size === 0) {
-    //       // All descendants complete - resolve the promise
-    //       const rootTask = this.tasks.get(rootTaskId);
-    //       tracker.resolve(rootTask?.result || null);
-    //       this.descendantTrackers.delete(rootTaskId);
-    //     }
-    //   }
-    // }
+    private _collectPendingDescendants(taskId: string, pending: Set<string>, visited: Set<string>) {
+      if (visited.has(taskId)) return;
+      visited.add(taskId);
 
-    // _addSpawnedTaskToTrackers(parentTaskId: string, spawnedTaskId: string) {
-    //   // Add newly spawned task to any active descendant trackers
-    //   for (const [rootTaskId, tracker] of this.descendantTrackers) {
-    //     // If the parent is being tracked, add the spawned child
-    //     if (tracker.pendingDescendants.has(parentTaskId) || rootTaskId === parentTaskId) {
-    //       const spawnedTask = this.tasks.get(spawnedTaskId);
-    //       if (spawnedTask && spawnedTask.state !== 'done' && spawnedTask.state !== 'failed') {
-    //         tracker.pendingDescendants.add(spawnedTaskId);
-    //       }
-    //     }
-    //   }
-    // }
+      const task = this.tasks.get(taskId);
+      if (task && !this._isTerminal(task.state)) {
+        pending.add(taskId);
+      }
+
+      const children = this.spawnedChildren.get(taskId);
+      if (children) {
+        for (const childId of children) {
+          this._collectPendingDescendants(childId, pending, visited);
+        }
+      }
+    }
+
+    // Called when a task reaches a terminal state (done, failed or user_action).
+    // Does nothing unless maxCompletedTasks is configured.
+    private _recordTerminalTask(taskId: string) {
+      const limit = this.options.maxCompletedTasks;
+      if (limit === undefined) return; // Default: retain everything
+
+      this.completedTaskIds.add(taskId);
+
+      // Evict oldest-first until back within the limit. Trackers hold their root
+      // task by reference, so eviction cannot affect an in-flight
+      // onCompleteDescendants() wait.
+      while (this.completedTaskIds.size > limit) {
+        const oldest = this.completedTaskIds.values().next().value;
+        if (oldest === undefined) break;
+        this.completedTaskIds.delete(oldest);
+        this.tasks.delete(oldest);
+        this.spawnedChildren.delete(oldest);
+      }
+    }
+
+    // Called when a task reaches a terminal state (done, failed or user_action)
+    private _settleDescendantTrackers(taskId: string) {
+      if (this.descendantTrackers.size === 0) return; // Fast path - feature unused
+
+      for (const [trackerId, tracker] of this.descendantTrackers) {
+        // Only trackers actually waiting on this task are affected
+        if (!tracker.pendingDescendants.delete(taskId)) continue;
+        if (tracker.pendingDescendants.size > 0) continue;
+
+        this.descendantTrackers.delete(trackerId);
+        this._settleTracker(tracker);
+      }
+    }
+
+    private _settleTracker(tracker: DescendantTracker) {
+      const rootTask = tracker.rootTask;
+
+      // Descendant failures do not reject - they surface via task.failed events -
+      // but the tracked task failing rejects, matching onCompletePromise()
+      if (rootTask.state === 'failed' || rootTask.state === 'user_action') {
+        tracker.reject(new Error(rootTask.error || `Task ${tracker.rootId} failed`));
+        return;
+      }
+
+      tracker.resolve(rootTask.result ?? null);
+    }
+
+    private _addSpawnedTaskToTrackers(parentTaskId: string, spawnedTask: FyflowTask) {
+      if (this.descendantTrackers.size === 0) return; // Fast path - feature unused
+
+      for (const tracker of this.descendantTrackers.values()) {
+        // Track the child if its parent is the tracked root or is itself tracked
+        if (tracker.rootId === parentTaskId || tracker.pendingDescendants.has(parentTaskId)) {
+          if (!this._isTerminal(spawnedTask.state)) {
+            tracker.pendingDescendants.add(spawnedTask.id);
+          }
+        }
+      }
+    }
 
     // Shutdown the scheduler and cleanup all resources
     /**
@@ -819,6 +1070,14 @@ export class FyflowTask {
       return stats;
     }
 
+    /**
+     * Wait for running tasks, then terminate every worker pool, drop all
+     * listeners and clear internal state.
+     *
+     * Always call this when finished - live workers and the periodic retry timer
+     * will otherwise keep the process alive. Pending `onCompleteDescendants()`
+     * waits reject.
+     */
     async shutdown(): Promise<void> {
 
       // 1. Clear periodic retry timer to stop any ongoing retries
@@ -855,9 +1114,17 @@ export class FyflowTask {
       // await Promise.all(workerManagerPromises);
 
 
-      // 5. Clear all internal state
+      // 5. Reject outstanding descendant waits - clearing them silently would
+      // leave callers awaiting a promise that can never settle
+      for (const tracker of this.descendantTrackers.values()) {
+        tracker.reject(new Error('Scheduler shut down before all descendants completed'));
+      }
+
+      // 6. Clear all internal state
       this.tasks.clear();
       this.descendantTrackers.clear();
+      this.spawnedChildren.clear();
+      this.completedTaskIds.clear();
       this.stats = {queued: 0, running: 0, done: 0, failed: 0};
 
     }

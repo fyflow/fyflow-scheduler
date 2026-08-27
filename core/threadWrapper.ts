@@ -29,6 +29,8 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     tasksCompleted = 0;
     errorCount = 0;
     createdAt = Date.now();
+    private initStartTime = 0;
+    private teardownStartTime = 0;
 
     // Pending termination request for post-task handling
     private pendingTerminationRequest: {
@@ -230,16 +232,44 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         // Handle different message types
         switch (type) {
           case 'init':
-            // console.log('worker.initialization.completed', this.id)
             this.initialized = true;
             this.dispatchEvent(new CustomEvent('worker.initialization.completed', {
-              detail: { workerId: this.id }
+              detail: {
+                workerId: this.id,
+                workerType: 'thread',
+                timestamp: Date.now(),
+                duration: this.initStartTime ? Date.now() - this.initStartTime : 0
+              }
+            }));
+            return;
+
+          // Setup runs inside the worker thread, which reports its timing back so
+          // threaded workers emit the same setup events inline workers do
+          case 'setup_started':
+            this.dispatchEvent(new CustomEvent('worker.setup.started', {
+              detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now() }
+            }));
+            return;
+
+          case 'setup_completed':
+            this.dispatchEvent(new CustomEvent('worker.setup.completed', {
+              detail: {
+                workerId: this.id,
+                workerType: 'thread',
+                timestamp: Date.now(),
+                duration: data?.duration ?? 0
+              }
             }));
             return;
 
           case 'teardown':
             this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
-              detail: { workerId: this.id }
+              detail: {
+                workerId: this.id,
+                workerType: 'thread',
+                timestamp: Date.now(),
+                duration: this.teardownStartTime ? Date.now() - this.teardownStartTime : 0
+              }
             }));
             return;
 
@@ -288,6 +318,22 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
                   cb.reject(new Error(data.message));
                 }
               }
+              return;
+            }
+
+            // Initialization has no task callback registered, so without this the
+            // error was dropped and _ensureInitialized() hung until its 30s
+            // timeout instead of failing immediately
+            if (taskId === 'init') {
+              this.initializing = false;
+              this.dispatchEvent(new CustomEvent('worker.initialization.failed', {
+                detail: {
+                  workerId: this.id,
+                  workerType: 'thread',
+                  timestamp: Date.now(),
+                  error: new Error(data?.message || String(data))
+                }
+              }));
               return;
             }
 
@@ -344,25 +390,40 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         })
       }
 
+      this.initStartTime = Date.now();
       this.dispatchEvent(new CustomEvent('worker.initialization.started', {
-        detail: { workerId: this.id, timestamp: Date.now() }
+        detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now() }
       }));
 
       return new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
           this.initializing = false;
           this.removeEventListener('worker.initialization.completed', onInit);
-          reject(new Error('Worker initialization timeout'));
-        }, 30000); // 10 second timeout
+          const error = new Error('Worker initialization timeout');
+          this.dispatchEvent(new CustomEvent('worker.initialization.failed', {
+            detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now(), error }
+          }));
+          reject(error);
+        }, 30000); // 30 second timeout
 
         const onInit = () => {
           clearTimeout(timeout);
           this.initializing = false;
           this.removeEventListener('worker.initialization.completed', onInit);
+          this.removeEventListener('worker.initialization.failed', onInitFailed);
           resolve();
         };
 
+        const onInitFailed = (e: any) => {
+          clearTimeout(timeout);
+          this.initializing = false;
+          this.removeEventListener('worker.initialization.completed', onInit);
+          this.removeEventListener('worker.initialization.failed', onInitFailed);
+          reject(e.detail?.error ?? new Error('Worker initialization failed'));
+        };
+
         this.addEventListener('worker.initialization.completed', onInit);
+        this.addEventListener('worker.initialization.failed', onInitFailed);
         // Convert relative paths to absolute URLs for proper worker imports
         const absoluteWorkerUrl = this.originalScriptUrl.startsWith('http') || this.originalScriptUrl.startsWith('file:')
           ? this.originalScriptUrl
@@ -385,16 +446,26 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
 
       // Queue task FIRST (synchronously) to update canAcceptTask() immediately
       // This prevents race conditions where multiple tasks are dispatched before queue updates
-      return new Promise(async (resolve, reject) => {
+      return new Promise((resolve, reject) => {
         this.taskQueue.push({ taskId, payload, resolve, reject });
 
-        // Ensure worker is initialized before processing tasks
-        await this._ensureInitialized();
+        // Ensure worker is initialized before processing tasks.
+        // This used to be `await` inside an async promise executor, where a
+        // rejection escaped as an unhandled rejection instead of failing the
+        // task - so a worker that could not initialize crashed the process.
+        this._ensureInitialized()
+          .then(() => {
+            this.updateActivity();
 
-        this.updateActivity();
-
-        // Process the queue now that worker is ready
-        this._processTaskQueue();
+            // Process the queue now that worker is ready
+            this._processTaskQueue();
+          })
+          .catch((error) => {
+            // Initialization failed - fail this task rather than leaving it queued
+            const index = this.taskQueue.findIndex(t => t.taskId === taskId);
+            if (index !== -1) this.taskQueue.splice(index, 1);
+            reject(error);
+          });
       });
     }
 
@@ -419,8 +490,9 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     async terminate() {
       // Send teardown message to worker if initialized
       if (this.initialized) {
+        this.teardownStartTime = Date.now();
         this.dispatchEvent(new CustomEvent('worker.teardown.started', {
-          detail: { workerId: this.id, timestamp: Date.now() }
+          detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now() }
         }));
 
         try {
@@ -439,7 +511,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
           });
         } catch (error) {
           this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
-            detail: { workerId: this.id, error }
+            detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now(), error }
           }));
         }
       }

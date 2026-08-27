@@ -133,8 +133,9 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 throw new Error(`Worker script ${this.scriptUrl} must export a default class`);
             }
 
+            const initStartTime = Date.now();
             this.dispatchEvent(new CustomEvent('worker.initialization.started', {
-                detail: { workerId: this.id, timestamp: Date.now() }
+                detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
             }));
 
             // Instantiate worker class with BaseWorkerContext (as specified in task)
@@ -144,16 +145,32 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // Call setup if it exists
             if (instance.setup) {
                 this.dispatchEvent(new CustomEvent('worker.setup.started', {
-                    detail: { workerId: this.id, timestamp: Date.now() }
+                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
                 }));
 
                 const setupStartTime = Date.now();
                 await instance.setup();
 
                 this.dispatchEvent(new CustomEvent('worker.setup.completed', {
-                    detail: { workerId: this.id, duration: Date.now() - setupStartTime }
+                    detail: {
+                        workerId: this.id,
+                        workerType: 'inline',
+                        timestamp: Date.now(),
+                        duration: Date.now() - setupStartTime
+                    }
                 }));
             }
+
+            // Threaded workers emit this once the worker thread confirms init;
+            // inline workers reach the equivalent point here
+            this.dispatchEvent(new CustomEvent('worker.initialization.completed', {
+                detail: {
+                    workerId: this.id,
+                    workerType: 'inline',
+                    timestamp: Date.now(),
+                    duration: Date.now() - initStartTime
+                }
+            }));
 
             this.workerInstance = instance;
             this.initializing = false;
@@ -182,6 +199,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             this.dispatchEvent(new CustomEvent('worker.initialization.failed', {
                 detail: {
                     workerId: this.id,
+                    workerType: 'inline',
+                    timestamp: Date.now(),
                     error,
                     stage: instance ? 'setup' : 'constructor'
                 }
@@ -335,19 +354,24 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         if (this.workerInstance?.teardown) {
             try {
                 this.dispatchEvent(new CustomEvent('worker.teardown.started', {
-                    detail: { workerId: this.id, timestamp: Date.now() }
+                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
                 }));
 
                 const teardownStartTime = Date.now();
                 await this.workerInstance.teardown();
 
                 this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
-                    detail: { workerId: this.id, duration: Date.now() - teardownStartTime }
+                    detail: {
+                        workerId: this.id,
+                        workerType: 'inline',
+                        timestamp: Date.now(),
+                        duration: Date.now() - teardownStartTime
+                    }
                 }));
             } catch (teardownError) {
                 // Emit failure event but continue with cleanup
                 this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
-                    detail: { workerId: this.id, error: teardownError }
+                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now(), error: teardownError }
                 }));
 
                 // Log for debugging but don't throw

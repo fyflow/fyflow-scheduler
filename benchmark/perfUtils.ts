@@ -1,5 +1,9 @@
 // Performance measurement utilities for benchmarking
 
+// Node.js globals declared for cross-platform compatibility
+declare const process: any;
+declare const require: any;
+
 export interface MemoryUsage {
     heapUsed: number;
     heapTotal: number;

@@ -232,10 +232,33 @@ scheduler.addEventListener('task.completed', (e: any) => {
     workerStats[task.workerType].totalTime = duration;
 });
 
-// Step 6: Real-time monitoring
+// Step 6: Completion handling
+//
+// Registered before any task is added, rather than on a timer that could fire
+// after the scheduler has already completed. Tasks arrive in waves and the
+// scheduler drains between them, so completion only counts once every wave has
+// been submitted.
+let allWavesAdded = false;
 
+scheduler.addEventListener('scheduler.completed', (e: any) => {
+    if (!allWavesAdded) return; // A lull between waves, not the end of the run
 
+    const stats = e.detail;
+    console.log('\n🎯 All Tasks Completed!');
+    console.log(`✅ Completed: ${stats.done} tasks`);
+    console.log(`❌ Failed: ${stats.failed} tasks`);
 
+    clearInterval(progressInterval);
+
+    // Give workers time to clean up, then exit
+    setTimeout(() => {
+        if (typeof Deno !== 'undefined') {
+            Deno.exit(0);
+        } else {
+            process.exit(0);
+        }
+    }, 2000);
+});
 
 // Step 5: Add tasks with staggered timing to show resource contention
 console.log('\n📋 Adding tasks to demonstrate resource contention...\n');
@@ -257,27 +280,9 @@ setTimeout(() => {
 
 setTimeout(() => {
     [...heavyTasks].forEach(task => scheduler.addTask(task));
+    allWavesAdded = true; // Last wave - completion from here on is final
 }, 4000);
 
-setTimeout(() => {
-    scheduler.addEventListener('scheduler.completed', (e: any) => {
-        const stats = e.detail;
-        console.log('\n🎯 All Tasks Completed!');
-        console.log(`✅ Completed: ${stats.done} tasks`);
-        console.log(`❌ Failed: ${stats.failed} tasks`);
-        
-        // Give workers time to clean up, then exit
-        setTimeout(() => {
-            clearInterval(progressInterval);
-            if (typeof Deno !== 'undefined') {
-                Deno.exit(0);
-            } else {
-                process.exit(0);
-            }
-        }, 2000);
-    });
-    
-}, 4100);
 
 const progressInterval = setInterval(() => {
     // console.log('monitoring')

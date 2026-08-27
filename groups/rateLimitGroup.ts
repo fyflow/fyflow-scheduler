@@ -5,6 +5,20 @@ export interface RateWindow {
   windowMs: number;   // Time window in milliseconds
 }
 
+/**
+ * Time-window throttling, for API quotas and similar limits.
+ *
+ * ```typescript
+ * const api = new RateLimitGroup([
+ *   { limit: 10,  windowMs: 1000 },   // 10 per second
+ *   { limit: 100, windowMs: 60_000 }  // and 100 per minute
+ * ], 'api');
+ * ```
+ *
+ * Every window must have room before a task runs. Tasks over the limit wait in
+ * the scheduler's blocked queue and are retried once a window rolls over - they
+ * are never dropped.
+ */
 export class RateLimitGroup extends EventTarget implements ResourceGroup {
   readonly id: string;
   readonly type = 'rate-limit' as const;

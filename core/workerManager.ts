@@ -5,16 +5,55 @@ import { WorkerStatus } from "./workerInterface.ts";
 type WorkerInstance = ThreadWrapper | InlineWrapper;
 
 export interface WorkerManagerOptions {
+  /** Maximum worker instances in this pool. Default 2. */
   maxThreads?: number;
+  /**
+   * Tasks each worker may run at once. Default 1. Total pool capacity is
+   * `maxThreads x maxConcurrentTasks`. Raise this for async/IO workers; leave it
+   * at 1 for CPU-bound ones.
+   */
   maxConcurrentTasks?: number;
+  /** Ms an idle worker is kept before termination. Default 5000. `0` never terminates. */
   idleTimeout?: number;
+  /**
+   * Run workers in the main thread instead of worker threads. Default false.
+   * Inline suits async/IO work; threaded suits CPU-bound work.
+   */
   inline?: boolean;
+  /** Passed as the first constructor argument to every worker instance in this pool. */
   config?: any;
+  /** Resource group ids every task in this pool must acquire before running. */
   groups?: string[];
-  requeueFailedTasks?: boolean; // Default: true (as specified in task)
-  maxWorkerRestarts?: number; // Default: 3 - prevent infinite restart loops
+  /** Requeue a worker's in-flight tasks when it fails, rather than failing them. Default true. */
+  requeueFailedTasks?: boolean;
+  /** Restarts allowed before the pool gives up and emits `worker.restart_limit_exceeded`. Default 3. */
+  maxWorkerRestarts?: number;
 }
 
+/**
+ * A pool of workers of one type, created from a single worker script.
+ *
+ * ```typescript
+ * const pool = new WorkerManager(workerUrl, {
+ *   maxThreads: 4,
+ *   maxConcurrentTasks: 1,
+ *   groups: ['cpu']
+ * });
+ * ```
+ *
+ * Emits: `task.started`, `task.completed`, `task.failed`, `task.progress`,
+ * `task.spawn_request`, `task.requeue_required`, `worker.failed`,
+ * `worker.self_terminated`, `worker.restart_limit_exceeded`, and the worker
+ * lifecycle events `worker.initialization.started|completed|failed`,
+ * `worker.setup.started|completed` and
+ * `worker.teardown.started|completed|failed`.
+ *
+ * Lifecycle events carry `{ workerId, workerType, timestamp }` plus `duration`
+ * on `*.completed` and `error` on `*.failed`. They fire on every worker
+ * creation and idle-timeout teardown, so keep their listeners cheap.
+ *
+ * Workers are created lazily on first use, up to `maxThreads`.
+ */
 export class WorkerManager extends EventTarget {
   threads: WorkerInstance[] = [];
   maxThreads: number;
@@ -29,6 +68,9 @@ export class WorkerManager extends EventTarget {
 
   // Track restart count for entire pool (simpler and more logical)
   private poolRestartCount = 0;
+  // Set for the duration of shutdown, so worker failures during teardown are not
+  // mistaken for crashes worth restarting
+  private shuttingDown = false;
 
   // Track ALL event listeners for cleanup
   private allListeners = new Map<any, {event: string; listener: Function}[]>();
@@ -166,6 +208,17 @@ export class WorkerManager extends EventTarget {
       { event: 'task.progress', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.progress', { detail: e.detail })) },
       { event: 'task.spawn_request', handler: (e: any) => this.dispatchEvent(new CustomEvent('task.spawn_request', { detail: e.detail })) },
       { event: 'worker.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.failed', { detail: e.detail })) },
+      // Lifecycle events - forwarded so pool owners can observe worker startup
+      // cost, setup failures and teardown problems. Both wrapper types emit the
+      // same set with the same payload shape.
+      { event: 'worker.initialization.started', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.initialization.started', { detail: e.detail })) },
+      { event: 'worker.initialization.completed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.initialization.completed', { detail: e.detail })) },
+      { event: 'worker.initialization.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.initialization.failed', { detail: e.detail })) },
+      { event: 'worker.setup.started', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.setup.started', { detail: e.detail })) },
+      { event: 'worker.setup.completed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.setup.completed', { detail: e.detail })) },
+      { event: 'worker.teardown.started', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.teardown.started', { detail: e.detail })) },
+      { event: 'worker.teardown.completed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.teardown.completed', { detail: e.detail })) },
+      { event: 'worker.teardown.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.teardown.failed', { detail: e.detail })) },
       { event: 'worker.self_terminated', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.self_terminated', { detail: e.detail })) },
       { event: 'worker.termination_requested', handler: (e: any) => this._handleWorkerTerminationRequest(e) }
     ];
@@ -206,6 +259,9 @@ export class WorkerManager extends EventTarget {
 
   // Unified worker failure handling (as specified in task)
   private _handleWorkerFailure(e: any) {
+    // A worker "failing" while we are tearing the pool down is expected
+    if (this.shuttingDown) return;
+
     const { workerId, error, metadata } = e.detail;
     const { failureType, canRestart, restartDelay } = metadata || {};
     const failedWorker = this.threads.find(w => w.id === workerId);
@@ -309,10 +365,15 @@ export class WorkerManager extends EventTarget {
   }
 
   // Worker Status Inspection APIs (as specified in task)
+  /** Ids of the workers that currently exist in this pool (created lazily). */
   getWorkerIds(): string[] {
     return this.threads.map(w => w.id);
   }
 
+  /**
+   * Health and activity of one worker, or `null` if no such worker exists.
+   * Useful for building supervision on top of `worker.failed`.
+   */
   getWorkerStatus(workerId: string): WorkerStatus | null {
     const worker = this.threads.find(w => w.id === workerId) as any;
     if (!worker) return null;
@@ -329,6 +390,7 @@ export class WorkerManager extends EventTarget {
     };
   }
 
+  /** `getWorkerStatus` for every live worker, keyed by worker id. */
   getAllWorkerStatuses(): Map<string, WorkerStatus> {
     const statuses = new Map<string, WorkerStatus>();
     this.threads.forEach(worker => {
@@ -341,6 +403,12 @@ export class WorkerManager extends EventTarget {
   }
 
   // Worker Management APIs (as specified in task)
+  /**
+   * Terminate a worker and create a replacement, optionally merging `newConfig`
+   * over the pool's `config`. The replacement gets a new id.
+   *
+   * @returns false if no worker with that id exists.
+   */
   async restartWorker(workerId: string, newConfig?: any): Promise<boolean> {
     const workerIndex = this.threads.findIndex(w => w.id === workerId);
     if (workerIndex === -1) return false;
@@ -362,11 +430,21 @@ export class WorkerManager extends EventTarget {
     return true;
   }
 
+  /** Alias for {@link WorkerManager.restartWorker}. */
   async replaceWorker(workerId: string, newConfig?: any): Promise<boolean> {
     // Same as restart for now
     return await this.restartWorker(workerId, newConfig);
   }
 
+  /**
+   * Merge `config` into a live worker's config object.
+   *
+   * Note this mutates the config a worker instance already holds - a worker that
+   * copied values in its constructor will not see the change. Use
+   * {@link WorkerManager.restartWorker} when the worker must be rebuilt.
+   *
+   * @returns false if no worker with that id exists.
+   */
   async updateWorkerConfig(workerId: string, config: any): Promise<boolean> {
     const worker = this.threads.find(w => w.id === workerId) as any;
     if (!worker) return false;
@@ -437,13 +515,16 @@ export class WorkerManager extends EventTarget {
   }
 
   // Shutdown all workers and cleanup resources
+  /** Terminate every worker in the pool and drop its listeners. */
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
 
     // Stop the centralized idle timer
     this.stopIdleTimer();
 
-    // Remove ALL event listeners to prevent process hanging
-    this._removeAllListeners();
+    // Listeners stay attached through termination so worker.teardown.* events
+    // are observable on the shutdown path - they are dropped at the end instead.
+    // The shuttingDown flag stops failure handling from restarting workers here.
 
     // Terminate all worker threads
     const shutdownPromises = this.threads.map(async (worker) => {
@@ -475,5 +556,7 @@ export class WorkerManager extends EventTarget {
     await Promise.all(shutdownPromises);
     this.threads = [];
 
+    // Remove ALL event listeners to prevent process hanging
+    this._removeAllListeners();
   }
 }

@@ -2,6 +2,11 @@
 // Provides standardized lifecycle methods for the framework
 
 // Special error class for worker termination requests
+/**
+ * Thrown into the task that was running when a worker asked to terminate itself
+ * via `context.terminateWithError()`. Catch it to distinguish worker shutdown
+ * from an ordinary task failure.
+ */
 export class WorkerTerminationError extends Error {
   public readonly metadata: { canRestart?: boolean; restartDelay?: number };
 
@@ -17,8 +22,16 @@ export interface WorkerConfig {
 }
 
 // Enhanced worker communication protocol
+/**
+ * Messages a worker thread sends back to its ThreadWrapper.
+ *
+ * `setup_started` / `setup_completed` exist so a threaded worker can report
+ * setup timing from inside the thread, letting ThreadWrapper emit the same
+ * `worker.setup.*` events an inline worker emits.
+ */
 export interface WorkerMessage {
-    type: 'init' | 'teardown' | 'result' | 'error' | 'progress' | 'spawn_task';
+    type: 'init' | 'teardown' | 'result' | 'error' | 'progress' | 'spawn_task'
+        | 'setup_started' | 'setup_completed';
     taskId?: string; // Only for task-related messages
     data?: any; // Message-specific payload
     timestamp?: number;
@@ -41,14 +54,42 @@ export interface SpawnTaskConfig {
 }
 
 // Two-Level Context Architecture
+/**
+ * Worker-level context, passed as the SECOND constructor argument to every
+ * worker instance. Forward it to `super(config, workerContext)` - a worker that
+ * only accepts `config` silently loses the ability to self-terminate.
+ */
 export interface BaseWorkerContext {
+    /** Id of this worker instance, as reported by `WorkerManager.getWorkerIds()`. */
     workerId: string;
+    /**
+     * Ask the pool to tear this worker down, e.g. after detecting a corrupt
+     * connection. In-flight tasks are requeued when the pool's
+     * `requeueFailedTasks` allows it and `canRestart` is not false.
+     */
     terminateWithError: (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void;
 }
 
+/**
+ * Task-level context, passed as the second argument to `run()`. Adds per-task
+ * capabilities on top of {@link BaseWorkerContext}.
+ */
 export interface TaskWorkerContext extends BaseWorkerContext {
+    /** Id of the task currently being run. */
     taskId: string;
+    /**
+     * Report progress as a fraction from 0 to 1 (NOT a percentage). Surfaces as
+     * a `task.progress` event on the scheduler.
+     */
     sendProgress: (progress: number, message?: string, details?: any) => void;
+    /**
+     * Create another task while this one runs. The spawned task is a descendant
+     * of this one, so `parentTask.onCompleteDescendants()` waits for it.
+     *
+     * Spawning does not block: the call returns immediately and the task is
+     * queued. A spawn naming an unregistered `workerType` emits
+     * `task.spawn_failed` and fails only that spawn.
+     */
     spawnTask: (config: SpawnTaskConfig) => void;
 }
 
@@ -81,6 +122,25 @@ export interface WorkerInterface {
 /**
  * Abstract base class for workers providing common functionality
  * Workers can extend this class or implement WorkerInterface directly
+ */
+/**
+ * Base class for workers. A worker script must `export default` a class.
+ *
+ * ```typescript
+ * export default class MyWorker extends BaseWorker {
+ *   constructor(config: WorkerConfig = {}, workerContext?: BaseWorkerContext) {
+ *     super(config, workerContext);   // forward BOTH arguments
+ *   }
+ *   async setup() {}                  // required, may be empty
+ *   async teardown() {}               // required, may be empty
+ *   async run(payload: any, context?: TaskWorkerContext) {
+ *     return payload.value * 2;
+ *   }
+ * }
+ * ```
+ *
+ * `setup` and `teardown` are abstract: extending without them is a compile
+ * error, even when there is nothing to do.
  */
 export abstract class BaseWorker implements WorkerInterface {
     protected config: WorkerConfig;

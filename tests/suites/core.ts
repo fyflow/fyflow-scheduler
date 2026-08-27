@@ -6,6 +6,9 @@ import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
 import { ConcurrentLimitGroup } from '../../groups/concurrentLimitGroup.ts';
 import { RateLimitGroup } from '../../groups/rateLimitGroup.ts';
 
+// Node.js process declaration for cross-platform compatibility
+declare const process: any;
+
 interface TestResult {
   name: string;
   passed: boolean;
@@ -98,6 +101,12 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('CPU Slot Enforcement', () => this.testCPUSlotEnforcement()));
     this.results.push(await this.runTest('Group Limit Enforcement', () => this.testGroupLimitEnforcement()));
     this.results.push(await this.runTest('Resource Contention', () => this.testResourceContention()));
+    this.results.push(await this.runTest('Blocked Tasks Complete And Delay Completion', () => this.testBlockedTasksCompleteAfterBlocking()));
+
+    // Task retention
+    this.results.push(await this.runTest('Completed Tasks Retained By Default', () => this.testRetentionDefault()));
+    this.results.push(await this.runTest('maxCompletedTasks Bounds Retention', () => this.testRetentionBounded()));
+    this.results.push(await this.runTest('maxCompletedTasks Evicts Oldest First', () => this.testRetentionEvictsOldest()));
 
     // Edge Cases and Error Handling
     this.results.push(await this.runTest('Worker Pool Scaling', () => this.testWorkerPoolScaling()));
@@ -420,6 +429,135 @@ class CrossPlatformTestSuite {
 
     stats = scheduler.stats;
     if (stats.done !== 4) throw new Error(`Expected 4 completed tasks, got ${stats.done}`);
+  }
+
+  // Tasks blocked by a resource group leave the ready queue and are subtracted
+  // from stats.queued, so the scheduler must track them separately. Otherwise it
+  // reports completion with work outstanding and clears the periodic retry timer
+  // that was the only thing that could ever unblock them.
+  // Retention is unlimited unless asked otherwise - most workloads have a bounded
+  // task count and want completed tasks left inspectable
+  private async testRetentionDefault(): Promise<void> {
+    const scheduler = this.createRetentionScheduler();
+    try {
+      await this.runRetentionTasks(scheduler, 12);
+
+      if (scheduler.tasks.size !== 12) {
+        throw new Error(`Expected all 12 tasks retained by default, got ${scheduler.tasks.size}`);
+      }
+      const first = scheduler.tasks.get('retain-0');
+      if (!first || first.result === undefined) {
+        throw new Error('Retained task lost its result');
+      }
+    } finally {
+      await scheduler.shutdown();
+    }
+  }
+
+  private async testRetentionBounded(): Promise<void> {
+    const scheduler = this.createRetentionScheduler({ maxCompletedTasks: 5 });
+    try {
+      await this.runRetentionTasks(scheduler, 20);
+
+      if (scheduler.tasks.size !== 5) {
+        throw new Error(`Expected retention capped at 5, got ${scheduler.tasks.size}`);
+      }
+      // Eviction must not distort the counters
+      if (scheduler.stats.done !== 20) {
+        throw new Error(`Expected stats.done to count all 20 tasks, got ${scheduler.stats.done}`);
+      }
+    } finally {
+      await scheduler.shutdown();
+    }
+  }
+
+  private async testRetentionEvictsOldest(): Promise<void> {
+    const scheduler = this.createRetentionScheduler({ maxCompletedTasks: 3 });
+    try {
+      // Serial, so completion order is deterministic
+      for (let i = 0; i < 8; i++) {
+        await scheduler.addTask(new FyflowTask({
+          id: `retain-${i}`,
+          workerType: 'TestInlineWorker',
+          payload: { taskId: `retain-${i}`, data: `retain-${i}`, delay: 5 }
+        }), { createPromise: true });
+      }
+
+      const retained = Array.from(scheduler.tasks.keys()).sort();
+      const expected = ['retain-5', 'retain-6', 'retain-7'];
+      if (JSON.stringify(retained) !== JSON.stringify(expected)) {
+        throw new Error(`Expected the 3 newest tasks ${JSON.stringify(expected)}, got ${JSON.stringify(retained)}`);
+      }
+    } finally {
+      await scheduler.shutdown();
+    }
+  }
+
+  private createRetentionScheduler(options: any = {}): FyflowScheduler {
+    const workerManager = new WorkerManager(this.testInlineWorkerUrl, {
+      maxThreads: 2,
+      maxConcurrentTasks: 4,
+      inline: true
+    });
+    return new FyflowScheduler({ TestInlineWorker: workerManager }, {}, options);
+  }
+
+  private async runRetentionTasks(scheduler: FyflowScheduler, count: number): Promise<void> {
+    const tasks = [];
+    for (let i = 0; i < count; i++) {
+      tasks.push(new FyflowTask({
+        id: `retain-${i}`,
+        workerType: 'TestInlineWorker',
+        payload: { taskId: `retain-${i}`, data: `retain-${i}`, delay: 5 }
+      }));
+    }
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+  }
+
+  private async testBlockedTasksCompleteAfterBlocking(): Promise<void> {
+    const taskCount = 9;
+    // Well below taskCount, so most tasks are blocked on arrival and can only run
+    // once the rate limit window rolls over
+    const rateLimit = new RateLimitGroup([{ limit: 3, windowMs: 200 }]);
+
+    const workerManager = new WorkerManager(this.testInlineWorkerUrl, {
+      maxThreads: 2,
+      maxConcurrentTasks: 4,
+      inline: true,
+      groups: ['rateLimited']
+    });
+
+    const scheduler = new FyflowScheduler({ TestInlineWorker: workerManager }, { rateLimited: rateLimit });
+
+    // Completion must not be announced while tasks are still blocked
+    let doneAtFirstCompletion = -1;
+    scheduler.addEventListener('scheduler.completed', (e: any) => {
+      if (doneAtFirstCompletion === -1) doneAtFirstCompletion = e.detail.done;
+    });
+
+    for (let i = 0; i < taskCount; i++) {
+      scheduler.addTask(new FyflowTask({
+        id: `blocked-${i}`,
+        workerType: 'TestInlineWorker',
+        payload: { taskId: `blocked-${i}`, data: `blocked-test-${i}`, delay: 10 }
+      }));
+    }
+
+    try {
+      await this.waitForCompletion(scheduler, taskCount, 8000);
+
+      const stats = scheduler.stats;
+      if (stats.done !== taskCount) {
+        throw new Error(`Expected ${taskCount} completed tasks, got ${stats.done}`);
+      }
+      if (doneAtFirstCompletion !== -1 && doneAtFirstCompletion !== taskCount) {
+        throw new Error(
+          `scheduler.completed fired early with ${doneAtFirstCompletion}/${taskCount} tasks done`
+        );
+      }
+    } finally {
+      await scheduler.shutdown();
+    }
   }
 
   private async testResourceContention(): Promise<void> {
