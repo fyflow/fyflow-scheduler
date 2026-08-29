@@ -114,14 +114,16 @@ jobs:
           path: playwright-report/
           retention-days: 7
 
-  quality:
-    name: Lint (gating) & format (advisory)
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
-    # Lint gates: the tree is clean as of 2026-08-29, so a new problem fails CI.
-    # Format does not: `deno fmt --check` still reports 65 of 68 files
-    # unformatted, so making it blocking would fail every run. Reformatting is a
-    # large mechanical diff that has to originate in the private repo; once it
-    # lands, delete the continue-on-error below and this gates too.
+    # Gating: the tree is clean as of 2026-08-29, so a new problem fails CI.
+    #
+    # No `deno fmt --check` here on purpose. It reports 65 of 68 files
+    # unformatted, so it could only ever have run advisory, and an always-failing
+    # advisory step is noise rather than signal. Reformatting is a large
+    # mechanical diff that has to originate in the private repo; add the step
+    # back, gating, once that lands.
     steps:
       - uses: actions/checkout@v4
 
@@ -132,10 +134,6 @@ jobs:
           # run: local 2.3.7 passed, CI resolved 2.9.6 and surfaced a real
           # cross-runtime typing error. Bump this on purpose, not by accident.
           deno-version: v2.9.6
-
-      - name: Format
-        continue-on-error: true
-        run: deno fmt --check
 
       - name: Lint
         run: deno lint .
