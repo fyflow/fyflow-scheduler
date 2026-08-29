@@ -5,8 +5,6 @@ Zero-dependency parallel task scheduler with resource management and cross-platf
 [![npm version](https://badge.fury.io/js/fyflow-scheduler.svg)](https://badge.fury.io/js/fyflow-scheduler)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Note**: This project was mostly "vibe coded" with [Claude Code](https://claude.ai/code) - it was an experiment, if such a complex library can be built with sufficient code quality.
-
 > **Using this library from an AI agent?** [AGENTS.md](AGENTS.md) is a complete
 > single-file reference: exact signatures, defaults, events, gotchas and recipes.
 > Every snippet in it is executed by the test suite.
