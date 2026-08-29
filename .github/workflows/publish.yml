@@ -95,3 +95,62 @@ jobs:
 
       - name: Publish
         run: deno publish
+
+  npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    # Runs only if JSR succeeded, so the two registries cannot drift apart on a
+    # release: the version guard and the full gate set have already passed.
+    needs: publish
+    permissions:
+      contents: read
+      id-token: write   # trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      # Node 24 deliberately: npm trusted publishing needs npm >= 11.5.1, and
+      # Node 22 still ships npm 10.9.2. registry-url is what wires npm up for
+      # the OIDC exchange.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          cache: pnpm
+
+      # Also runs prepare, which is the esbuild + tsc library build, so the
+      # tarball is built from this checkout rather than anything cached.
+      - name: Install and build
+        run: pnpm install --frozen-lockfile
+
+      # npm, unlike JSR, hard-errors when republishing an existing version
+      # (E403) rather than skipping. Re-running this workflow on an unchanged
+      # version would therefore fail on an otherwise correct release.
+      - name: Skip if this version is already published
+        id: check
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          NAME=$(node -p "require('./package.json').name")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already on npm - nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$NAME@$VERSION is not published yet."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the tarball before publishing
+        if: steps.check.outputs.publish == 'true'
+        run: npm pack --dry-run
+
+      # No NPM_TOKEN. This relies on a trusted publisher being configured for
+      # fyflow-scheduler on npmjs.com, pointing at this repository and this
+      # workflow file (.github/workflows/publish.yml). Renaming this file breaks
+      # the trust relationship and publishing starts failing auth.
+      # Provenance is attested automatically via the OIDC token.
+      - name: Publish
+        if: steps.check.outputs.publish == 'true'
+        run: npm publish --provenance --access public
