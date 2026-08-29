@@ -12,6 +12,8 @@ export type { FyflowSchedulerOptions, AddTaskOptions } from "./core/FyflowSchedu
 export { ConcurrentLimitGroup } from "./groups/concurrentLimitGroup.ts";
 export { RateLimitGroup } from "./groups/rateLimitGroup.ts";
 export type { RateWindow } from "./groups/rateLimitGroup.ts";
+export { KeyedRateLimitGroup } from "./groups/keyedRateLimitGroup.ts";
+export type { KeyedRateLimitGroupOptions, KeyedTaskLike } from "./groups/keyedRateLimitGroup.ts";
 export type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from "./groups/resourceGroup.ts";
 
 // Worker management

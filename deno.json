@@ -1,4 +1,29 @@
 {
+    "name": "@fyflow/scheduler",
+    "version": "0.1.0",
+    "license": "MIT",
+    "exports": "./index.ts",
+    "publish": {
+      "exclude": [
+        "**",
+        "!index.ts",
+        "!core/FyflowScheduler.ts",
+        "!core/workerManager.ts",
+        "!core/threadWrapper.ts",
+        "!core/inlineWrapper.ts",
+        "!core/workerInterface.ts",
+        "!core/workerWrapperUrl.ts",
+        "!core/workerWrapper.ts",
+        "!groups/resourceGroup.ts",
+        "!groups/concurrentLimitGroup.ts",
+        "!groups/rateLimitGroup.ts",
+        "!groups/keyedRateLimitGroup.ts",
+        "!README.md",
+        ".claude",
+        ".vscode",
+        ".github"
+      ]
+    },
     "compilerOptions": {
       "lib": ["deno.ns", "dom", "dom.iterable", "esnext"],
       "checkJs": false,
@@ -17,17 +42,21 @@
     },
     "tasks": {
       "start": "deno run --allow-read --allow-net examples/getting-started.ts",
+      "examples": "deno run --allow-read --allow-write --allow-run --allow-net --allow-env scripts/run-examples.ts",
+      "jsr:smoke": "deno run --allow-read --allow-write --allow-run --allow-net --allow-env scripts/jsr-smoke.ts",
       "check": "deno check index.ts tests/runner.ts core/ groups/ tests/suites/ tests/workers/ tests/performance/ benchmark/ examples/",
       "test": "deno run --allow-read --allow-net tests/runner.ts",
       "test:core": "deno run --allow-read --allow-net tests/runner.ts core",
       "test:error": "deno run --allow-read --allow-net tests/runner.ts error",
       "test:spawning": "deno run --allow-read --allow-net tests/runner.ts spawning",
+      "test:settlement": "deno run --allow-read --allow-net tests/runner.ts settlement",
       "test:docs": "deno run --allow-read --allow-net tests/runner.ts docs",
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",
       "benchmark:quick": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick",
       "benchmark:baseline": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories baseline",
       "benchmark:variance": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick --runs 3",
+      "benchmark:startup": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories startup",
       "benchmark:contention": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories contention",
       "benchmark:overlapping": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories overlapping",
       "benchmark:help": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --help"

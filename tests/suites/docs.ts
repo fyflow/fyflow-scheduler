@@ -12,7 +12,8 @@ import {
   FyflowScheduler,
   FyflowTask,
   ConcurrentLimitGroup,
-  RateLimitGroup
+  RateLimitGroup,
+  KeyedRateLimitGroup
 } from '../../index.ts';
 import type { WorkerStatus } from '../../index.ts';
 
@@ -118,11 +119,22 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Task Failure Handling', () => this.docFailure()));
     this.results.push(await this.runTest('Doc: Worker Status Inspection', () => this.docWorkerStatus()));
     this.results.push(await this.runTest('Doc: Restart A Worker', () => this.docRestartWorker()));
+    this.results.push(await this.runTest('Doc: replaceWorker Is An Alias', () => this.docReplaceWorker()));
+    this.results.push(await this.runTest('Doc: updateWorkerConfig And Its Caveat', () => this.docUpdateWorkerConfig()));
+    this.results.push(await this.runTest('Doc: task.started Fires On The Pool', () => this.docTaskStartedEvent()));
+    this.results.push(await this.runTest('Doc: Teardown Failure Is Reported', () => this.docTeardownFailure()));
     this.results.push(await this.runTest('Doc: Worker Self-Termination', () => this.docSelfTermination()));
     this.results.push(await this.runTest('Doc: Worker Lifecycle Events', () => this.docLifecycleEvents()));
     this.results.push(await this.runTest('Doc: Bounded Task Retention', () => this.docRetention()));
     this.results.push(await this.runTest('Doc: Waiting For The Whole Run', () => this.docSchedulerCompleted()));
     this.results.push(await this.runTest('Doc: Unknown Worker Type Behaviour', () => this.docUnknownWorkerType()));
+    this.results.push(await this.runTest('Doc: Inline Concurrency Is The Product', () => this.docInlineConcurrency()));
+    this.results.push(await this.runTest('Doc: Groups Must Be Declared By The Pool', () => this.docGroupsMustBeDeclared()));
+    this.results.push(await this.runTest('Doc: Keyed Rate Limit Is Per Key', () => this.docKeyedRateLimit()));
+    this.results.push(await this.runTest('Doc: Keyed Limit Isolates A Saturated Key', () => this.docKeyedIsolation()));
+    this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
+    this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
+    this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -222,39 +234,58 @@ class DocsTestSuite {
 
   private async docConcurrentGroup(): Promise<void> {
     const cpu = new ConcurrentLimitGroup(2, 'cpu');
-    const scheduler = this.makeScheduler({ groups: ['cpu'] }, { cpu });
+    // Pool capacity is 16, far above the limit, so a peak near the limit can
+    // only come from the group. Asserting "8 tasks completed" would have passed
+    // with no group at all.
+    const scheduler = this.makeScheduler({ groups: ['cpu'], maxThreads: 4, maxConcurrentTasks: 4 }, { cpu });
+
+    let inFlight = 0, peak = 0;
+    scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
+    scheduler.addEventListener('task.completed', () => { inFlight--; });
 
     const tasks = Array.from({ length: 8 }, (_, i) => new FyflowTask({
-      id: `doc-cpu-${i}`,
-      workerType: 'DocsWorker',
-      payload: { id: `doc-cpu-${i}`, value: i }
+      id: `doc-cpu-${i}`, workerType: 'DocsWorker',
+      payload: { id: `doc-cpu-${i}`, value: i, awaitMs: 40 }
     }));
     await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
 
     if (scheduler.stats.done !== 8) throw new Error(`Expected 8 done, got ${scheduler.stats.done}`);
-    // Slots are returned when tasks finish
+
+    // Groups are optimistic, so a brief overshoot is expected - but nothing near
+    // the pool's own capacity of 16
+    if (peak > 6) {
+      throw new Error(`Group did not constrain concurrency: peak ${peak} against a limit of 2`);
+    }
     if (cpu.getMetrics().running !== 0) {
       throw new Error(`Expected group drained, got ${cpu.getMetrics().running} running`);
     }
   }
 
   private async docRateLimitGroup(): Promise<void> {
-    // Several windows are enforced together
+    // Several windows are enforced together, so the tightest one binds
     const api = new RateLimitGroup([
       { limit: 4, windowMs: 200 },
       { limit: 50, windowMs: 60_000 }
     ], 'api');
-    const scheduler = this.makeScheduler({ groups: ['api'] }, { api });
+    const scheduler = this.makeScheduler({ groups: ['api'], maxThreads: 4, maxConcurrentTasks: 4 }, { api });
 
     const tasks = Array.from({ length: 12 }, (_, i) => new FyflowTask({
-      id: `doc-api-${i}`,
-      workerType: 'DocsWorker',
-      payload: { id: `doc-api-${i}`, value: i }
+      id: `doc-api-${i}`, workerType: 'DocsWorker', payload: { id: `doc-api-${i}`, value: i }
     }));
+
+    const start = performance.now();
     await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+    const elapsed = performance.now() - start;
 
     // Everything beyond the limit waits for the window instead of being dropped
     if (scheduler.stats.done !== 12) throw new Error(`Expected 12 done, got ${scheduler.stats.done}`);
+
+    // 12 tasks at 4 per 200ms window need at least two window rollovers. These
+    // tasks are otherwise instant - unthrottled the run finishes in ~50ms, so
+    // this is what distinguishes a working rate limit from none at all.
+    if (elapsed < 400) {
+      throw new Error(`Rate limit did not throttle: 12 tasks at 4 per 200ms finished in ${elapsed.toFixed(0)}ms`);
+    }
   }
 
   private async docResourceMonitoring(): Promise<void> {
@@ -435,6 +466,116 @@ class DocsTestSuite {
     if (result.value !== 20) throw new Error(`Expected the new config to apply (20), got ${result.value}`);
   }
 
+  // Documented as an alias for restartWorker
+  private async docReplaceWorker(): Promise<void> {
+    const pool = new WorkerManager(this.workerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true
+    });
+    const scheduler = new FyflowScheduler({ DocsWorker: pool });
+    this.schedulers.push(scheduler);
+
+    await scheduler.addTask(new FyflowTask({
+      id: 'replace-1', workerType: 'DocsWorker', payload: { id: 'replace-1', value: 2 }
+    }), { createPromise: true });
+
+    const originalId = pool.getWorkerIds()[0];
+    const replaced = await pool.replaceWorker(originalId, { multiplier: 5 });
+    if (!replaced) throw new Error('replaceWorker returned false for a live worker');
+    if (pool.getWorkerIds()[0] === originalId) throw new Error('Worker id unchanged after replaceWorker');
+
+    const result = await scheduler.addTask(new FyflowTask({
+      id: 'replace-2', workerType: 'DocsWorker', payload: { id: 'replace-2', value: 2 }
+    }), { createPromise: true });
+    if (result.value !== 10) throw new Error(`Expected the new config to apply (10), got ${result.value}`);
+
+    if (await pool.replaceWorker('no-such-worker')) {
+      throw new Error('replaceWorker should return false for an unknown id');
+    }
+  }
+
+  // updateWorkerConfig merges into the config object a live worker holds. The
+  // documented caveat is that a worker which copied values in its constructor -
+  // as DocsWorker copies `multiplier` - will not see the change; restartWorker is
+  // what rebuilds it.
+  private async docUpdateWorkerConfig(): Promise<void> {
+    const pool = new WorkerManager(this.workerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true, config: { multiplier: 2 }
+    });
+    const scheduler = new FyflowScheduler({ DocsWorker: pool });
+    this.schedulers.push(scheduler);
+
+    const before = await scheduler.addTask(new FyflowTask({
+      id: 'upd-1', workerType: 'DocsWorker', payload: { id: 'upd-1', value: 3 }
+    }), { createPromise: true });
+    if (before.value !== 6) throw new Error(`Expected 3 * 2 = 6, got ${before.value}`);
+
+    const workerId = pool.getWorkerIds()[0];
+    if (!await pool.updateWorkerConfig(workerId, { multiplier: 10 })) {
+      throw new Error('updateWorkerConfig returned false for a live worker');
+    }
+    if (await pool.updateWorkerConfig('no-such-worker', {})) {
+      throw new Error('updateWorkerConfig should return false for an unknown id');
+    }
+
+    const after = await scheduler.addTask(new FyflowTask({
+      id: 'upd-2', workerType: 'DocsWorker', payload: { id: 'upd-2', value: 3 }
+    }), { createPromise: true });
+
+    // The caveat, asserted: the running instance copied multiplier at construction
+    if (after.value !== 6) {
+      throw new Error(
+        `A worker that copied config in its constructor should not see updateWorkerConfig ` +
+        `(expected 6, got ${after.value}) - if this changed, the documented caveat is wrong`
+      );
+    }
+  }
+
+  private async docTaskStartedEvent(): Promise<void> {
+    const pool = new WorkerManager(this.workerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true
+    });
+    const scheduler = new FyflowScheduler({ DocsWorker: pool });
+    this.schedulers.push(scheduler);
+
+    // task.started is a pool event - the scheduler emits task.running instead
+    const started: string[] = [];
+    pool.addEventListener('task.started', (e: any) => started.push(e.detail.taskId));
+
+    await scheduler.addTask(new FyflowTask({
+      id: 'started', workerType: 'DocsWorker', payload: { id: 'started', value: 1 }
+    }), { createPromise: true });
+
+    if (started.length !== 1 || started[0] !== 'started') {
+      throw new Error(`Expected one task.started for 'started', got ${JSON.stringify(started)}`);
+    }
+  }
+
+  private async docTeardownFailure(): Promise<void> {
+    const crashUrl = typeof Deno !== "undefined"
+      ? new URL("../workers/crashingWorker.ts", import.meta.url).href
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      : new URL((await import('../workers/crashingWorker.ts?worker-direct')).default).href;
+
+    const pool = new WorkerManager(crashUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true, config: { crashOnTeardown: true }
+    });
+    const scheduler = new FyflowScheduler({ CrashingWorker: pool });
+
+    let teardownFailed = 0;
+    pool.addEventListener('worker.teardown.failed', () => { teardownFailed++; });
+
+    await scheduler.addTask(new FyflowTask({
+      id: 'teardown', workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+    }), { createPromise: true });
+
+    // Shutdown tears the worker down, and its teardown throws
+    await scheduler.shutdown();
+
+    if (teardownFailed !== 1) {
+      throw new Error(`Expected 1 worker.teardown.failed, got ${teardownFailed}`);
+    }
+  }
+
   private async docSelfTermination(): Promise<void> {
     const pool = new WorkerManager(this.workerUrl, {
       maxThreads: 1, maxConcurrentTasks: 1, inline: true
@@ -567,6 +708,234 @@ class DocsTestSuite {
     }
     if (scheduler.tasks.has('doc-bad-good') || scheduler.tasks.has('doc-bad-2')) {
       throw new Error('Rejected batch left orphan entries in the task map');
+    }
+  }
+
+  // For an inline pool, maxThreads counts worker INSTANCES in the main process,
+  // not threads. Only maxThreads x maxConcurrentTasks bounds concurrency, so
+  // 4x5 and 1x20 behave the same - the documented table depends on this
+  private async docInlineConcurrency(): Promise<void> {
+    const peakFor = async (maxThreads: number, maxConcurrentTasks: number) => {
+      const pool = new WorkerManager(this.workerUrl, {
+        maxThreads, maxConcurrentTasks, inline: true, idleTimeout: 0
+      });
+      const scheduler = new FyflowScheduler({ DocsWorker: pool });
+      this.schedulers.push(scheduler);
+
+      let inFlight = 0, peak = 0;
+      scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
+      scheduler.addEventListener('task.completed', () => { inFlight--; });
+
+      const tasks = Array.from({ length: 60 }, (_, i) => new FyflowTask({
+        id: `conc-${maxThreads}x${maxConcurrentTasks}-${i}`,
+        workerType: 'DocsWorker',
+        payload: { id: `conc-${i}`, value: i, awaitMs: 30 }
+      }));
+      await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+      return { peak, instances: pool.getWorkerIds().length };
+    };
+
+    const split = await peakFor(4, 5);
+    const single = await peakFor(1, 20);
+
+    // Instances really are created - and they are not threads
+    if (split.instances !== 4) throw new Error(`Expected 4 inline instances, got ${split.instances}`);
+    if (single.instances !== 1) throw new Error(`Expected 1 inline instance, got ${single.instances}`);
+
+    // Both configurations reach the same ceiling: the product, 20
+    if (split.peak !== 20) throw new Error(`4x5 should peak at 20 in-flight, got ${split.peak}`);
+    if (single.peak !== 20) throw new Error(`1x20 should peak at 20 in-flight, got ${single.peak}`);
+  }
+
+  // Registering a group on the scheduler does nothing on its own - the pool (or
+  // the task) has to declare it. The Quick Start in README.md depends on this
+  private async docGroupsMustBeDeclared(): Promise<void> {
+    const peakWith = async (declare: boolean) => {
+      const group = new ConcurrentLimitGroup(2, 'cpu');
+      const pool = new WorkerManager(this.workerUrl, {
+        maxThreads: 4, maxConcurrentTasks: 4, inline: true, idleTimeout: 0,
+        ...(declare ? { groups: ['cpu'] } : {})
+      });
+      const scheduler = new FyflowScheduler({ DocsWorker: pool }, { cpu: group });
+      this.schedulers.push(scheduler);
+
+      let inFlight = 0, peak = 0;
+      scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
+      scheduler.addEventListener('task.completed', () => { inFlight--; });
+
+      const tasks = Array.from({ length: 40 }, (_, i) => new FyflowTask({
+        id: `grp-${declare}-${i}`,
+        workerType: 'DocsWorker',
+        payload: { id: `grp-${i}`, value: i, awaitMs: 25 }
+      }));
+      await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+      return peak;
+    };
+
+    const undeclared = await peakWith(false);
+    const declared = await peakWith(true);
+
+    // Undeclared: the limit of 2 is ignored entirely, so the pool's own capacity
+    // (4 x 4) is the only bound
+    if (undeclared <= 4) {
+      throw new Error(`An undeclared group appears to constrain now (peak ${undeclared}) - docs need updating`);
+    }
+    // Declared: bounded by the limit, allowing for documented optimistic overshoot
+    if (declared > 4) {
+      throw new Error(`Declared group did not constrain: peak ${declared} for a limit of 2`);
+    }
+  }
+
+  // Each key gets its own bucket, so N keys can run N x limit concurrently
+  private async docKeyedRateLimit(): Promise<void> {
+    const api = new KeyedRateLimitGroup(
+      [{ limit: 2, windowMs: 200 }],
+      { id: 'api', keyFrom: (t: any) => t.payload.endpoint }
+    );
+    const scheduler = this.makeScheduler({ groups: ['api'], maxThreads: 4, maxConcurrentTasks: 4 }, { api });
+
+    const perKey = new Map<string, number>();
+    let inFlight = 0, peak = 0;
+    scheduler.addEventListener('task.running', (e: any) => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      const k = e.detail.payload.endpoint;
+      perKey.set(k, (perKey.get(k) ?? 0) + 1);
+    });
+    scheduler.addEventListener('task.completed', (e: any) => {
+      inFlight--;
+      const k = e.detail.payload.endpoint;
+      perKey.set(k, (perKey.get(k) ?? 1) - 1);
+    });
+
+    const tasks = [];
+    for (const endpoint of ['search', 'orders', 'users']) {
+      for (let i = 0; i < 6; i++) {
+        tasks.push(new FyflowTask({
+          id: `keyed-${endpoint}-${i}`,
+          workerType: 'DocsWorker',
+          payload: { id: `keyed-${endpoint}-${i}`, value: i, endpoint, awaitMs: 30 }
+        }));
+      }
+    }
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+
+    if (scheduler.stats.done !== 18) throw new Error(`Expected 18 done, got ${scheduler.stats.done}`);
+    // 3 keys x limit 2 means the total can exceed any single key's limit
+    if (peak <= 2) {
+      throw new Error(`Keys are not getting independent buckets - peak was ${peak} across 3 keys`);
+    }
+  }
+
+  // A saturated key must not delay tasks belonging to another key
+  private async docKeyedIsolation(): Promise<void> {
+    const api = new KeyedRateLimitGroup(
+      [{ limit: 1, windowMs: 400 }],
+      { id: 'api', keyFrom: (t: any) => t.payload.endpoint }
+    );
+    const scheduler = this.makeScheduler({ groups: ['api'], maxThreads: 4, maxConcurrentTasks: 4 }, { api });
+
+    // 'hot' saturates its own bucket for the whole window
+    const hot = Array.from({ length: 5 }, (_, i) => new FyflowTask({
+      id: `hot-${i}`,
+      workerType: 'DocsWorker',
+      payload: { id: `hot-${i}`, value: i, endpoint: 'hot', awaitMs: 10 }
+    }));
+    // 'cold' is added behind them and must not wait for 'hot' to drain
+    const cold = new FyflowTask({
+      id: 'cold-0',
+      workerType: 'DocsWorker',
+      payload: { id: 'cold-0', value: 0, endpoint: 'cold', awaitMs: 10 }
+    });
+
+    scheduler.addTasks(hot);
+    const start = performance.now();
+    await scheduler.addTask(cold, { createPromise: true });
+    const coldWait = performance.now() - start;
+
+    // Sharing a queue with 'hot' would mean waiting out its 400ms windows
+    if (coldWait > 250) {
+      throw new Error(`A saturated key delayed another key: cold task waited ${coldWait.toFixed(0)}ms`);
+    }
+  }
+
+  // A task with no derivable key is rejected rather than silently sharing a bucket
+  private async docKeyedRequiresKey(): Promise<void> {
+    const api = new KeyedRateLimitGroup([{ limit: 5, windowMs: 100 }], { id: 'api' });
+    const scheduler = this.makeScheduler({ groups: ['api'] }, { api });
+
+    let message = '';
+    try {
+      scheduler.addTask(new FyflowTask({
+        id: 'no-key', workerType: 'DocsWorker', payload: { id: 'no-key', value: 1 }
+      }));
+    } catch (error: any) {
+      message = error.message;
+    }
+    if (!message.includes('Missing limit key')) {
+      throw new Error(`Expected a missing-key error, got "${message || 'no error'}"`);
+    }
+    if (scheduler.stats.queued !== 0) throw new Error('Rejected task was still queued');
+
+    // The default keyFrom reads task.limitKey
+    const result = await scheduler.addTask(new FyflowTask({
+      id: 'with-key', workerType: 'DocsWorker', limitKey: 'tenant-a',
+      payload: { id: 'with-key', value: 7 }
+    }), { createPromise: true });
+    if (result.value !== 7) throw new Error('Task with a limitKey did not run');
+  }
+
+  private async docKeyedMetrics(): Promise<void> {
+    const api = new KeyedRateLimitGroup(
+      [{ limit: 4, windowMs: 50 }],
+      { id: 'api', keyFrom: (t: any) => t.payload.endpoint, idleKeyTtlMs: 60 }
+    );
+    const scheduler = this.makeScheduler({ groups: ['api'] }, { api });
+
+    const tasks = ['a', 'b'].flatMap(endpoint => [0, 1].map(i => new FyflowTask({
+      id: `m-${endpoint}-${i}`,
+      workerType: 'DocsWorker',
+      payload: { id: `m-${endpoint}-${i}`, value: i, endpoint }
+    })));
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+
+    const metrics = api.getMetrics();
+    if (metrics.limit !== 4) throw new Error(`Expected per-key limit 4, got ${metrics.limit}`);
+    if (metrics.activeKeys !== 2) throw new Error(`Expected 2 active keys, got ${metrics.activeKeys}`);
+    if (api.getKeyMetrics('a').limit !== 4) throw new Error('getKeyMetrics returned the wrong limit');
+
+    // Idle keys are evicted so high-cardinality keys cannot grow without bound
+    await new Promise(resolve => setTimeout(resolve, 150));
+    if (api.getMetrics().activeKeys !== 0) {
+      throw new Error(`Idle keys were not evicted: ${api.getActiveKeys().join(',')}`);
+    }
+  }
+
+  // AGENTS.md is the reference an agent reads before writing code against this
+  // library, so a new export that never reaches it is invisible to that audience.
+  // Deno-only: the Node build runs from dev-dist and has no repo-relative access
+  // to the markdown.
+  private async docExportsDocumented(): Promise<void> {
+    if (typeof Deno === 'undefined') return; // Covered by the Deno run
+
+    const root = new URL('../../', import.meta.url);
+    const indexSource = await Deno.readTextFile(new URL('index.ts', root));
+    const agents = await Deno.readTextFile(new URL('AGENTS.md', root));
+
+    const exported = new Set<string>();
+    for (const match of indexSource.matchAll(/export (?:type )?\{([^}]+)\}/gs)) {
+      for (const raw of match[1].split(',')) {
+        // `X as Y` exports Y - taking the left side would miss renamed exports
+        const name = raw.trim().split(' as ').pop()!.trim();
+        if (name) exported.add(name);
+      }
+    }
+    if (exported.size < 20) {
+      throw new Error(`Only parsed ${exported.size} exports from index.ts - the parser is wrong, not the docs`);
+    }
+
+    const undocumented = [...exported].filter(name => !agents.includes(name)).sort();
+    if (undocumented.length > 0) {
+      throw new Error(`Exported but absent from AGENTS.md: ${undocumented.join(', ')}`);
     }
   }
 

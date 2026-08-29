@@ -9,9 +9,9 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     runningTasks = 0;
     maxConcurrentTasks: number;
     idleTimeout: number;
-    callbacks = new Map<string, {resolve: Function, reject: Function}>();
-    taskStartTimes = new Map<string, number>(); // Track task execution start times
-    runningTaskData = new Map<string, {id: string, payload: any}>(); // Track task data for requeuing
+    callbacks: Map<string, {resolve: Function, reject: Function}> = new Map<string, {resolve: Function, reject: Function}>();
+    taskStartTimes: Map<string, number> = new Map<string, number>(); // Track task execution start times
+    runningTaskData: Map<string, {id: string, payload: any}> = new Map<string, {id: string, payload: any}>(); // Track task data for requeuing
     lastActivityTime: number = Date.now();
     config: any;
     id: string;
@@ -28,7 +28,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     // Stats for WorkerStatus
     tasksCompleted = 0;
     errorCount = 0;
-    createdAt = Date.now();
+    createdAt: number = Date.now();
     private initStartTime = 0;
     private teardownStartTime = 0;
 
@@ -214,7 +214,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
       this.lastActivityTime = Date.now();
     }
 
-    async _ensureInitialized() {
+    async _ensureInitialized(): Promise<void> {
       if (this.initialized) return;
       this.initializing = true
       const workerWrapperURL = await getWorkerUrl();
@@ -238,7 +238,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
                 workerId: this.id,
                 workerType: 'thread',
                 timestamp: Date.now(),
-                duration: this.initStartTime ? Date.now() - this.initStartTime : 0
+                duration: this.initStartTime ? performance.now() - this.initStartTime : 0
               }
             }));
             return;
@@ -268,7 +268,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
                 workerId: this.id,
                 workerType: 'thread',
                 timestamp: Date.now(),
-                duration: this.teardownStartTime ? Date.now() - this.teardownStartTime : 0
+                duration: this.teardownStartTime ? performance.now() - this.teardownStartTime : 0
               }
             }));
             return;
@@ -326,12 +326,26 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
             // timeout instead of failing immediately
             if (taskId === 'init') {
               this.initializing = false;
+              const initError = new Error(data?.message || String(data));
               this.dispatchEvent(new CustomEvent('worker.initialization.failed', {
                 detail: {
                   workerId: this.id,
                   workerType: 'thread',
                   timestamp: Date.now(),
-                  error: new Error(data?.message || String(data))
+                  error: initError
+                }
+              }));
+              // Also report it as a worker failure, exactly as InlineWrapper does.
+              // Without this the pool never learns the worker is unusable, so it
+              // never counts a restart and never reaches
+              // worker.restart_limit_exceeded - an unstartable threaded pool was
+              // silent to anyone monitoring that event.
+              this.dispatchEvent(new CustomEvent('worker.failed', {
+                detail: {
+                  workerId: this.id,
+                  error: initError,
+                  metadata: { failureType: 'initialization', stage: 'constructor' },
+                  timestamp: Date.now()
                 }
               }));
               return;
@@ -390,7 +404,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         })
       }
 
-      this.initStartTime = Date.now();
+      this.initStartTime = performance.now();
       this.dispatchEvent(new CustomEvent('worker.initialization.started', {
         detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now() }
       }));
@@ -490,7 +504,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     async terminate() {
       // Send teardown message to worker if initialized
       if (this.initialized) {
-        this.teardownStartTime = Date.now();
+        this.teardownStartTime = performance.now();
         this.dispatchEvent(new CustomEvent('worker.teardown.started', {
           detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now() }
         }));

@@ -43,7 +43,24 @@ export class FyflowTask {
      * slot. Cleared when a task is requeued or retried.
      */
     executionTime?: number;
+    /**
+     * Bucket this task belongs to for keyed resource groups. Read by the default
+     * `keyFrom` of {@link KeyedRateLimitGroup}; a group given its own `keyFrom`
+     * can derive the key from the payload instead.
+     */
+    limitKey?: string;
     _resourcesPreAllocated?: boolean; // Flag to track if resources are pre-allocated
+    /**
+     * Keys resolved at dispatch, per keyed group id. Held so release uses the
+     * same bucket acquisition used, even if the payload changed meanwhile.
+     */
+    _resourceKeys?: Record<string, string>;
+    /**
+     * Set while this attempt is being settled, so the same outcome arriving from
+     * both the pool's `task.failed` event and the task promise settles once.
+     * Cleared on every dispatch, so each attempt gets its own settle.
+     */
+    _settling?: boolean;
 
     // Private fields for resource management
     _scheduler?: FyflowScheduler; // Reference to scheduler for descendant tracking
@@ -61,9 +78,13 @@ export class FyflowTask {
      * @param config.handleRejection Default `true`. Attaches a silent catch so a
      *   fire-and-forget failure does not surface as an unhandled rejection;
      *   `task.failed` is still emitted.
+     * @param config.limitKey Bucket for keyed resource groups, e.g. the endpoint
+     *   or tenant this task belongs to. Required when the task belongs to a
+     *   keyed group that has no custom `keyFrom`.
      */
-    constructor({id, workerType, payload, optional = false, retryPolicy, workerGroups = [], handleRejection = true}: any) {
+    constructor({id, workerType, payload, optional = false, retryPolicy, workerGroups = [], handleRejection = true, limitKey}: any) {
       this.id = id;
+      this.limitKey = limitKey;
       this.workerType = workerType;
       this.payload = payload;
       this.optional = optional;
@@ -158,9 +179,9 @@ export class FyflowTask {
    * `scheduler.completed`.
    */
   export class FyflowScheduler extends EventTarget {
-    tasks = new Map<string, FyflowTask>();
-    readyQueuesByWorker = new Map<string, FyflowTask[]>(); // Per-worker-type queues for O(1) dispatch
-    blockedQueues = new Map<string, FyflowTask[]>(); // Grouped by blocking group IDs for faster lookup
+    tasks: Map<string, FyflowTask> = new Map<string, FyflowTask>();
+    readyQueuesByWorker: Map<string, FyflowTask[]> = new Map<string, FyflowTask[]>(); // Per-worker-type queues for O(1) dispatch
+    blockedQueues: Map<string, FyflowTask[]> = new Map<string, FyflowTask[]>(); // Grouped by blocking group IDs for faster lookup
     workerPools: any;
     groups: Record<string, any>;
     stats = {queued:0, running:0, done:0, failed:0};
@@ -196,6 +217,48 @@ export class FyflowTask {
 
       this._setupWorkerPoolListeners();
       this._setupGroupEventListeners();
+    }
+
+    /** Every resource group a task must acquire: its own plus its pool's. */
+    private _groupsForTask(task: FyflowTask, pool: any): Array<{ id: string; group: any }> {
+      const ids = [...new Set([...(task.workerGroups || []), ...(pool?.groups || [])])];
+      return ids
+        .map(id => ({ id, group: this.groups[id] }))
+        .filter(entry => entry.group);
+    }
+
+    /**
+     * Blocked queues are per group, and per (group, key) for keyed groups, so a
+     * saturated key never stalls tasks belonging to a different one.
+     */
+    private _blockedQueueId(groupId: string, key?: string): string {
+      return key === undefined ? groupId : `${groupId} ${key}`;
+    }
+
+    /**
+     * Resolve the bucket for every keyed group this task belongs to.
+     *
+     * @throws if a keyed group cannot derive a key. A keyless task would
+     *   otherwise silently share a bucket with every other keyless task, or skip
+     *   the limit entirely - both discovered only once something is throttled.
+     */
+    private _resolveResourceKeys(task: FyflowTask, pool: any): Record<string, string> {
+      const keys: Record<string, string> = {};
+
+      for (const { id, group } of this._groupsForTask(task, pool)) {
+        if (!group.keyed) continue;
+
+        const key = group.keyFor?.(task);
+        if (key === undefined) {
+          throw new Error(
+            `Missing limit key for group "${id}" on task "${task.id}". ` +
+            `Set task.limitKey, or give the group a keyFrom that derives one.`
+          );
+        }
+        keys[id] = key;
+      }
+
+      return keys;
     }
 
     // Any task waiting on a resource group. Blocked tasks are subtracted from
@@ -249,6 +312,8 @@ export class FyflowTask {
       if (!workerQueue) {
         throw new Error(`Unknown worker type: ${task.workerType}`);
       }
+      // Throws on a keyed group with no derivable key, before anything is registered
+      this._resolveResourceKeys(task, this.workerPools[task.workerType]);
 
       // Set scheduler reference for descendant tracking
       task._scheduler = this;
@@ -303,6 +368,7 @@ export class FyflowTask {
         if (!this.readyQueuesByWorker.has(task.workerType)) {
           throw new Error(`Unknown worker type: ${task.workerType}`);
         }
+        this._resolveResourceKeys(task, this.workerPools[task.workerType]);
       }
 
       const promises: Promise<any>[] = [];
@@ -350,6 +416,7 @@ export class FyflowTask {
 
     _dispatchLoop() {
       let tasksProcessed = 0;
+      let keyedSkips = 0; // Bounds the extra scanning keyed groups can cause
       const maxTasksPerLoop = 1000; // Prevent excessive iterations in extreme contention
 
 
@@ -371,11 +438,20 @@ export class FyflowTask {
             // Dispatch the task (synchronous dispatch, async execution)
             this._dispatchTask(task, pool);
             tasksProcessed++;
-          } else if (canDispatchResult === 'blocked') {
+          } else if (canDispatchResult === 'blocked' || canDispatchResult === 'blocked-keyed') {
             // Task was moved to blocked queue - remove from ready queue
             queue.shift();
             // Decrement queued count since task is now blocked (not in ready queue)
-            this.stats.queued--;
+            this.stats.queued = Math.max(0, this.stats.queued - 1);
+
+            if (canDispatchResult === 'blocked-keyed' && keyedSkips < maxTasksPerLoop) {
+              // Only this task's key is exhausted. Keep scanning: the next task
+              // may belong to a key with room, and stopping here would let one
+              // hot key stall every other key sharing the worker type.
+              keyedSkips++;
+              continue;
+            }
+
             // Stop processing this worker type for now
             break;
           } else {
@@ -399,7 +475,7 @@ export class FyflowTask {
 
 
     // Helper: Check resource availability and block if needed
-    _checkAndBlockResources(task: FyflowTask, pool: any): boolean {
+    _checkAndBlockResources(task: FyflowTask, pool: any): true | 'blocked' | 'blocked-keyed' {
       const taskGroupIds = task.workerGroups || [];
       const workerGroupIds = pool.groups || [];
 
@@ -408,30 +484,35 @@ export class FyflowTask {
         return true;
       }
 
-      const allGroupIds = [...new Set([...taskGroupIds, ...workerGroupIds])];
-      const allGroups = allGroupIds.map((gid: string) => this.groups[gid]).filter((g: any) => g);
+      const entries = this._groupsForTask(task, pool);
+      const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
+      task._resourceKeys = keys;
 
       // Check if resources are available
-      for (const group of allGroups) {
-        if (!group.canRun()) {
-          // Add to blocked queue
-          const groupId = allGroupIds.find(gid => this.groups[gid] === group)!;
-          if (!this.blockedQueues.has(groupId)) {
-            this.blockedQueues.set(groupId, []);
+      for (const { id, group } of entries) {
+        const key = group.keyed ? keys[id] : undefined;
+        if (!group.canRun(key)) {
+          const blockedOnKey = Boolean(group.keyed);
+          // Blocked on this group - and on this key, when the group is keyed
+          const queueId = this._blockedQueueId(id, key);
+          if (!this.blockedQueues.has(queueId)) {
+            this.blockedQueues.set(queueId, []);
           }
-          const blockedQueue = this.blockedQueues.get(groupId)!;
+          const blockedQueue = this.blockedQueues.get(queueId)!;
           if (!blockedQueue.includes(task)) {
             blockedQueue.push(task);
           }
           this._schedulePeriodicRetry();
-          return false; // Resources unavailable, task blocked
+          // A keyed block says nothing about the next task in the ready queue,
+          // which may belong to a key with a free bucket
+          return blockedOnKey ? 'blocked-keyed' : 'blocked';
         }
       }
       return true; // Resources available
     }
 
     // NEW: Non-optimistic mode helper methods
-    _canDispatchTask(task: FyflowTask, pool: any): boolean | 'blocked' {
+    _canDispatchTask(task: FyflowTask, pool: any): boolean | 'blocked' | 'blocked-keyed' {
       // Check if we have an immediately available thread (no async creation)
       const availableThreads = pool.threads.filter((t: any) =>
         t.canAcceptTask && t.canAcceptTask()
@@ -439,8 +520,9 @@ export class FyflowTask {
 
       if (availableThreads > 0) {
         // Have available thread - check resources
-        if (!this._checkAndBlockResources(task, pool)) {
-          return 'blocked';
+        const resourceResult = this._checkAndBlockResources(task, pool);
+        if (resourceResult !== true) {
+          return resourceResult;
         }
         return true;
       }
@@ -451,8 +533,9 @@ export class FyflowTask {
       const canCreateThread = (pool.threads.length + initializingCount) < pool.maxThreads;
       if (canCreateThread) {
         // Check resource groups before creating thread
-        if (!this._checkAndBlockResources(task, pool)) {
-          return 'blocked';
+        const resourceResult = this._checkAndBlockResources(task, pool);
+        if (resourceResult !== true) {
+          return resourceResult;
         }
         // Resources available - can create thread and dispatch
         return true;
@@ -464,18 +547,19 @@ export class FyflowTask {
 
     _dispatchTask(task: FyflowTask, pool: any) {
       // Acquire resources immediately (thread will be created if needed)
-      const taskGroupIds = task.workerGroups || [];
-      const workerGroupIds = pool.groups || [];
-      const allGroupIds = [...new Set([...taskGroupIds, ...workerGroupIds])];
-      const allGroups = allGroupIds.map((gid: string) => this.groups[gid]).filter((g: any) => g);
+      const entries = this._groupsForTask(task, pool);
+      const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
+      task._resourceKeys = keys;
 
-      allGroups.forEach((g: any) => g.onStart());
+      entries.forEach(({ id, group }) => group.onStart(group.keyed ? keys[id] : undefined));
       task._resourcesPreAllocated = true;
+      // A fresh attempt may be settled again
+      task._settling = false;
 
       // Update state and stats synchronously
       task.state = 'running';
       task.startTime = Date.now();
-      this.stats.queued--;
+      this.stats.queued = Math.max(0, this.stats.queued - 1);
       this.stats.running++;
 
       // Get/create thread and execute task
@@ -490,7 +574,7 @@ export class FyflowTask {
             task.state = 'pending';
             task.startTime = undefined;
             task.executionTime = undefined; // Discard timing from the abandoned attempt
-            this.stats.running--;
+            this.stats.running = Math.max(0, this.stats.running - 1);
             this.stats.queued++;
 
             // Release pre-allocated resources
@@ -513,96 +597,154 @@ export class FyflowTask {
     _releaseResourcesForTask(task: FyflowTask, pool: any) {
       if (!task._resourcesPreAllocated) return;
 
-      const taskGroupIds = task.workerGroups || [];
-      const workerGroupIds = pool.groups || [];
-      const allGroupIds = [...new Set([...taskGroupIds, ...workerGroupIds])];
+      const entries = this._groupsForTask(task, pool);
+      // Release the exact buckets that were acquired, not whatever keyFrom would
+      // return now - a payload the worker mutated must not send the release to a
+      // different key than the acquire
+      const keys = task._resourceKeys ?? {};
 
       // Release all resources first, then retry blocked tasks
-      for (const groupId of allGroupIds) {
-        const group = this.groups[groupId];
-        if (group) {
-          group.onFinish();
-        }
+      for (const { id, group } of entries) {
+        group.onFinish(group.keyed ? keys[id] : undefined);
       }
 
       task._resourcesPreAllocated = undefined;
+      task._resourceKeys = undefined;
 
       // Retry blocked tasks AFTER all resources are released
-      for (const groupId of allGroupIds) {
-        this._retryBlockedTasksForGroup(groupId);
+      for (const { id, group } of entries) {
+        this._retryBlockedTasksForGroup(id, group.keyed ? keys[id] : undefined);
       }
     }
 
-    _onTaskComplete(task: FyflowTask, result: any, pool: any) {
-      // Skip if already completed (prevent double-processing)
-      if (task.state === 'done') {
+    /**
+     * The one place a task settles.
+     *
+     * An outcome can reach the scheduler twice - as the pool's `task.failed`
+     * event and as the settling of the pool's task promise - and each of those
+     * is the ONLY path in some situation, so neither can be dropped:
+     *
+     * - an ordinary task throw reaches both
+     * - a worker that dies with `requeueFailedTasks: false` reaches only the event
+     * - a worker that cannot be constructed reaches only the promise
+     *
+     * They used to be two near-duplicate implementations, so a single failure
+     * emitted `task.failed` twice, counted `stats.failed` twice, raced the
+     * terminal state between `user_action` and `failed`, and - because only the
+     * promise path released resources - leaked a resource group slot whenever
+     * only the event path ran.
+     */
+    private _settleTask(
+      task: FyflowTask,
+      pool: any,
+      outcome: { ok: true; result: any } | { ok: false; error: any } | { requeue: true }
+    ): void {
+      // One settle per attempt. Cleared in _dispatchTask, so a retried or
+      // requeued task can settle again.
+      if (task._settling) return;
+      task._settling = true;
+
+      // Released here and nowhere else, so every path returns its slots exactly once
+      this._releaseResourcesForTask(task, pool);
+
+      // A worker died under this task and the pool wants it retried on another.
+      // Handled here rather than in its own listener so it competes with the
+      // other two outcomes for this attempt's single settle - otherwise the same
+      // failure could requeue the task AND count it failed, which is how
+      // stats.queued and stats.failed came to total more than the task count.
+      if ('requeue' in outcome) {
+        task.state = 'pending';
+        task.startTime = undefined;
+        task.executionTime = undefined; // Discard timing from the abandoned attempt
+        task._resourcesPreAllocated = undefined;
+        task._resourceKeys = undefined;
+        this.stats.running = Math.max(0, this.stats.running - 1);
+        this.stats.queued++;
+
+        const requeueTarget = this.readyQueuesByWorker.get(task.workerType);
+        if (requeueTarget) requeueTarget.push(task);
+
+        // _settling stays set until the next dispatch clears it, so a late
+        // outcome from the abandoned attempt cannot settle the new one
+        this._dispatchLoop();
         return;
       }
 
-      // Release resources
-      this._releaseResourcesForTask(task, pool);
+      if (outcome.ok) {
+        task.state = 'done';
+        task.endTime = Date.now();
+        task.result = outcome.result;
+        this.stats.running = Math.max(0, this.stats.running - 1);
+        this.stats.done++;
+        task.resolve?.(outcome.result);
 
-      // Update stats and task state
-      task.state = 'done';
-      task.endTime = Date.now();
-      task.result = result;
-      this.stats.running--;
-      this.stats.done++;
-      task.resolve?.(result);
+        this.dispatchEvent(new CustomEvent('task.completed', { detail: task }));
+        this._settleDescendantTrackers(task.id);
+        this._recordTerminalTask(task.id);
+        this._checkCompletion();
 
-      // Check descendant trackers
-      this._settleDescendantTrackers(task.id);
-      this._recordTerminalTask(task.id);
+        // Resources are free again
+        this._dispatchLoop();
+        return;
+      }
 
-      // Emit events
-      this.dispatchEvent(new CustomEvent('task.completed', { detail: task }));
-      // this._onParentComplete(task);
-      this._checkCompletion();
+      const error = outcome.error;
 
-      // CRITICAL: Dispatch more tasks now that resources are available
-      this._dispatchLoop();
-    }
-
-    _onTaskFailed(task: FyflowTask, error: any, pool: any) {
-      // Release resources
-      this._releaseResourcesForTask(task, pool);
-
-      // Handle retry or failure
+      // Retry, if the policy still allows it
       if (task.attempts < (task.retryPolicy?.maxRetries || 0)) {
         task.attempts++;
         task.state = 'pending';
         task.startTime = undefined;
         task.executionTime = undefined; // Discard timing from the abandoned attempt
-        this.stats.running--;
+        task._resourcesPreAllocated = undefined;
+        task._resourceKeys = undefined;
+        this.stats.running = Math.max(0, this.stats.running - 1);
         this.stats.queued++;
 
         const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-        if (workerQueue) {
-          workerQueue.push(task);
-        }
+        if (workerQueue) workerQueue.push(task);
 
         setTimeout(() => this._dispatchLoop(), task.retryPolicy?.backoffMs || 0);
-      } else {
-        task.state = 'failed';
-        task.error = error.message;
-        this.stats.running--;
-        this.stats.failed++;
-        this.dispatchEvent(new CustomEvent('task.failed', { detail: task }));
-
-        // Settle the caller's promise. Failures that arrive as a worker
-        // `task.failed` event are rejected by the pool listener, but failures
-        // that only surface here - a worker that cannot initialize, for
-        // instance - reached no other rejection path and hung forever.
-        if (task.optional) {
-          task.resolve?.(null);
-        } else {
-          task.reject?.(error instanceof Error ? error : new Error(task.error || 'Task failed'));
-        }
-
-        this._settleDescendantTrackers(task.id);
-        this._recordTerminalTask(task.id);
-        this._checkCompletion();
+        return;
       }
+
+      // Terminal. stats.failed counts tasks that failed, mirroring stats.done -
+      // not attempts, which is why a task with retries counts once.
+      task.error = error instanceof Error ? error.message : String(error ?? 'Task failed');
+      task.endTime = Date.now();
+      this.stats.running = Math.max(0, this.stats.running - 1);
+      this.stats.failed++;
+
+      if (task.optional) {
+        // Optional work does not block the caller
+        task.state = 'failed';
+        task.resolve?.(null);
+      } else {
+        // Out of retries and not optional: something outside the scheduler has
+        // to decide what happens next
+        task.state = 'user_action';
+        task.reject?.(error instanceof Error ? error : new Error(task.error));
+      }
+
+      this.dispatchEvent(new CustomEvent('task.failed', { detail: task }));
+      if (!task.optional) {
+        this.dispatchEvent(new CustomEvent('task.user_action', { detail: task }));
+      }
+
+      this._settleDescendantTrackers(task.id);
+      this._recordTerminalTask(task.id);
+      this._checkCompletion();
+
+      // Resources are free again
+      this._dispatchLoop();
+    }
+
+    _onTaskComplete(task: FyflowTask, result: any, pool: any) {
+      this._settleTask(task, pool, { ok: true, result });
+    }
+
+    _onTaskFailed(task: FyflowTask, error: any, pool: any) {
+      this._settleTask(task, pool, { ok: false, error });
     }
 
     _retryBlockedTasks() {
@@ -612,55 +754,85 @@ export class FyflowTask {
         this._dispatchLoop();
       }
 
-      // Then, retry blocked tasks for groups that now have capacity
+      // Then, retry blocked tasks for groups that now have capacity. Keyed
+      // groups hold one queue per key, so each is retried on its own bucket -
+      // otherwise a saturated key would gate every other key behind it.
       for (const [groupId, group] of Object.entries(this.groups)) {
-        if (group && group.canRun()) {
+        if (!group || !group.canRun()) continue;
+
+        if (group.keyed) {
+          for (const key of this._blockedKeysFor(groupId)) {
+            this._retryBlockedTasksForGroup(groupId, key);
+          }
+        } else {
           this._retryBlockedTasksForGroup(groupId);
         }
       }
 
     }
 
-    _retryBlockedTasksForGroup(groupId: string) {
-      // Immediately retry tasks blocked by this specific group
-      const blockedTasks = this.blockedQueues.get(groupId);
+    /** Keys that currently have tasks blocked on this group. */
+    private _blockedKeysFor(groupId: string): string[] {
+      const prefix = `${groupId} `;
+      const keys: string[] = [];
+      for (const [queueId, queue] of this.blockedQueues) {
+        if (queue.length > 0 && queueId.startsWith(prefix)) {
+          keys.push(queueId.slice(prefix.length));
+        }
+      }
+      return keys;
+    }
+
+    _retryBlockedTasksForGroup(groupId: string, key?: string) {
+      const queueId = this._blockedQueueId(groupId, key);
+      const blockedTasks = this.blockedQueues.get(queueId);
       if (!blockedTasks || blockedTasks.length === 0) return;
 
       const group = this.groups[groupId];
-      if (!group || !group.canRun()) return;
+      if (!group || !group.canRun(key)) return;
 
       // Move tasks from blocked queue back to ready queue
       const tasksToRetry: FyflowTask[] = [];
-      while (blockedTasks.length > 0 && group.canRun()) {
+      const stillBlocked: FyflowTask[] = [];
+
+      while (blockedTasks.length > 0 && group.canRun(key)) {
         const task = blockedTasks.shift()!;
 
-        // Check if all groups for this task can now run
         const pool = this.workerPools[task.workerType];
-        if (pool) {
-          const taskGroupIds = task.workerGroups || [];
-          const workerGroupIds = pool.groups || [];
-          const allGroupIds = [...new Set([...taskGroupIds, ...workerGroupIds])];
-          const allGroups = allGroupIds.map(gid => this.groups[gid]).filter(g => g);
+        if (!pool) continue;
 
-          if (allGroups.every(g => g.canRun())) {
-            // Remove from other blocked queues
-            for (const otherGroupId of allGroupIds) {
-              if (otherGroupId !== groupId) {
-                const otherQueue = this.blockedQueues.get(otherGroupId);
-                if (otherQueue) {
-                  const index = otherQueue.indexOf(task);
-                  if (index !== -1) otherQueue.splice(index, 1);
-                }
-              }
-            }
-            tasksToRetry.push(task);
+        const entries = this._groupsForTask(task, pool);
+        const keys = task._resourceKeys ?? {};
+        const runnable = entries.every(({ id, group: g }) =>
+          g.canRun(g.keyed ? keys[id] : undefined)
+        );
+
+        if (!runnable) {
+          // Another of this task's groups is still full. Keep it queued - it used
+          // to be dropped here, leaving it in no queue at all, which only stayed
+          // invisible because single-group tasks can never reach this branch.
+          stillBlocked.push(task);
+          continue;
+        }
+
+        // Remove from the queues of its other groups
+        for (const { id, group: g } of entries) {
+          const otherQueueId = this._blockedQueueId(id, g.keyed ? keys[id] : undefined);
+          if (otherQueueId === queueId) continue;
+          const otherQueue = this.blockedQueues.get(otherQueueId);
+          if (otherQueue) {
+            const index = otherQueue.indexOf(task);
+            if (index !== -1) otherQueue.splice(index, 1);
           }
         }
+        tasksToRetry.push(task);
       }
+
+      // Preserve arrival order for anything that could not run yet
+      if (stillBlocked.length > 0) blockedTasks.unshift(...stillBlocked);
 
       // Add tasks back to ready queue and dispatch
       if (tasksToRetry.length > 0) {
-        // Add to per-worker queues
         for (const task of tasksToRetry) {
           const workerQueue = this.readyQueuesByWorker.get(task.workerType);
           if (workerQueue) {
@@ -823,37 +995,9 @@ export class FyflowTask {
         
         //TODO: manually added this, verify it makes sense!!!
         const taskRequeueListener = (e: any) => {
-          const { taskId } = e.detail;
-          const task = this.tasks.get(taskId);
-
-          if (task && task.state === 'running') {
-            // Release resources before requeuing
-            const workerPool = this.workerPools[task.workerType];
-            const wasStarted = task.startTime !== undefined;
-            const wasPreAllocated = task._resourcesPreAllocated === true;
-
-            if (workerPool && (wasStarted || wasPreAllocated)) {
-              // Release resource group slots
-              this._releaseResourcesForTask(task, workerPool);
-            }
-
-            // Reset task state for requeuing
-            task.state = 'pending';
-            task.startTime = undefined; // Clear start time since task is being requeued
-            task.executionTime = undefined; // Discard timing from the abandoned attempt
-            task._resourcesPreAllocated = undefined; // Clear pre-allocation flag for retry
-            this.stats.running--;
-            this.stats.queued++;
-
-            // Add back to ready queue for rescheduling
-            const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-            if (workerQueue) {
-              workerQueue.push(task);
-            }
-
-            // Trigger immediate dispatch to reschedule
-            this._dispatchLoop();
-          }
+          const task = this.tasks.get(e.detail.taskId);
+          if (!task || task.state !== 'running') return;
+          this._settleTask(task, this.workerPools[task.workerType], { requeue: true });
         };
         this._addInternalListener(pool, 'task.requeue_required', taskRequeueListener);
 
@@ -878,40 +1022,12 @@ export class FyflowTask {
 
         const taskFailedListener = (e: any) => {
           const task = this.tasks.get(e.detail.taskId);
-          if (task) {
-            task.state = 'failed';
-            this.stats.running--;
-            this.stats.failed++;
-
-            if (task.attempts < (task.retryPolicy?.maxRetries || 0)) {
-              task.attempts++;
-              task.state = 'pending';
-              task.startTime = undefined; // Clear start time for retry attempt
-              task.executionTime = undefined; // Discard timing from the abandoned attempt
-              task._resourcesPreAllocated = undefined; // Clear pre-allocation flag for retry
-              this.stats.queued++;
-              const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-              if (workerQueue) {
-                workerQueue.push(task);
-              }
-              setTimeout(() => this._dispatchLoop(), task.retryPolicy?.backoffMs || 0);
-            } else if (!task.optional) {
-              task.state = 'user_action';
-              this.dispatchEvent(new CustomEvent('task.user_action', {detail: task}));
-              // Emit task.failed event for external listeners
-              this.dispatchEvent(new CustomEvent('task.failed', {detail: {...task, error: e.detail.error}}));
-              // Reject the task promise since it failed without retries
-              task.reject?.(e.detail.error || new Error('Task failed'));
-              this._settleDescendantTrackers(task.id);
-              this._recordTerminalTask(task.id);
-              this._checkCompletion();
-            } else {
-              task.resolve?.(null);
-              this._settleDescendantTrackers(task.id);
-              this._recordTerminalTask(task.id);
-              this._checkCompletion();
-            }
-          }
+          if (!task) return;
+          // Same settle routine the promise path uses. For a worker that dies
+          // with requeueFailedTasks off this is the only notification the
+          // scheduler gets, so it cannot be skipped - and _settleTask makes it
+          // harmless when the promise path also fires.
+          this._settleTask(task, pool, { ok: false, error: e.detail.error });
         };
         this._addInternalListener(pool, 'task.failed', taskFailedListener);
       });
@@ -1087,8 +1203,18 @@ export class FyflowTask {
       this._removeAllListeners();
 
       // 2. Wait for any currently running tasks to complete
-      while (this.stats.running > 0) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      // Bounded: a task dispatched to a pool whose workers can no longer be
+      // created never settles, and an unbounded wait turns that into a hang with
+      // no diagnostic. Workers are terminated below regardless.
+      const drainDeadline = Date.now() + 5000;
+      while (this.stats.running > 0 && Date.now() < drainDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (this.stats.running > 0) {
+        console.warn(
+          `⚠️ Shutdown proceeding with ${this.stats.running} task(s) still marked running - ` +
+          `they were dispatched to a pool that could not complete them`
+        );
       }
       // 3. Clear all queues
       this.readyQueuesByWorker.forEach(q => q.length = 0);

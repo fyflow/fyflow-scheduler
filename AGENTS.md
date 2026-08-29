@@ -4,9 +4,14 @@ Complete usage reference for `fyflow-scheduler`. Everything here is exercised by
 `tests/suites/docs.ts`, which runs on every `npm test` — if a snippet stops
 working, the build fails.
 
-**Package**: `fyflow-scheduler` (npm) / `@fyflow/scheduler` (JSR)
-**Runtimes**: Deno, Node.js **≥ 22**, browser
+**Package**: `fyflow-scheduler` (npm) for Node **≥ 22** and browsers /
+`jsr:@fyflow/scheduler` for Deno
 **Dependencies**: none
+
+The two are not interchangeable. The JSR package is **Deno-only** and contains no
+Node-specific files; importing it outside Deno throws an error pointing at npm.
+Node and browser support lives entirely in the npm package, which ships prebuilt
+bundles with the worker bootstrap inlined.
 
 ---
 
@@ -63,32 +68,55 @@ workers and a retry timer running.
 
 ---
 
-## 3. Worker URLs — the most common mistake
+## 3. Worker URLs
 
-Worker scripts are loaded by URL, and **resolution differs per runtime**. Getting
-this wrong is the single most likely failure when writing code against this
-library.
+A worker is loaded by URL, and what you pass depends on your runtime.
+
+### npm (Node and browser) - ship a `.js` worker
 
 ```typescript
-let workerUrl: string;
-if (typeof Deno !== "undefined") {
-  // Deno loads the TypeScript source directly
-  workerUrl = new URL("./workers/myWorker.ts", import.meta.url).href;
-} else {
-  // Node and browser go through the esbuild worker plugin, which rewrites
-  // `?worker-direct` at build time into a bundled worker file
-  // @ts-expect-error - resolved by the build, not by TypeScript
-  workerUrl = new URL((await import("./workers/myWorker.ts?worker-direct")).default).href;
-}
+const workerUrl = new URL('./myWorker.js', import.meta.url).href;
+
+const pool = new WorkerManager(workerUrl, { maxThreads: 4 });
 ```
 
-- The `?worker-direct` suffix is an **esbuild convention from this repo's
-  `esbuild.config.js`**, not a standard. It only works in a build that includes
-  that plugin.
-- On Node/browser the code must be built (`npm run build` / `npm run build:dev`)
-  before it runs. Deno needs no build step.
-- The worker file must `export default` a class. Anything else fails with
-  `Worker script <url> must export a default class`.
+That is all. No bundler plugin, no build step for the worker, no query suffix.
+Verified against the published package with both `inline: true` and
+`inline: false`.
+
+- The file must be **JavaScript**. Node cannot import TypeScript, so a `.ts`
+  worker fails with `Unknown file extension ".ts"`. Compile your worker as part
+  of your own build.
+- In the browser the URL must be reachable by the page, and your bundler needs to
+  emit the worker as a separate asset. Most bundlers do this for
+  `new URL('./myWorker.js', import.meta.url)` automatically.
+
+### Deno (JSR) - point at the TypeScript source
+
+```typescript
+const workerUrl = new URL('./myWorker.ts', import.meta.url).href;
+```
+
+Deno loads the source directly. No build step.
+
+### Cross-runtime code
+
+Only needed if one codebase must run on both:
+
+```typescript
+const workerUrl = typeof Deno !== 'undefined'
+  ? new URL('./myWorker.ts', import.meta.url).href
+  : new URL('./myWorker.js', import.meta.url).href;
+```
+
+> **`?worker-direct` is not part of this API.** You will see it in this
+> repository's own examples and tests. It is a convention of *this repo's*
+> `esbuild.config.js`, which inlines a `.ts` worker into the bundle so the
+> examples can be written once and run on both runtimes. It does not exist in the
+> published packages, and using it in your own code will fail to resolve.
+
+The worker file must `export default` a class. Anything else fails with
+`Worker script <url> must export a default class`.
 
 ---
 
@@ -123,6 +151,20 @@ export default class MyWorker extends BaseWorker {
 
 - `config` comes from the pool's `config` option and is shared by every worker
   instance in that pool.
+- A worker can ask the pool to tear it down - e.g. after a connection goes bad -
+  with `this.workerContext?.terminateWithError(err, { canRestart: true })`. The
+  task running at the time rejects with a `WorkerTerminationError`, so catch that
+  to tell worker shutdown apart from an ordinary task failure:
+
+  ```typescript
+  import { WorkerTerminationError } from 'fyflow-scheduler';
+
+  try {
+    await scheduler.addTask(task, { createPromise: true });
+  } catch (error) {
+    if (error instanceof WorkerTerminationError) { /* the worker went away */ }
+  }
+  ```
 - One instance is created per worker, lazily, and reused across tasks. Instance
   state persists between tasks — do not assume a fresh object per task.
 - Throwing from `run()` fails that task. Throwing from `setup()` fails the
@@ -131,6 +173,29 @@ export default class MyWorker extends BaseWorker {
 ---
 
 ## 5. API reference
+
+### Everything importable
+
+```typescript
+import {
+  FyflowScheduler, FyflowTask, WorkerManager,   // core
+  ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup,
+  BaseWorker, WorkerTerminationError            // worker authoring
+} from 'fyflow-scheduler';
+
+import type {
+  FyflowSchedulerOptions, AddTaskOptions,
+  WorkerManagerOptions, WorkerConfig, WorkerInterface, WorkerStatus,
+  WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerContext,
+  SpawnTaskConfig, ProgressData,
+  ResourceGroup, ResourceGroupMetrics, ResourceGroupStats,
+  RateWindow, KeyedRateLimitGroupOptions, KeyedTaskLike
+} from 'fyflow-scheduler';
+```
+
+`ThreadWrapper` and `InlineWrapper` are also exported, but they are the internal
+worker wrappers the pool manages for you - you should not construct them.
+
 
 ### `new FyflowScheduler(workerPools, resourceGroups?, options?)`
 
@@ -145,7 +210,7 @@ export default class MyWorker extends BaseWorker {
 |---|---|---|
 | `addTask` | `(task, opts?) => Promise<any> \| void` | Returns a promise only with `{ createPromise: true }`. **Throws** on unknown `workerType` |
 | `addTasks` | `(tasks, opts?) => Promise<any>[] \| void` | Batched dispatch for bulk adds. **Throws** on unknown `workerType`, validating the whole batch before queueing any of it |
-| `stats` | `{ queued, running, done, failed }` | Counts every task, including evicted ones |
+| `stats` | `{ queued, running, done, failed }` | Counts **tasks**, not attempts - a task that fails after two retries counts once. Includes evicted tasks |
 | `tasks` | `Map<string, FyflowTask>` | Live and completed tasks (see `maxCompletedTasks`) |
 | `getResourceMetrics()` | `Record<string, { limit, running, available, utilization }>` | `utilization` is 0–1 |
 | `getResourceStats()` | `Record<string, { totalAcquired, totalReleased }>` | Lifetime counters |
@@ -161,13 +226,17 @@ export default class MyWorker extends BaseWorker {
 | `optional` | `boolean` | `false` | If it fails, resolves `null` instead of rejecting |
 | `retryPolicy` | `{ maxRetries, backoffMs }` | none | |
 | `workerGroups` | `string[]` | `[]` | **Added to** the pool's groups, not a replacement |
+| `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` with no custom `keyFrom` |
 | `handleRejection` | `boolean` | `true` | Silences unhandled rejections for fire-and-forget |
 
 Readable after the run: `state`, `result`, `error`, `attempts`, `startTime`,
 `endTime`, `executionTime` (worker-measured ms, excludes queue wait).
 
 States: `pending` → `running` → `done` | `failed`. A **non-optional** task that
-fails with no retries left ends in **`user_action`**, not `failed`.
+fails with no retries left ends in **`user_action`**, not `failed`; an
+**optional** one ends in `failed` and resolves `null`. Each attempt settles
+exactly once, so `task.failed` fires once per failed task and the terminal state
+does not change afterwards.
 
 Methods: `onCompletePromise()` — this task only; `onCompleteDescendants()` —
 this task plus everything it spawns (§7).
@@ -176,9 +245,9 @@ this task plus everything it spawns (§7).
 
 | Option | Default | Notes |
 |---|---|---|
-| `maxThreads` | `2` | Worker instances in the pool |
-| `maxConcurrentTasks` | `1` | Tasks per worker. Pool capacity = `maxThreads × maxConcurrentTasks` |
-| `inline` | `false` | `true` runs in the main thread — right for async/IO, wrong for CPU-bound |
+| `maxThreads` | `2` | Worker **instances**, not OS threads — see below |
+| `maxConcurrentTasks` | `1` | Tasks per instance. Pool capacity = `maxThreads × maxConcurrentTasks` |
+| `inline` | `false` | `true` runs in the main process — right for async/IO, wrong for CPU-bound |
 | `config` | `{}` | First constructor argument for every worker instance |
 | `groups` | `[]` | Group ids every task in this pool must acquire |
 | `idleTimeout` | `5000` | Ms before an idle worker is terminated. `0` = never |
@@ -193,11 +262,38 @@ Management: `getWorkerIds()`, `getWorkerStatus(id)`, `getAllWorkerStatuses()`,
 resourcesHeld, lastError? }`, where `state` is
 `initializing | healthy | busy | failed | terminated`.
 
+#### What `maxThreads` means for an inline pool
+
+`maxThreads` counts worker *instances*, not threads. With `inline: false` each
+instance is a real worker thread. With `inline: true` they are all objects in the
+main process — **no threads are created at all** — and concurrency comes from
+overlapping `await`s on the event loop.
+
+So for inline pools only the **product** matters for throughput. Measured with
+120 tasks each awaiting 40ms:
+
+| Config | Instances | Peak in-flight | Duration |
+|---|---:|---:|---:|
+| `maxThreads: 1, maxConcurrentTasks: 5` | 1 | 5 | 1115 ms |
+| `maxThreads: 4, maxConcurrentTasks: 5` | 4 | 20 | 295 ms |
+| `maxThreads: 1, maxConcurrentTasks: 20` | 1 | 20 | 292 ms |
+| `maxThreads: 4, maxConcurrentTasks: 20` | 4 | 80 | 128 ms |
+
+`4 × 5` and `1 × 20` are interchangeable for speed. What the split *does* change
+is **state isolation**: each instance is constructed separately, so
+`maxThreads: 4` gives four connection pools / caches / whatever per-instance
+state your worker holds, while `maxThreads: 1` funnels every concurrent task
+through a single object.
+
+Neither knob buys parallelism for CPU-bound work inline — it is one event loop.
+Use `inline: false` for that.
+
 ### Resource groups
 
 ```typescript
 new ConcurrentLimitGroup(limit: number, id?: string)
 new RateLimitGroup(windows: { limit: number, windowMs: number }[], id?: string)
+new KeyedRateLimitGroup(windows, { id?, keyFrom?, idleKeyTtlMs? })
 ```
 
 Both expose `canRun()`, `getMetrics()`, `getStats()`. Tasks over a limit wait in
@@ -205,6 +301,35 @@ a blocked queue and are retried — never dropped. Multiple rate-limit windows a
 enforced together.
 
 ---
+
+#### Per-key rate limits
+
+`KeyedRateLimitGroup` applies its windows **independently per key**, for when
+each endpoint, tenant or account has its own quota:
+
+```typescript
+const api = new KeyedRateLimitGroup(
+  [{ limit: 10, windowMs: 1000 }],           // 10/sec PER KEY, not in total
+  { id: 'api', keyFrom: t => t.payload.endpoint }
+);
+
+const pool = new WorkerManager(url, { groups: ['api'], inline: true });
+const scheduler = new FyflowScheduler({ ApiWorker: pool }, { api });
+```
+
+- `keyFrom` defaults to `t => t.limitKey`, so tasks can carry the key directly:
+  `new FyflowTask({ id, workerType, payload, limitKey: 'tenant-a' })`
+- **A task with no derivable key throws at `addTask`**, rather than silently
+  sharing a bucket or skipping the limit
+- Blocked tasks are queued per key, so a saturated key never delays another one
+- Idle keys are evicted once they hold no running tasks and have been quiet
+  longer than `idleKeyTtlMs` (default: twice the largest window), so
+  high-cardinality keys do not grow without bound
+- `getMetrics()` is the aggregate across keys plus `activeKeys`;
+  `getKeyMetrics(key)` gives one bucket, `getActiveKeys()` lists them
+
+The limit is per key, not global: with 3 keys and a limit of 2, up to 6 tasks run
+at once.
 
 ## 6. Events
 
@@ -218,7 +343,7 @@ Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
 | `task.completed` | the `FyflowTask` (with `result`, `executionTime`) |
 | `task.failed` | the task, plus `error` |
 | `task.progress` | `{ taskId, workerId, progress (0–1), message, details }` |
-| `task.user_action` | the task — failed, out of retries, not optional |
+| `task.user_action` | the task — failed, out of retries, not optional. Fires once, only after the retry budget is spent |
 | `task.spawn_request` | `{ parentTask, spawnConfig, workerId, workerType }` |
 | `task.spawn_failed` | `{ parentTask, spawnConfig, error }` |
 | `scheduler.completed` | the `stats` object |
@@ -277,13 +402,60 @@ await task.onCompleteDescendants();   // rejects if called before addTask
 - A **descendant** failing does **not** reject — watch `task.failed` for those.
 - The **tracked task** failing **does** reject, matching `onCompletePromise()`.
 - Safe to call more than once, and after the workflow already finished.
-- Rejects if the scheduler shuts down first.
+- `shutdown()` drains outstanding work first, so a workflow that can still finish
+  does, and the wait resolves. It rejects only for work that can no longer run
 
 This is lineage, not a dependency: spawning never changes dispatch order.
 
 ---
 
-## 8. Common mistakes
+## 8. When workers fail
+
+The scheduler never discards queued work to make a broken pool look healthy. What
+happens to a task depends on *how* its worker failed, and the two outcomes are
+quite different:
+
+| Failure | Tasks | Promises |
+|---|---|---|
+| A worker **dies or cannot be constructed**, with `requeueFailedTasks` `true` (the default) | requeued, and wait | stay **pending** until a worker can run them |
+| The same, with `requeueFailedTasks` `false` | fail | reject |
+
+The first row is deliberate. A pool that cannot keep - or build - a worker is an
+operational problem that needs the worker fixed, not a reason to destroy work
+that will run correctly once it is. So those tasks queue, and
+`await scheduler.addTask(task, { createPromise: true })` simply does not settle
+until the pool recovers.
+
+The pool retries up to `maxWorkerRestarts` times, then gives up and emits
+`worker.restart_limit_exceeded`. Construction failures and runtime deaths follow
+the same path, and inline and threaded pools behave identically.
+
+**That means you must watch the pool, not just the task.** All of these are
+emitted on the `WorkerManager`:
+
+| Event | Meaning |
+|---|---|
+| `worker.initialization.failed` | a worker could not be constructed - its tasks are failing |
+| `worker.failed` | a live worker died |
+| `task.requeue_required` | a task went back to the queue because its worker died |
+| `worker.restart_limit_exceeded` | the pool has stopped rebuilding workers - **intervention needed** |
+
+```typescript
+pool.addEventListener('worker.restart_limit_exceeded', (e) => {
+  // The pool has given up. Anything queued for it will wait until you fix it.
+  alert(`pool exhausted ${e.detail.maxRestarts} restarts, queued: ${scheduler.stats.queued}`);
+});
+pool.addEventListener('worker.initialization.failed', (e) => {
+  // Workers cannot even be built - usually a bad worker URL (§3)
+  console.error(e.detail.error);
+});
+```
+
+> `worker.restart_limit_exceeded` is the one event that means *stop and fix
+> something* - it fires for a pool that cannot build a worker as well as one whose
+> workers keep dying. Everything above it is recoverable noise.
+
+## 9. Common mistakes
 
 | Symptom | Cause |
 |---|---|
@@ -291,7 +463,7 @@ This is lineage, not a dependency: spawning never changes dispatch order.
 | Process never exits | `shutdown()` not called |
 | `Unknown worker type: X` | `workerType` is not a key of `workerPools` |
 | `Worker script <url> must export a default class` | Worker has no `export default class`, or the URL is wrong for the runtime (§3) |
-| Worker fails to load only on Node | Missing `?worker-direct`, or the build was not run |
+| `Unknown file extension ".ts"` on Node | Node cannot import TypeScript - ship a compiled `.js` worker (§3) |
 | `Task must be added to a scheduler before tracking descendants` | `onCompleteDescendants()` called before `addTask` |
 | `terminateWithError` does nothing | Worker constructor did not forward `workerContext` to `super` |
 | Progress bar shows 0–1 instead of 0–100 | `progress` is a fraction; multiply by 100 yourself |
@@ -299,10 +471,12 @@ This is lineage, not a dependency: spawning never changes dispatch order.
 | Task ends in `user_action`, not `failed` | Non-optional task, retries exhausted |
 | Memory grows in a long-running process | Completed tasks are retained; set `maxCompletedTasks` |
 | Limit briefly exceeded | Groups are optimistic by design (§1) |
+| A resource group has no effect at all | The pool never declared it. Registering a group on the scheduler is not enough - add it to the pool's `groups` or the task's `workerGroups` |
+| `Missing limit key for group "x"` | The task belongs to a `KeyedRateLimitGroup` but has no `limitKey`, and the group's `keyFrom` returned nothing |
 
 ---
 
-## 9. Recipes
+## 10. Recipes
 
 **Bulk work, waiting for all of it**
 
@@ -333,6 +507,17 @@ new FyflowTask({
   retryPolicy: { maxRetries: 3, backoffMs: 250 },
   optional: true          // resolves null instead of rejecting
 });
+```
+
+**A separate quota per endpoint or tenant**
+
+```typescript
+const api = new KeyedRateLimitGroup(
+  [{ limit: 10, windowMs: 1000 }],
+  { id: 'api', keyFrom: t => t.payload.endpoint }
+);
+// Each endpoint gets its own 10/sec bucket, and a saturated one does not
+// delay tasks belonging to the others
 ```
 
 **Monitoring**
@@ -378,13 +563,15 @@ const scheduler = new FyflowScheduler(pools, groups, {
 
 ---
 
-## 10. Choosing worker settings
+## 11. Choosing worker settings
 
 | Workload | Settings |
 |---|---|
-| Async / IO (HTTP, DB) | `inline: true`, `maxConcurrentTasks: 8–50`, `maxThreads: 1–2` |
+| Async / IO (HTTP, DB) | `inline: true`, and pick the product: `maxThreads × maxConcurrentTasks` = how many requests may be in flight |
 | CPU-bound | `inline: false`, `maxConcurrentTasks: 1`, `maxThreads ≈ core count` |
 | Mixed | Separate pools per workload; do not mix in one pool |
 
 Inline workers share the main thread — a CPU-bound inline worker blocks the
-scheduler itself.
+scheduler itself. For inline pools, split the product toward `maxThreads` when
+you want more isolated worker instances (separate connections, caches), and
+toward `maxConcurrentTasks` when one shared instance is fine.

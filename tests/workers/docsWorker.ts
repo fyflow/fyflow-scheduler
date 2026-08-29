@@ -20,6 +20,11 @@ export default class DocsWorker extends BaseWorker {
   async teardown(): Promise<void> {}
 
   async run(payload: any, context?: TaskWorkerContext): Promise<any> {
+    // Lets a test observe overlapping awaits
+    if (payload.awaitMs) {
+      await new Promise(resolve => setTimeout(resolve, payload.awaitMs));
+    }
+
     if (payload.fail) {
       throw new Error('DocsWorker was asked to fail');
     }

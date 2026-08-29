@@ -106,6 +106,7 @@ class ErrorHandlingTestSuite {
     this.results.push(await this.runTest('Worker Runtime Crash during Task Execution', () => this.testWorkerRuntimeCrash()));
     this.results.push(await this.runTest('Worker Setup Method Failure', () => this.testWorkerSetupFailure()));
     this.results.push(await this.runTest('Worker Initialization Failure', () => this.testWorkerInitializationFailure()));
+    this.results.push(await this.runTest('Stats Never Go Negative On Failure', () => this.testStatsNeverGoNegative()));
 
     // Core Event Emission Tests
     this.results.push(await this.runTest('Worker Failed Event Emission', () => this.testWorkerFailedEventEmission()));
@@ -306,6 +307,55 @@ class ErrorHandlingTestSuite {
     if (!result || !result.result) throw new Error('Worker should be able to process tasks after a task crash');
   }
 
+  // A failure can arrive twice - as the worker's task.failed event and as the
+  // rejection of the pool's task promise - and a pool that cannot create a worker
+  // emits task.failed for tasks that never started. Both used to decrement
+  // stats.running unguarded, driving it negative, which also means the scheduler
+  // never sees itself idle and the run hangs instead of finishing.
+  private async testStatsNeverGoNegative(): Promise<void> {
+    // Inline, so a pool that can never produce a worker leaves no thread behind
+    const workerManager = new WorkerManager(this.crashWorkerUrl, {
+      maxThreads: 2,
+      maxConcurrentTasks: 1,
+      inline: true,
+      maxWorkerRestarts: 0,
+      config: { crashOnInit: true }
+    });
+    const scheduler = this.createScheduler({ CrashingWorker: workerManager });
+
+    let lowestRunning = 0;
+    const sample = () => { lowestRunning = Math.min(lowestRunning, scheduler.stats.running); };
+    scheduler.addEventListener('task.failed', sample);
+    scheduler.addEventListener('task.completed', sample);
+
+    for (let i = 0; i < 6; i++) {
+      scheduler.addTask(new FyflowTask({
+        id: `negative-stats-${i}`,
+        workerType: 'CrashingWorker',
+        payload: { action: 'normal-task' }
+      }));
+    }
+
+    const deadline = performance.now() + 800;
+    while (performance.now() < deadline) {
+      sample();
+      if (scheduler.stats.running < 0) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    sample();
+
+    // Shut down inside the test: a pool that can never create a worker keeps
+    // retrying, and leaving it to suite cleanup holds the process open
+    await scheduler.shutdown();
+
+    if (lowestRunning < 0) {
+      throw new Error(`stats.running went negative (${lowestRunning}) - failures are being counted twice`);
+    }
+    if (scheduler.stats.failed < 0 || scheduler.stats.queued < 0 || scheduler.stats.done < 0) {
+      throw new Error(`Negative counter in stats: ${JSON.stringify(scheduler.stats)}`);
+    }
+  }
+
   // Test worker initialization failure
   private async testWorkerInitializationFailure(): Promise<void> {
     const workerManager = new WorkerManager(this.crashWorkerUrl, {
@@ -314,7 +364,11 @@ class ErrorHandlingTestSuite {
       inline: false,
       // crashOnInit is read from worker config, not the task payload - the
       // constructor throws before any task runs
-      config: { crashOnInit: true }
+      config: { crashOnInit: true },
+      // With requeue on (the default) an unbuildable pool holds its tasks for a
+      // repaired worker rather than failing them, so this test would wait for
+      // ever. It is asserting the event, not the wait.
+      requeueFailedTasks: false
     });
 
     const scheduler = this.createScheduler({ CrashingWorker: workerManager });
@@ -432,9 +486,15 @@ class ErrorHandlingTestSuite {
 
     try {
       scheduler.addTask(task);
-      // await task.onCompleteDescendants()
-      // console.log('✅ task.onCompleteDescendants completed', task);
-      await new Promise(resolve => setTimeout(resolve, 200));
+
+      // Wait for the event rather than sleeping a fixed 200ms. The worker
+      // self-terminates after 50ms, but two worker threads have to start first
+      // and Node thread startup alone measures 50-70ms each - so under the load
+      // of a full suite run the fixed budget expired before the event arrived.
+      const deadline = performance.now() + 5000;
+      while (!taskRequeuedEmitted && performance.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
     } catch (error: any) {
       // May or may not throw depending on timing
     }

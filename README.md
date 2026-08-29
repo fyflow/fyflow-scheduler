@@ -17,45 +17,58 @@ FyFlow is a self-contained parallel task scheduler with resource management. Ful
 
 ## Installation
 
+**Node.js and browser** - npm, which ships prebuilt bundles with the worker
+bootstrap inlined, so no bundler configuration is needed:
+
 ```bash
 npm install fyflow-scheduler
 # or
 yarn add fyflow-scheduler
 ```
 
-For Deno:
+**Deno** - JSR, which ships the TypeScript sources and loads the worker directly:
+
 ```bash
-deno add @fyflow/scheduler
+deno add jsr:@fyflow/scheduler
 ```
+
+The two packages are not interchangeable. **The JSR package is Deno-only**: it
+contains no Node-specific files, and importing it from Node or a browser throws
+an error pointing you at npm. Node and browser support lives entirely in the npm
+package.
 
 ## Quick Start
 
 ```typescript
 import { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup } from 'fyflow-scheduler';
 
-// Create worker pool
-const workerPool = new WorkerManager('./worker.js', { maxThreads: 2 });
+// A pool must DECLARE the groups it uses - registering a group on the scheduler
+// alone does not constrain anything
+const workerPool = new WorkerManager('./worker.js', { maxThreads: 2, groups: ['cpu'] });
 
-// Create scheduler with CPU constraints
 const scheduler = new FyflowScheduler(
   { MyWorker: workerPool },
   { cpu: new ConcurrentLimitGroup(4) }
 );
 
-// Create parallel tasks
 const tasks = [
   new FyflowTask({ id: 'task1', workerType: 'MyWorker', payload: { data: 'input' } }),
   new FyflowTask({ id: 'task2', workerType: 'MyWorker', payload: { data: 'processed' } })
 ];
 
-// Execute
-tasks.forEach(task => scheduler.addTask(task));
+// createPromise is required to get results back - addTask is fire-and-forget
+const results = await Promise.all(scheduler.addTasks(tasks, { createPromise: true }));
+
+await scheduler.shutdown();   // required, or live workers keep the process alive
 ```
+
+See [Loading Workers](#loading-workers-differs-per-runtime) for how `./worker.js`
+is resolved - it differs between Deno, Node and the browser.
 
 ## Key Features
 
 - **Parallel Task Execution**: High-performance concurrent task processing
-- **Resource Management**: CPU/GPU constraints with concurrent execution limits
+- **Resource Management**: Named concurrency and rate-limit groups applied per pool or per task
 - **Dynamic Task Spawning**: Workers can create new tasks at runtime
 - **Cross-Platform**: Node.js, Browser, and Deno support
 - **Worker Pools**: Thread-based and inline execution modes
@@ -97,21 +110,33 @@ export default class MyWorker extends BaseWorker {
 }
 ```
 
-### Loading Workers (differs per runtime)
+### Loading Workers
 
-Worker URLs do not resolve the same way everywhere. Deno loads the TypeScript
-source directly; Node and the browser go through this project's esbuild worker
-plugin, which rewrites a `?worker-direct` import at build time.
+Point the pool at your worker file's URL.
+
+**npm (Node and browser)** - ship a compiled `.js` worker:
+
+```javascript
+const workerUrl = new URL('./myWorker.js', import.meta.url).href;
+const pool = new WorkerManager(workerUrl, { maxThreads: 4 });
+```
+
+No bundler plugin and no build step for the worker itself. Node cannot import
+TypeScript, so a `.ts` worker fails with `Unknown file extension`; compile it as
+part of your own build. In the browser, your bundler needs to emit the worker as
+a separate asset, which most do automatically for
+`new URL('./myWorker.js', import.meta.url)`.
+
+**Deno (JSR)** - point at the TypeScript source, which Deno loads directly:
 
 ```typescript
-let workerUrl;
-if (typeof Deno !== "undefined") {
-  workerUrl = new URL("./workers/myWorker.ts", import.meta.url).href;
-} else {
-  // Requires a build (`npm run build`) - resolved by esbuild, not TypeScript
-  workerUrl = new URL((await import("./workers/myWorker.ts?worker-direct")).default).href;
-}
+const workerUrl = new URL('./myWorker.ts', import.meta.url).href;
 ```
+
+> The `?worker-direct` suffix in this repository's examples and tests is a
+> convention of its own esbuild config, used so the `.ts` examples run on both
+> runtimes. It is not part of the published API and will not resolve in your
+> code.
 
 ### Getting Results Back
 
@@ -201,13 +226,18 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `payload`: Data passed to worker
 - `workerGroups`: Optional resource group names
 - `optional`: Mark task as optional (failures don't block workflow)
+- `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup`)
 - `retryPolicy`: `{ maxRetries, backoffMs }`
 - `onCompletePromise()`: Promise for this task alone
 - `onCompleteDescendants()`: Promise for this task plus everything it spawns
 
 **WorkerManager(scriptUrl, options)**
-- `maxThreads`: Maximum worker threads
-- `maxConcurrentTasks`: Tasks per worker
+- `maxThreads`: Maximum worker **instances** (not OS threads). With
+  `inline: false` each is a real worker thread; with `inline: true` they are
+  objects in the main process, so only `maxThreads × maxConcurrentTasks` matters
+  for throughput — the split controls how much per-instance state (connections,
+  caches) is duplicated
+- `maxConcurrentTasks`: Tasks per instance
 - `groups`: Resource group names
 - `inline`: Use inline execution (default: false)
 - `idleTimeout`: Ms before an idle worker is terminated (0 = never, default 5000)
@@ -219,6 +249,17 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 **RateLimitGroup(windows, id?)**
 - Time-window throttling, e.g. `[{ limit: 10, windowMs: 1000 }]`. Multiple
   overlapping windows are enforced together
+
+**KeyedRateLimitGroup(windows, options?)**
+- The same windows applied **independently per key**, for when each endpoint,
+  tenant or account has its own quota
+- `options.keyFrom` derives the key from a task, defaulting to `task.limitKey`
+- A task with no derivable key throws at `addTask` rather than silently sharing
+  a bucket
+- Blocked tasks queue per key, so a saturated key never delays another
+- Idle keys are evicted after `options.idleKeyTtlMs` (default: twice the largest
+  window), so high-cardinality keys do not grow without bound
+- `getKeyMetrics(key)` and `getActiveKeys()` give the per-bucket view
 
 **Worker management** (on a `WorkerManager`)
 - `getWorkerIds()`: ids of the workers that currently exist (created lazily)
@@ -236,6 +277,21 @@ detecting a bad connection. In-flight tasks are requeued when the pool's
 ```typescript
 this.workerContext?.terminateWithError(new Error('connection lost'), { canRestart: true });
 ```
+
+### When Workers Fail
+
+The scheduler never discards queued work to make a broken pool look healthy:
+
+- A worker that **dies or cannot be constructed**, with `requeueFailedTasks: true`
+  (the default), has its tasks requeued. The pool retries up to
+  `maxWorkerRestarts` times, then gives up. If it never manages to run a worker
+  those tasks wait, and their promises stay pending - a pool that cannot keep or
+  build a worker needs fixing, not its work thrown away.
+- With `requeueFailedTasks: false` the tasks fail and their promises reject.
+
+So watch the pool, not only the task. `worker.restart_limit_exceeded` means the
+pool has given up rebuilding workers and needs intervention - it covers both a
+worker that cannot be built and one that keeps dying.
 
 ### Events
 
@@ -267,22 +323,45 @@ Workers extend `BaseWorker` and implement:
 
 ## Performance
 
-Measured with `npm run benchmark:quick` on Node.js:
-- **Inline Workers**: peaks above 70,000 tasks/sec at 10K tasks, dropping to
-  ~6,000 tasks/sec at 100K as coordination grows relative to per-task work
-- **Thread Workers**: ~80-90% efficiency for CPU workloads
-- **Memory Usage**: ~1MB per 1,000 tasks at 10K scale, growing at larger volumes
+Measured with `npm run benchmark:quick`:
 
-Numbers vary substantially between runs and machines - re-run the suite rather
-than relying on these figures.
+- **Throughput (inline)**: tens of thousands of tasks/sec at 10K tasks, falling
+  at larger volumes as coordination grows relative to per-task work
+- **Efficiency (threaded, CPU work)**: 96-98%. This is achieved average
+  concurrency over configured concurrency - "how much of the parallelism I asked
+  for did I get" - so steady-state coordination overhead is a few percent
+- **Memory**: roughly 1MB per 1,000 in-flight tasks at 10K scale. Completed tasks
+  are retained by default; see `maxCompletedTasks`
+
+**Worker startup** is measured separately (`npm run benchmark:startup`), because
+every other scenario pre-warms its pool. It is the largest difference between the
+two worker types, and between runtimes:
+
+| | Deno | Node 22 |
+|---|---:|---:|
+| 1 worker thread | ~12 ms | ~54 ms |
+| 8 inline instances (each) | ~85 µs | ~324 µs |
+
+Threads cost roughly three orders of magnitude more to start than inline
+instances, so a short-lived threaded pool can spend most of its life starting up.
+
+Numbers vary substantially between runs and machines, and a scenario's result
+depends on what ran before it in the suite. Re-run the suite rather than relying
+on these figures, and compare full-suite runs only against other full-suite runs.
 
 ## Platform Support
 
-| Platform | Worker Threads | Inline Workers | Build Required |
-|----------|---------------|----------------|----------------|
-| Node.js  | ✅            | ✅             | Yes (esbuild)  |
-| Browser  | ✅            | ✅             | Yes (esbuild)  |
-| Deno     | ✅            | ✅             | No             |
+| Platform | Package | Worker Threads | Inline Workers | Build Required |
+|----------|---------|---------------|----------------|----------------|
+| Node.js  | npm `fyflow-scheduler` | ✅ | ✅ | Prebuilt in the package |
+| Browser  | npm `fyflow-scheduler` | ✅ | ✅ | Prebuilt in the package |
+| Deno     | JSR `@fyflow/scheduler` | ✅ | ✅ | None - sources are loaded directly |
+
+Only four files differ between runtimes, and the split is resolved at build time
+rather than at runtime: the worker bootstrap (`workerWrapper.ts` vs
+`workerWrapper.node.ts`), the URL that locates it, and two feature checks in
+`ThreadWrapper` for Node's `worker_threads` event emitter. Everything else -
+the scheduler, worker manager and all resource groups - is platform-agnostic.
 
 Node.js 22 or newer is required: the library and its tests rely on `CustomEvent`
 being a global, which landed in Node 19.
@@ -293,15 +372,21 @@ being a global, which landed in Node 19.
 # Build library
 npm run build
 
-# Run tests (core + error handling + spawning)
-npm test                    # Node.js tests
-npm run test:browser        # Browser tests
+# Run tests - core, error handling, spawning and the documentation examples
+npm test                    # Node.js tests (requires Node >= 22)
+npm run test:browser        # Browser tests (Playwright)
 npm run test:deno           # Deno tests
+npm run test:docs           # Just the executable documentation examples
 npm run test:performance    # Contention scaling (not part of the default run)
 
+# Type check library, tests, examples and benchmarks
+deno task check
+
 # Benchmarks
-npm run benchmark          # Full benchmark suite
-npm run benchmark:quick    # Quick performance test
+npm run benchmark           # Full benchmark suite
+npm run benchmark:quick     # Quick performance test
+npm run benchmark:startup   # Worker startup cost, for comparing runtimes
+npm run benchmark:baseline  # The set behind benchmark-baseline-comprehensive.md
 ```
 
 ## Examples
@@ -312,6 +397,12 @@ See the `examples/` directory for comprehensive usage examples:
 - `worker-types.ts`: Thread vs inline worker comparison
 - `performance-groups.ts`: Resource management, rate limits and constraints
 - `monitor-resource-health.ts`: Drop-in resource health monitor helper
+- `deno-only/minimal.ts`: The plain Deno form - a worker URL with no build step
+  and none of this repo's bundler convention
+
+The examples above the `deno-only/` folder run on both Deno and Node, which is
+why they carry the `?worker-direct` branch. Run them all with
+`npm run build:dev && deno task examples`.
 
 ## License
 

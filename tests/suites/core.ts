@@ -112,10 +112,10 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('Worker Pool Scaling', () => this.testWorkerPoolScaling()));
 
     // Rate Limiting Stress Tests
-    // NOTE: RateLimitGroup uses optimistic allocation like ConcurrentLimitGroup, so enforcement
-    // with high concurrency may show brief overage during race conditions.
-    // Skipping this test as it requires complex timing synchronization.
-    // this.results.push(await this.runTest('Concurrent Rate Limit Enforcement', () => this.testConcurrentRateLimitEnforcement()));
+    // RateLimitGroup is optimistic like ConcurrentLimitGroup, so instantaneous
+    // enforcement is racy - the assertion is on the average rate over the run,
+    // with tolerance, which is what the limit actually promises.
+    this.results.push(await this.runTest('Concurrent Rate Limit Enforcement', () => this.testConcurrentRateLimitEnforcement()));
 
     // Idle Timeout Tests
     this.results.push(await this.runTest('Idle Timeout Default (5000ms)', () => this.testIdleTimeoutDefault()));
@@ -124,6 +124,8 @@ class CrossPlatformTestSuite {
 
     // Batch API Tests
     this.results.push(await this.runTest('Batch Task Addition', () => this.testBatchTaskAddition()));
+    this.results.push(await this.runTest('handleRejection Silences Fire-And-Forget Failures', () => this.testHandleRejection()));
+    this.results.push(await this.runTest('periodicRetryIntervalMs Is Honoured', () => this.testPeriodicRetryInterval()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -623,6 +625,63 @@ class CrossPlatformTestSuite {
     await new Promise(resolve => setTimeout(resolve, 150));
   }
 
+
+  // Fire-and-forget failures must not surface as unhandled rejections. On Deno an
+  // unhandled rejection terminates the process, so a run that gets past this at
+  // all is the assertion; the counters confirm the failures really happened.
+  private async testHandleRejection(): Promise<void> {
+    const workerManager = new WorkerManager(this.testInlineWorkerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 2, inline: true
+    });
+    const scheduler = new FyflowScheduler({ TestInlineWorker: workerManager }, {});
+
+    for (let i = 0; i < 4; i++) {
+      // No createPromise: nothing is awaiting these, and handleRejection defaults true
+      scheduler.addTask(new FyflowTask({
+        id: `faf-fail-${i}`,
+        workerType: 'TestInlineWorker',
+        payload: { taskId: `faf-fail-${i}`, shouldThrow: true }
+      }));
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 600));
+
+    if (scheduler.stats.failed !== 4) {
+      throw new Error(`Expected 4 failed tasks, got ${scheduler.stats.failed}`);
+    }
+    // Still usable afterwards
+    const ok = await scheduler.addTask(new FyflowTask({
+      id: 'faf-ok', workerType: 'TestInlineWorker', payload: { taskId: 'faf-ok', delay: 5 }
+    }), { createPromise: true });
+    if (!ok) throw new Error('Scheduler stopped working after fire-and-forget failures');
+    await scheduler.shutdown();
+  }
+
+  // Blocked tasks are released by the periodic retry, so a custom interval must
+  // still drain them - this is the only thing the option controls
+  private async testPeriodicRetryInterval(): Promise<void> {
+    const group = new ConcurrentLimitGroup(1);
+    const workerManager = new WorkerManager(this.testInlineWorkerUrl, {
+      maxThreads: 2, maxConcurrentTasks: 2, inline: true, groups: ['tight']
+    });
+    const scheduler = new FyflowScheduler(
+      { TestInlineWorker: workerManager },
+      { tight: group },
+      { periodicRetryIntervalMs: 10 }
+    );
+
+    const tasks = Array.from({ length: 6 }, (_, i) => new FyflowTask({
+      id: `retry-interval-${i}`,
+      workerType: 'TestInlineWorker',
+      payload: { taskId: `retry-interval-${i}`, delay: 20 }
+    }));
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+
+    if (scheduler.stats.done !== 6) {
+      throw new Error(`Expected 6 done with a custom retry interval, got ${scheduler.stats.done}`);
+    }
+    await scheduler.shutdown();
+  }
 
   private async waitForCompletion(scheduler: FyflowScheduler, expectedTasks: number, timeoutMs = 5000): Promise<void> {
     const start = performance.now();

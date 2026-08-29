@@ -18,10 +18,29 @@ export interface ResourceGroupStats {
 
 export interface ResourceGroup extends EventTarget {
   readonly id: string;
-  readonly type: 'concurrent' | 'rate-limit';
+  readonly type: 'concurrent' | 'rate-limit' | 'keyed-rate-limit';
 
-  // Capacity check (synchronous)
-  canRun(): boolean;
+  /**
+   * True when this group limits per key rather than globally. The scheduler
+   * resolves a key with {@link ResourceGroup.keyFor} and passes it to
+   * `canRun`/`onStart`/`onFinish`, and queues blocked tasks per key so a
+   * saturated key cannot stall the others.
+   */
+  readonly keyed?: boolean;
+
+  /**
+   * Key this task belongs to, for keyed groups. Returning undefined or an empty
+   * string makes `addTask` throw - a task with no key would otherwise silently
+   * bypass or share a bucket.
+   */
+  keyFor?(task: unknown): string | undefined;
+
+  /**
+   * Capacity check (synchronous). `key` is supplied only for keyed groups; a
+   * keyed group called without one reports whether ANY key has capacity, which
+   * the scheduler uses as a cheap pre-filter.
+   */
+  canRun(key?: string): boolean;
 
   // Get current metrics
   getMetrics(): ResourceGroupMetrics;

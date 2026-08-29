@@ -18,11 +18,34 @@ console.log('=================================\n');
 
 console.log('📦 Created CPU manager with 8 slots');
 
+// Worker URLs differ per runtime. Deno loads the .ts source directly; the Node
+// and browser bundles inline it through this repo's esbuild worker plugin.
+//
+// NOTE FOR CONSUMERS: `?worker-direct` is a convention of THIS repository's
+// build, not part of the published API. In your own project, ship a compiled
+// .js worker and pass `new URL('./myWorker.js', import.meta.url).href` - see
+// examples/deno-only/ for the plain form.
+let cpuWorkerUrl: string;
+let asyncWorkerUrl: string;
+let simpleWorkerUrl: string;
+if (typeof Deno !== "undefined") {
+    cpuWorkerUrl = new URL("./workers/cpuWorker.ts", import.meta.url).href;
+    asyncWorkerUrl = new URL("./workers/asyncWorker.ts", import.meta.url).href;
+    simpleWorkerUrl = new URL("./workers/simpleWorker.ts", import.meta.url).href;
+} else {
+    // @ts-expect-error - esbuild resolves ?worker-direct at build time
+    cpuWorkerUrl = new URL((await import("./workers/cpuWorker.ts?worker-direct")).default).href;
+    // @ts-expect-error - esbuild resolves ?worker-direct at build time
+    asyncWorkerUrl = new URL((await import("./workers/asyncWorker.ts?worker-direct")).default).href;
+    // @ts-expect-error - esbuild resolves ?worker-direct at build time
+    simpleWorkerUrl = new URL((await import("./workers/simpleWorker.ts?worker-direct")).default).href;
+}
+
 // Step 2: Create different worker pool configurations
 const workerPools = {
     // Threaded workers: 1 CPU slot per thread, 1 task per thread
     CpuThreaded: new WorkerManager(
-        new URL("./workers/cpuWorker.ts", import.meta.url).href,
+        cpuWorkerUrl,
         {
             maxThreads: 4,           // 4 threads
             maxConcurrentTasks: 1,   // 1 task per thread
@@ -33,7 +56,7 @@ const workerPools = {
 
     // Inline workers: 0 CPU slots, high concurrency for async work
     AsyncInline: new WorkerManager(
-        new URL("./workers/asyncWorker.ts", import.meta.url).href,
+        asyncWorkerUrl,
         {
             maxThreads: 2,           // 2 worker instances
             maxConcurrentTasks: 10,  // 10 concurrent tasks per instance
@@ -44,7 +67,7 @@ const workerPools = {
 
     // Mixed: Simple workers can work both ways
     SimpleThreaded: new WorkerManager(
-        new URL("./workers/simpleWorker.ts", import.meta.url).href,
+        simpleWorkerUrl,
         {
             maxThreads: 2,
             maxConcurrentTasks: 1,
@@ -54,7 +77,7 @@ const workerPools = {
     ),
 
     SimpleInline: new WorkerManager(
-        new URL("./workers/simpleWorker.ts", import.meta.url).href,
+        simpleWorkerUrl,
         {
             maxThreads: 1,
             maxConcurrentTasks: 8,

@@ -87,9 +87,6 @@ export class ReportGenerator {
                 md.push(`- Groups: ${result.config.groupConfig.groupCount} groups, ${result.config.groupConfig.groupLimit} limit each`);
             }
 
-            if (result.config.dependencyConfig && result.config.dependencyConfig.type !== 'none') {
-                md.push(`- Dependencies: ${result.config.dependencyConfig.type}`);
-            }
             md.push("");
 
             // Metrics
@@ -100,6 +97,10 @@ export class ReportGenerator {
             md.push(`- **Coordination Overhead**: ${formatDuration(result.metrics.coordinationOverhead)}`);
             md.push(`- **Total Worker Time**: ${formatDuration(result.metrics.totalWorkerTime)}`);
             md.push(`- **Overall Efficiency**: ${result.metrics.overallEfficiency.toFixed(1)}%`);
+            if (result.metrics.workerStartup?.workersStarted > 0) {
+                const s = result.metrics.workerStartup;
+                md.push(`- **Worker Startup**: ${s.workersStarted} worker(s), avg ${formatDuration(s.avgInitMs)} init, ${formatDuration(s.avgSetupMs)} setup, max ${formatDuration(s.maxInitMs)}`);
+            }
             md.push(`- **Task Throughput**: ${result.metrics.taskThroughput.toFixed(2)} tasks/sec`);
             md.push(`- **Memory Delta**: ${formatBytes(result.metrics.memoryUsage.delta)}`);
             md.push(`- **Peak Memory**: ${formatBytes(result.metrics.memoryUsage.peak)}`);
@@ -124,7 +125,7 @@ export class ReportGenerator {
             md.push("");
         }
 
-        const volumeResults = suite.results.filter(r => !r.config.groupConfig && (!r.config.dependencyConfig || r.config.dependencyConfig.type === 'none'));
+        const volumeResults = suite.results.filter(r => !r.config.groupConfig);
         if (volumeResults.length > 0) {
             md.push("### Task Volume Scaling");
             md.push("| Test | Tasks | Throughput | Memory Delta | Scheduler Overhead |");
@@ -161,6 +162,10 @@ export class ReportGenerator {
             'Coordination Overhead (ms)',
             'Total Worker Time (ms)',
             'Overall Efficiency (%)',
+            'Workers Started',
+            'Avg Worker Init (ms)',
+            'Max Worker Init (ms)',
+            'Avg Worker Setup (ms)',
             'Task Throughput (tasks/sec)',
             'Memory Delta (bytes)',
             'Peak Memory (bytes)',
@@ -184,6 +189,10 @@ export class ReportGenerator {
             result.metrics.coordinationOverhead.toFixed(2),
             result.metrics.totalWorkerTime.toFixed(2),
             result.metrics.overallEfficiency.toFixed(1),
+            result.metrics.workerStartup?.workersStarted ?? 0,
+            (result.metrics.workerStartup?.avgInitMs ?? 0).toFixed(2),
+            (result.metrics.workerStartup?.maxInitMs ?? 0).toFixed(2),
+            (result.metrics.workerStartup?.avgSetupMs ?? 0).toFixed(2),
             result.metrics.taskThroughput.toFixed(2),
             result.metrics.memoryUsage.delta,
             result.metrics.memoryUsage.peak,
@@ -272,7 +281,7 @@ export class ReportGenerator {
 
         // Analyze throughput scaling
         const volumeResults = suite.results
-            .filter(r => !r.config.groupConfig && (!r.config.dependencyConfig || r.config.dependencyConfig.type === 'none'))
+            .filter(r => !r.config.groupConfig)
             .sort((a, b) => a.config.taskCount - b.config.taskCount);
 
         if (volumeResults.length >= 2) {

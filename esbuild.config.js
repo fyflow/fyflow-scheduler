@@ -20,6 +20,22 @@ if (fs.existsSync(outputDir)) {
   console.log(`🧹 Cleared ${outputDir}/`);
 }
 
+// Deno loads core/workerWrapper.ts directly, so the published workerWrapperUrl.ts
+// is Deno-only. Bundled targets need the variant that inlines the worker via the
+// ?worker plugin, which Deno cannot publish - swap it in here rather than
+// branching at runtime.
+const bundledWorkerUrlPlugin = {
+  name: "bundled-worker-url",
+  setup(build) {
+    build.onResolve({ filter: /workerWrapperUrl\.ts$/ }, args => {
+      if (args.path.includes("workerWrapperUrl.bundled.ts")) return null;
+      return {
+        path: path.resolve(args.resolveDir, args.path.replace("workerWrapperUrl.ts", "workerWrapperUrl.bundled.ts"))
+      };
+    });
+  }
+};
+
 const workerPlugin = {
   name: "worker-loader",
   setup(build) {
@@ -87,11 +103,14 @@ if (buildType === 'development') {
   await build({
     entryPoints: [
       "index.ts",
+      // Non-recursive on purpose: examples/deno-only/ must NOT be built for
+      // Node or the browser - it demonstrates the plain Deno worker URL form
       "examples/*.ts",
       "tests/runner.ts",
       "tests/suites/core.ts",
       "tests/suites/error-handling.ts",
       "tests/suites/spawning.ts",
+      "tests/suites/settlement.ts",
       "tests/suites/docs.ts",
       "tests/performance/contention-scaling.ts",
       "benchmark/runBenchmarks.ts"
@@ -101,7 +120,7 @@ if (buildType === 'development') {
     platform: "node",
     format: "esm",
     outdir: "dev-dist/node",
-    plugins: [workerPlugin, injectWorkerImport],
+    plugins: [bundledWorkerUrlPlugin, workerPlugin, injectWorkerImport],
   });
 
   console.log("✓ Node.js development build complete");
@@ -125,7 +144,7 @@ if (buildType === 'development') {
     platform: "browser",
     format: "esm",
     outdir: "dev-dist/browser",
-    plugins: [workerPlugin],
+    plugins: [bundledWorkerUrlPlugin, workerPlugin],
   });
 
   console.log("✓ Browser development build complete");
@@ -141,7 +160,7 @@ if (buildType === 'development') {
     platform: "node",
     format: "esm",
     outdir: "dist/node",
-    plugins: [workerPlugin, injectWorkerImport],
+    plugins: [bundledWorkerUrlPlugin, workerPlugin, injectWorkerImport],
   });
 
   console.log("✓ Node.js library build complete");
@@ -153,7 +172,7 @@ if (buildType === 'development') {
     platform: "browser",
     format: "esm",
     outdir: "dist/browser",
-    plugins: [workerPlugin],
+    plugins: [bundledWorkerUrlPlugin, workerPlugin],
   });
 
   console.log("✓ Browser library build complete");

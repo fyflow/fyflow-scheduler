@@ -73,6 +73,9 @@ class TestRunner {
       // Run spawning and descendant tracking tests
       await this.runSuite('Spawning', `./suites/spawning${ext}`);
 
+      // Run task settlement tests
+      await this.runSuite('Settlement', `./suites/settlement${ext}`);
+
       // Run the executable documentation examples
       await this.runSuite('Documentation Examples', `./suites/docs${ext}`);
 
@@ -92,6 +95,7 @@ class TestRunner {
       'error': `./suites/error-handling${ext}`,
       'error-handling': `./suites/error-handling${ext}`,
       'spawning': `./suites/spawning${ext}`,
+      'settlement': `./suites/settlement${ext}`,
       'docs': `./suites/docs${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
@@ -128,6 +132,7 @@ async function main() {
     console.log('  core        - Core functionality tests');
     console.log('  error       - Error handling tests');
     console.log('  spawning    - Task spawning and descendant tracking tests');
+    console.log('  settlement  - Task settlement and failure accounting tests');
     console.log('  docs        - Executable documentation examples');
     console.log('  performance - Performance tests');
     console.log('');

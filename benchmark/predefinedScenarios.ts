@@ -248,10 +248,17 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
         }
     },
 
-    // 4. Complex DAG Dependencies
+    // 4. Inline concurrency shapes
+    //
+    // These were "Deep Chain", "Wide Tree" and "Mixed Dependencies", named after
+    // DAG workloads the framework cannot express - task dependencies were removed
+    // and dependencyConfig was never read by the task generator, so all three ran
+    // plain independent tasks. "Wide Tree" was byte-identical to
+    // "Large Volume - 1K Independent Tasks (Inline)" and has been dropped; the
+    // other two are renamed for the configuration they actually measure.
     {
-        name: "Deep Chain - 1K Tasks",
-        description: "1,000 tasks in sequential dependency chain",
+        name: "Inline Serial - 1K Tasks, 1 Per Instance",
+        description: "1,000 tasks with maxConcurrentTasks 1 - no overlap within an instance",
         taskCount: 1000,
         cpuSlots: 8,
         workerConfig: {
@@ -259,33 +266,12 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
             maxConcurrentTasks: 1,
             inline: true,
             taskDelay: 1
-        },
-        dependencyConfig: {
-            type: 'chain',
-            depth: 1000
         }
     },
 
     {
-        name: "Wide Tree - 1K Tasks",
-        description: "1,000 tasks in tree structure with fanout of 10",
-        taskCount: 1000,
-        cpuSlots: 8,
-        workerConfig: {
-            maxThreads: 4,
-            maxConcurrentTasks: 5,
-            inline: true,
-            taskDelay: 1
-        },
-        dependencyConfig: {
-            type: 'tree',
-            fanout: 10
-        }
-    },
-
-    {
-        name: "Mixed Dependencies - 5K Tasks",
-        description: "5,000 tasks with mixed dependency patterns (30% chain, 30% tree, 40% independent)",
+        name: "Large Volume - 5K Independent Tasks (Inline)",
+        description: "5,000 independent tasks - fills the gap between the 1K and 10K volume scenarios",
         taskCount: 5000,
         cpuSlots: 16,
         workerConfig: {
@@ -293,9 +279,6 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
             maxConcurrentTasks: 10,
             inline: true,
             taskDelay: 0
-        },
-        dependencyConfig: {
-            type: 'mixed'
         }
     },
 
@@ -500,25 +483,117 @@ export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
 ];
 
 // Scenario categories for organized testing
+// Worker startup cost. Deliberately NOT warmed: these exist to measure how long
+// it takes to bring workers up, which differs sharply between Deno, Node and the
+// browser, and between threaded and inline pools. Compare `Worker Startup` in the
+// report across runtimes; task throughput here is incidental.
+export const STARTUP_SCENARIOS: BenchmarkConfig[] = [
+    {
+        name: "Worker Startup - 1 Thread",
+        description: "Cold start cost of a single worker thread",
+        taskCount: 4,
+        cpuSlots: 1,
+        warmupWorkers: false,
+        workerConfig: { maxThreads: 1, maxConcurrentTasks: 1, inline: false, taskDelay: 0 }
+    },
+    {
+        name: "Worker Startup - 8 Threads",
+        description: "Cold start cost of eight worker threads",
+        taskCount: 32,
+        cpuSlots: 8,
+        warmupWorkers: false,
+        workerConfig: { maxThreads: 8, maxConcurrentTasks: 1, inline: false, taskDelay: 0 }
+    },
+    {
+        name: "Worker Startup - 8 Inline Instances",
+        description: "Cold start cost of eight inline worker instances (no threads)",
+        taskCount: 32,
+        cpuSlots: 8,
+        warmupWorkers: false,
+        workerConfig: { maxThreads: 8, maxConcurrentTasks: 1, inline: true, taskDelay: 0 }
+    }
+];
+
+// Look scenarios up by name rather than by array position. The categories used
+// to be index slices - BENCHMARK_SCENARIOS.slice(16, 19) and friends - so
+// inserting or removing any scenario silently reassigned every category after
+// it. byName throws on a typo instead.
+function byName(...names: string[]): BenchmarkConfig[] {
+    return names.map(name => {
+        const scenario = BENCHMARK_SCENARIOS.find(s => s.name === name);
+        if (!scenario) throw new Error(`Unknown benchmark scenario: ${name}`);
+        return scenario;
+    });
+}
+
 export const SCENARIO_CATEGORIES = {
-    QUICK: BENCHMARK_SCENARIOS.slice(0, 7), // Include both inline (0-3) and threaded (4-6) scenarios
-    FIRE_AND_FORGET: BENCHMARK_SCENARIOS.slice(7, 10), // Fire-and-forget optimization tests (7-9)
-    CONTENTION: BENCHMARK_SCENARIOS.slice(10, 13),
-    GROUP_SCALING: BENCHMARK_SCENARIOS.slice(13, 16),
-    DEPENDENCIES: BENCHMARK_SCENARIOS.slice(16, 19),
-    MIXED: BENCHMARK_SCENARIOS.slice(19, 20),
-    OVERLAPPING: BENCHMARK_SCENARIOS.slice(20, 23),
-    STRESS: BENCHMARK_SCENARIOS.slice(23, 24),
+    QUICK: byName(
+        "Large Volume - 1K Independent Tasks (Inline)",
+        "Large Volume - 10K Independent Tasks (Inline)",
+        "Large Volume - 50K Independent Tasks (Inline)",
+        "Large Volume - 100K Independent Tasks (Inline)",
+        "Threading Scalability - 200 Tasks, 2 Threads",
+        "Threading Scalability - 200 Tasks, 4 Threads",
+        "Threading Efficiency - 1K CPU Tasks"
+    ),
+    VOLUME: byName(
+        "Large Volume - 1K Independent Tasks (Inline)",
+        "Large Volume - 5K Independent Tasks (Inline)",
+        "Large Volume - 10K Independent Tasks (Inline)",
+        "Large Volume - 50K Independent Tasks (Inline)",
+        "Large Volume - 100K Independent Tasks (Inline)"
+    ),
+    FIRE_AND_FORGET: byName(
+        "Fire-and-Forget - 10K Tasks (Inline)",
+        "Fire-and-Forget - 50K Tasks (Inline)",
+        "Fire-and-Forget - 100K Tasks (Inline)"
+    ),
+    CONTENTION: byName(
+        "High Contention - 1K Tasks, 4 Slots",
+        "High Contention - 10K Tasks, 4 Slots",
+        "Extreme Contention - 25K Tasks, 2 Slots"
+    ),
+    GROUP_SCALING: byName(
+        "Many Groups - 100 Groups",
+        "Many Groups - 500 Groups",
+        "Many Groups - 1K Groups"
+    ),
+    CONCURRENCY: byName(
+        "Inline Serial - 1K Tasks, 1 Per Instance",
+        "High concurrency - 25k Tasks, maxConcurrentTasks os 1",
+        "High concurrency - 70k",
+        "High concurrency - 90k",
+        "High concurrency - 90k 8x1",
+        "Workload concurrency - 10 2x1 cpuWorker",
+        "Workload concurrency - 10 8x1 cpuWorker"
+    ),
+    MIXED: byName("Mixed Workload - CPU vs Async"),
+    OVERLAPPING: byName(
+        "Overlapping Groups - 1K Tasks, 100 Groups",
+        "Overlapping Groups - 5K Tasks, 50 Groups",
+        "Overlapping Groups - 10K Tasks, 20 Groups"
+    ),
+    STRESS: byName(
+        "High Async Concurrency - 1K Tasks, 500ms Delay",
+        "High Async Concurrency - 2K Tasks, 500ms Delay",
+        "Memory Pressure - 100K Tasks"
+    ),
+    STARTUP: STARTUP_SCENARIOS,
     // Baseline category - comprehensive baseline tests for regression detection
     BASELINE: [
-        BENCHMARK_SCENARIOS[1],  // Large Volume - 10K Independent Tasks (Inline)
-        BENCHMARK_SCENARIOS[2],  // Large Volume - 50K Independent Tasks (Inline)
-        BENCHMARK_SCENARIOS[7],  // Fire-and-Forget - 10K Tasks (Inline)
-        BENCHMARK_SCENARIOS[8],  // Fire-and-Forget - 50K Tasks (Inline)
-        BENCHMARK_SCENARIOS[4],  // Threading Scalability - 200 Tasks, 2 Threads
-        BENCHMARK_SCENARIOS[5],  // Threading Scalability - 200 Tasks, 4 Threads
-        BENCHMARK_SCENARIOS[10], // High Contention - 1K Tasks, 4 Slots
-        BENCHMARK_SCENARIOS[11]  // High Contention - 10K Tasks, 4 Slots
+        ...byName(
+            "Large Volume - 10K Independent Tasks (Inline)",
+            "Large Volume - 50K Independent Tasks (Inline)",
+            "Fire-and-Forget - 10K Tasks (Inline)",
+            "Fire-and-Forget - 50K Tasks (Inline)",
+            "Threading Scalability - 200 Tasks, 2 Threads",
+            "Threading Scalability - 200 Tasks, 4 Threads",
+            "High Contention - 1K Tasks, 4 Slots",
+            "High Contention - 10K Tasks, 4 Slots"
+        ),
+        // Every other baseline scenario pre-warms its workers, so startup cost
+        // is deliberately excluded from their efficiency. These carry it.
+        ...STARTUP_SCENARIOS
     ]
 };
 
@@ -527,9 +602,9 @@ export function getScenariosByCategory(category: keyof typeof SCENARIO_CATEGORIE
 }
 
 export function getAllScenarios(): BenchmarkConfig[] {
-    return BENCHMARK_SCENARIOS;
+    return [...BENCHMARK_SCENARIOS, ...STARTUP_SCENARIOS];
 }
 
 export function getScenarioByName(name: string): BenchmarkConfig | undefined {
-    return BENCHMARK_SCENARIOS.find(scenario => scenario.name === name);
+    return getAllScenarios().find(scenario => scenario.name === name);
 }

@@ -75,9 +75,9 @@ self.onmessage = async (e) => {
             // Report setup timing so ThreadWrapper can emit the same
             // worker.setup.* events an inline worker emits
             sendMessage({ type: 'setup_started' });
-            const setupStart = Date.now();
+            const setupStart = performance.now();
             await workerInstance.setup?.();
-            sendMessage({ type: 'setup_completed', data: { duration: Date.now() - setupStart } });
+            sendMessage({ type: 'setup_completed', data: { duration: performance.now() - setupStart } });
 
             sendMessage({ type: 'init' });
         } else if (action === 'run' && workerInstance && workerId) {

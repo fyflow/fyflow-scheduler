@@ -1,5 +1,23 @@
 import type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from './resourceGroup.ts';
 
+/** Per-window view returned by {@link RateLimitGroup.getStatus}. */
+export interface RateWindowStatus {
+  limit: number;
+  windowMs: number;
+  current: number;
+  completed: number;
+  running: number;
+  remaining: number;
+  resetTime: number;
+}
+
+/** Snapshot returned by {@link RateLimitGroup.getStatus}. */
+export interface RateLimitStatus {
+  running: number;
+  windows: RateWindowStatus[];
+  canAcceptNew: boolean;
+}
+
 export interface RateWindow {
   limit: number;      // Maximum requests allowed
   windowMs: number;   // Time window in milliseconds
@@ -126,9 +144,9 @@ export class RateLimitGroup extends EventTarget implements ResourceGroup {
   /**
    * Get current status for monitoring
    */
-  getStatus() {
+  getStatus(): RateLimitStatus {
     const now = Date.now();
-    const windowStatus = this.windows.map((window, index) => {
+    const windowStatus: RateWindowStatus[] = this.windows.map((window, index) => {
       const windowKey = index.toString();
       const requests = this.requestCounts.get(windowKey)!;
       const windowStart = now - window.windowMs;

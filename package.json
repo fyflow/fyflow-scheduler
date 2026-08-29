@@ -15,6 +15,7 @@
     "test:core": "npm run build:dev && node dev-dist/node/tests/runner.js core",
     "test:error": "npm run build:dev && node dev-dist/node/tests/runner.js error",
     "test:spawning": "npm run build:dev && node dev-dist/node/tests/runner.js spawning",
+    "test:settlement": "npm run build:dev && node dev-dist/node/tests/runner.js settlement",
     "test:docs": "npm run build:dev && node dev-dist/node/tests/runner.js docs",
     "test:performance": "npm run build:dev && node dev-dist/node/tests/runner.js performance",
     "test:deno": "deno task test",
@@ -33,6 +34,7 @@
     "benchmark:quick": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --quick",
     "benchmark:baseline": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories baseline",
     "benchmark:variance": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --quick --runs 3",
+    "benchmark:startup": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories startup",
     "benchmark:contention": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories contention",
     "benchmark:overlapping": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories overlapping",
     "benchmark:help": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --help"

@@ -20,14 +20,33 @@ console.log("=" .repeat(60));
 // Create resource groups
 const cpuGroup = new ConcurrentLimitGroup(4);
 
+// Worker URLs differ per runtime. Deno loads the .ts source directly; the Node
+// and browser bundles inline it through this repo's esbuild worker plugin.
+//
+// NOTE FOR CONSUMERS: `?worker-direct` is a convention of THIS repository's
+// build, not part of the published API. In your own project, ship a compiled
+// .js worker and pass `new URL('./myWorker.js', import.meta.url).href` - see
+// examples/deno-only/ for the plain form.
+let progressWorkerUrl: string;
+let dataProcessorUrl: string;
+if (typeof Deno !== "undefined") {
+    progressWorkerUrl = new URL("./workers/progressWorker.ts", import.meta.url).href;
+    dataProcessorUrl = new URL("./workers/dataProcessor.ts", import.meta.url).href;
+} else {
+    // @ts-expect-error - esbuild resolves ?worker-direct at build time
+    progressWorkerUrl = new URL((await import("./workers/progressWorker.ts?worker-direct")).default).href;
+    // @ts-expect-error - esbuild resolves ?worker-direct at build time
+    dataProcessorUrl = new URL((await import("./workers/dataProcessor.ts?worker-direct")).default).href;
+}
+
 // Create worker managers for different worker types
 const progressWorkerManager = new WorkerManager(
-    new URL("./workers/progressWorker.ts", import.meta.url).href,
+    progressWorkerUrl,
     { maxThreads: 2, maxConcurrentTasks: 1, inline: false }
 );
 
 const dataProcessorManager = new WorkerManager(
-    new URL("./workers/dataProcessor.ts", import.meta.url).href,
+    dataProcessorUrl,
     { maxThreads: 2, maxConcurrentTasks: 1, inline: true }
 );
 

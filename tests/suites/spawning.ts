@@ -95,6 +95,7 @@ class SpawningTestSuite {
     this.results.push(await this.runTest('Descendants - Resolves When Already Complete', () => this.testAlreadyComplete()));
     this.results.push(await this.runTest('Spawn Of Unknown Worker Type Does Not Crash', () => this.testUnknownWorkerSpawn()));
     this.results.push(await this.runTest('Descendants - Survive Task Eviction', () => this.testDescendantsSurviveEviction()));
+    this.results.push(await this.runTest('Descendants - Reject On Scheduler Shutdown', () => this.testDescendantsRejectOnShutdown()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -344,6 +345,46 @@ class SpawningTestSuite {
     // 1 root + 3 children + 9 grandchildren
     if (scheduler.stats.done !== 13) {
       throw new Error(`Expected 13 completed tasks, got ${scheduler.stats.done}`);
+    }
+  }
+
+  // Documented: an outstanding wait rejects if the scheduler shuts down first,
+  // rather than being dropped silently and leaving the caller awaiting forever
+  private async testDescendantsRejectOnShutdown(): Promise<void> {
+    // shutdown() drains outstanding work first - it keeps dispatching while tasks
+    // are running - so a workflow that can still finish simply finishes and the
+    // wait resolves. The rejection is for work that can no longer run, so this
+    // uses a pool whose worker cannot be loaded at all.
+    const pool = new WorkerManager(
+      new URL("../workers/doesNotExist.ts", import.meta.url).href,
+      { maxThreads: 1, maxConcurrentTasks: 1, inline: true, idleTimeout: 0 }
+    );
+    const scheduler = new FyflowScheduler({ SpawningWorker: pool });
+    this.schedulers.push(scheduler);
+
+    const task = new FyflowTask({
+      id: 'shutdown-wait', workerType: 'SpawningWorker',
+      payload: { spawn: 0, childId: 'sw' }
+    });
+    scheduler.addTask(task);
+
+    const waiting = task.onCompleteDescendants().then(() => 'resolved').catch(
+      (error: any) => `rejected:${error.message}`
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await scheduler.shutdown();
+
+    const outcome = await Promise.race([
+      waiting,
+      new Promise<string>(resolve => setTimeout(() => resolve('NEVER SETTLED'), 3000))
+    ]);
+
+    if (!outcome.startsWith('rejected')) {
+      throw new Error(`Expected the wait to reject on shutdown, got: ${outcome}`);
+    }
+    if (!outcome.includes('shut down')) {
+      throw new Error(`Expected a shutdown-specific message, got: ${outcome}`);
     }
   }
 

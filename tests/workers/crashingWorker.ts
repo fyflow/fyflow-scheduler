@@ -73,6 +73,10 @@ export default class CrashingWorker extends BaseWorker {
   }
 
   async teardown(): Promise<void> {
+    // Lets a test observe worker.teardown.failed, which nothing else emits
+    if (this.config.crashOnTeardown) {
+      throw new Error('Intentional crash during worker teardown');
+    }
     // console.log('CrashingWorker teardown completed');
   }
 }

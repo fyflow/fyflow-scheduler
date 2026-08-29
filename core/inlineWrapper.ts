@@ -3,8 +3,8 @@ import { WorkerInstanceExtensions, WorkerInstanceState, WorkerStatus, BaseWorker
 export class InlineWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
     runningTasks = 0;
     maxConcurrentTasks: number;
-    runningTaskIds = new Set<string>();
-    runningTaskData = new Map<string, {id: string, payload: any}>();
+    runningTaskIds: Set<string> = new Set<string>();
+    runningTaskData: Map<string, {id: string, payload: any}> = new Map<string, {id: string, payload: any}>();
     idleTimeout: number;
     lastActivityTime: number = Date.now();
     workerModule: any = null;
@@ -21,7 +21,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     // Stats for WorkerStatus
     tasksCompleted = 0;
     errorCount = 0;
-    createdAt = Date.now();
+    createdAt: number = Date.now();
     constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}) {
         super();
         this.scriptUrl = scriptUrl;
@@ -111,14 +111,14 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         this.lastActivityTime = Date.now();
     }
 
-    async _loadWorkerModule() {
+    async _loadWorkerModule(): Promise<any> {
         if (!this.workerModule) {
             this.workerModule = await import(this.scriptUrl);
         }
         return this.workerModule;
     }
 
-    async _createWorkerInstance() {
+    async _createWorkerInstance(): Promise<any> {
         if (this.workerInstance) {
             return this.workerInstance;
         }
@@ -133,7 +133,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 throw new Error(`Worker script ${this.scriptUrl} must export a default class`);
             }
 
-            const initStartTime = Date.now();
+            const initStartTime = performance.now();
             this.dispatchEvent(new CustomEvent('worker.initialization.started', {
                 detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
             }));
@@ -148,7 +148,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                     detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
                 }));
 
-                const setupStartTime = Date.now();
+                const setupStartTime = performance.now();
                 await instance.setup();
 
                 this.dispatchEvent(new CustomEvent('worker.setup.completed', {
@@ -156,7 +156,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                         workerId: this.id,
                         workerType: 'inline',
                         timestamp: Date.now(),
-                        duration: Date.now() - setupStartTime
+                        duration: performance.now() - setupStartTime
                     }
                 }));
             }
@@ -168,7 +168,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                     workerId: this.id,
                     workerType: 'inline',
                     timestamp: Date.now(),
-                    duration: Date.now() - initStartTime
+                    duration: performance.now() - initStartTime
                 }
             }));
 
@@ -357,7 +357,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                     detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
                 }));
 
-                const teardownStartTime = Date.now();
+                const teardownStartTime = performance.now();
                 await this.workerInstance.teardown();
 
                 this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
@@ -365,7 +365,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                         workerId: this.id,
                         workerType: 'inline',
                         timestamp: Date.now(),
-                        duration: Date.now() - teardownStartTime
+                        duration: performance.now() - teardownStartTime
                     }
                 }));
             } catch (teardownError) {

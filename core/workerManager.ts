@@ -5,19 +5,39 @@ import { WorkerStatus } from "./workerInterface.ts";
 type WorkerInstance = ThreadWrapper | InlineWrapper;
 
 export interface WorkerManagerOptions {
-  /** Maximum worker instances in this pool. Default 2. */
+  /**
+   * Maximum worker instances in this pool. Default 2.
+   *
+   * Despite the name this is a count of worker *instances*, not OS threads.
+   * With `inline: false` each instance is a real worker thread. With
+   * `inline: true` they all live in the main process, and the name is a
+   * misnomer - see {@link WorkerManagerOptions.inline}.
+   */
   maxThreads?: number;
   /**
-   * Tasks each worker may run at once. Default 1. Total pool capacity is
-   * `maxThreads x maxConcurrentTasks`. Raise this for async/IO workers; leave it
-   * at 1 for CPU-bound ones.
+   * Tasks each worker instance may run at once. Default 1. Total pool capacity
+   * is `maxThreads x maxConcurrentTasks` for both pool types. Raise this for
+   * async/IO workers; leave it at 1 for CPU-bound ones.
    */
   maxConcurrentTasks?: number;
   /** Ms an idle worker is kept before termination. Default 5000. `0` never terminates. */
   idleTimeout?: number;
   /**
-   * Run workers in the main thread instead of worker threads. Default false.
-   * Inline suits async/IO work; threaded suits CPU-bound work.
+   * Run workers in the main process instead of worker threads. Default false.
+   * Inline suits async/IO work; threaded suits CPU-bound work, since an inline
+   * worker shares the event loop and a synchronous task blocks the scheduler.
+   *
+   * For an inline pool, `maxThreads` creates that many instances of your worker
+   * class in the same process - no threads are involved. Concurrency comes from
+   * overlapping `await`s, so only the PRODUCT matters for throughput:
+   * `maxThreads: 4, maxConcurrentTasks: 5` and
+   * `maxThreads: 1, maxConcurrentTasks: 20` both cap at 20 in-flight tasks and
+   * measure the same.
+   *
+   * What the split does change is state isolation: each instance is constructed
+   * separately, so 4 instances means 4 connection pools, caches or whatever
+   * per-instance state your worker holds, while 1 instance funnels all 20
+   * concurrent tasks through one object.
    */
   inline?: boolean;
   /** Passed as the first constructor argument to every worker instance in this pool. */
@@ -296,8 +316,15 @@ export class WorkerManager extends EventTarget {
     // CRITICAL: Release group resources immediately (can't process tasks)
     this._releaseWorkerGroupResources(workerId);
 
-    // Schedule replacement only if canRestart=true, under restart limit, and after delay
-    if (canRestart === true) {
+    // Replace unless the failure explicitly forbade it.
+    //
+    // This used to require `canRestart === true`, while the requeue decision
+    // above uses `canRestart !== false`. Failures that set no canRestart at all -
+    // which is every construction failure - fell through both branches: no
+    // replacement was scheduled AND worker.restart_limit_exceeded was never
+    // emitted, so an unstartable pool kept a dead worker in its maxThreads slot
+    // and stayed silent to anyone monitoring that event.
+    if (canRestart !== false) {
       if (this.poolRestartCount < this.maxWorkerRestarts) {
         this.poolRestartCount++;
         const delay = restartDelay || 5000; // Default 5 second delay
