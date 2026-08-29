@@ -41,6 +41,13 @@ jobs:
       - name: Test (core, error handling, spawning, settlement, docs)
         run: deno task test
 
+      # Separate from `deno task test` and not covered by it. These unit tests
+      # inject the POSIX path implementation, so the Linux branch of the publish
+      # output parser is exercised regardless of the runner - that branch is
+      # what broke CI while passing on the Windows dev machine.
+      - name: Test scripts
+        run: deno task test:scripts
+
       # Publishability gate. Catches config regressions - a missing name field,
       # a query-suffixed specifier in the module graph, newly introduced slow
       # types - before they reach a release tag.

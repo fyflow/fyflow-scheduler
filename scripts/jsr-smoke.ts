@@ -11,12 +11,15 @@
 //
 // Run: deno task jsr:smoke
 
+import { basename, dirname, fromFileUrl, join } from "jsr:@std/path@^1.1.2";
+import { externalImports, parsePublishedFileUrls, stagingPlan } from "./publishOutput.ts";
+
 const repoRoot = new URL("../", import.meta.url);
 
-async function publishedFiles(): Promise<string[]> {
+async function publishedFileUrls(): Promise<string[]> {
   const command = new Deno.Command(Deno.execPath(), {
     args: ["publish", "--dry-run", "--allow-dirty"],
-    cwd: new URL(repoRoot).pathname.replace(/^\/([A-Za-z]:)/, "$1"),
+    cwd: fromFileUrl(repoRoot),
     stdout: "piped",
     stderr: "piped"
   });
@@ -28,23 +31,13 @@ async function publishedFiles(): Promise<string[]> {
     throw new Error("deno publish --dry-run failed");
   }
 
-  const files: string[] = [];
-  let collecting = false;
-  for (const rawLine of output.split("\n")) {
-    // deno-lint-ignore no-control-regex -- stripping ANSI colour codes from deno publish output
-    const line = rawLine.replace(/\x1b\[[0-9;]*m/g, "").trim();
-    if (line.startsWith("Simulating publish")) { collecting = true; continue; }
-    if (!collecting) continue;
-    const match = line.match(/^file:\/\/\/(.+?) \(/);
-    if (!match) continue;
-    files.push(decodeURIComponent(match[1]));
-  }
-  if (files.length === 0) throw new Error("Could not parse the published file list");
-  return files;
+  const urls = parsePublishedFileUrls(output);
+  if (urls.length === 0) throw new Error("Could not parse the published file list");
+  return urls;
 }
 
-const files = await publishedFiles();
-const rootPath = new URL(repoRoot).pathname.replace(/^\/([A-Za-z]:)/, "$1").replace(/\/$/, "");
+const fileUrls = await publishedFileUrls();
+const files = fileUrls.map((url) => fromFileUrl(url));
 
 console.log(`📦 ${files.length} files would be published`);
 
@@ -59,17 +52,42 @@ if (forbidden.length > 0) {
   Deno.exit(1);
 }
 
+// The package must have no dependencies. Everything it imports must be another
+// file inside it.
+//
+// Nothing else catches this. `scripts/` uses @std/path and is kept out of the
+// package by the publish allowlist alone - not by any dependency declaration,
+// because Deno has no devDependencies. Widen that allowlist by one line, or
+// import a script from a published module, and @std becomes a real dependency
+// every consumer resolves. The smoke run below would not notice: it copies the
+// published files and runs them, and a `jsr:` import simply resolves over the
+// network and passes green.
+const withExternalImports: string[] = [];
+for (const file of files) {
+  if (!/\.(ts|js|mjs|json)$/.test(file)) continue;
+  const source = await Deno.readTextFile(file);
+  const external = basename(file) === "deno.json"
+    ? Object.values(JSON.parse(source).imports ?? {}) as string[]
+    : externalImports(source);
+  for (const specifier of external) {
+    withExternalImports.push(`${basename(file)} -> ${specifier}`);
+  }
+}
+if (withExternalImports.length > 0) {
+  console.error("❌ The JSR package would carry dependencies:");
+  withExternalImports.forEach(d => console.error("   " + d));
+  Deno.exit(1);
+}
+
 const staging = await Deno.makeTempDir({ prefix: "fyflow-jsr-" });
-for (const absolute of files) {
-  const relative = absolute.slice(rootPath.length + 1);
-  const target = `${staging}/${relative}`;
-  await Deno.mkdir(target.slice(0, target.lastIndexOf("/")), { recursive: true });
-  await Deno.copyFile(absolute, target);
+for (const { source, target } of stagingPlan(fileUrls, repoRoot, staging)) {
+  await Deno.mkdir(dirname(target), { recursive: true });
+  await Deno.copyFile(source, target);
 }
 console.log(`📂 staged to ${staging}`);
 
 // A consumer-supplied worker, deliberately outside the package
-await Deno.writeTextFile(`${staging}/consumerWorker.ts`, `
+await Deno.writeTextFile(join(staging, "consumerWorker.ts"), `
 export default class ConsumerWorker {
   async setup() {}
   async teardown() {}
@@ -81,7 +99,7 @@ export default class ConsumerWorker {
 
 // Exercise the package the way a consumer would: threaded workers, which is the
 // only path that loads core/workerWrapper.ts
-await Deno.writeTextFile(`${staging}/smoke.ts`, `
+await Deno.writeTextFile(join(staging, "smoke.ts"), `
 import { FyflowScheduler, FyflowTask, WorkerManager } from "./index.ts";
 
 const workerUrl = new URL("./consumerWorker.ts", import.meta.url).href;
@@ -109,7 +127,7 @@ console.log("THREAD_WORKER_OK");
 `);
 
 const run = new Deno.Command(Deno.execPath(), {
-  args: ["run", "--allow-read", "--allow-net", `${staging}/smoke.ts`],
+  args: ["run", "--allow-read", "--allow-net", join(staging, "smoke.ts")],
   stdout: "piped",
   stderr: "piped"
 });
@@ -127,3 +145,4 @@ if (code !== 0 || !out.includes("THREAD_WORKER_OK")) {
 await Deno.remove(staging, { recursive: true });
 console.log("✅ Threaded worker ran against the published files only");
 console.log("✅ No Node-specific files in the package");
+console.log("✅ No dependencies - every import stays inside the package");

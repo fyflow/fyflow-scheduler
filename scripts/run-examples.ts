@@ -7,8 +7,12 @@
 //
 // Run: deno task examples
 
+import { fromFileUrl } from "jsr:@std/path@^1.1.2";
+
 const repoRoot = new URL("../", import.meta.url);
-const rootPath = new URL(repoRoot).pathname.replace(/^\/([A-Za-z]:)/, "$1").replace(/\/$/, "");
+// fromFileUrl, not a drive-letter regex: the hand-rolled form was correct only
+// on Windows and silently produced a broken path on Linux (see publishOutput.ts).
+const rootPath = fromFileUrl(repoRoot);
 // The slowest example takes ~12s, so this is a generous margin that still gives
 // quick feedback when one hangs
 const TIMEOUT_MS = 60_000;
