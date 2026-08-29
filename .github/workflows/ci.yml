@@ -23,7 +23,11 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          # Pinned deliberately. `v2.x` floats, so a Deno release can turn CI red
+          # with no change from us - which is exactly what happened on the first
+          # run: local 2.3.7 passed, CI resolved 2.9.6 and surfaced a real
+          # cross-runtime typing error. Bump this on purpose, not by accident.
+          deno-version: v2.9.6
 
       # `deno task check` resolves @types/node from package.json devDependencies,
       # so it fails with 'Could not find "@types/node"' unless deps are installed
@@ -118,7 +122,11 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          # Pinned deliberately. `v2.x` floats, so a Deno release can turn CI red
+          # with no change from us - which is exactly what happened on the first
+          # run: local 2.3.7 passed, CI resolved 2.9.6 and surfaced a real
+          # cross-runtime typing error. Bump this on purpose, not by accident.
+          deno-version: v2.9.6
 
       - name: Format
         continue-on-error: true
