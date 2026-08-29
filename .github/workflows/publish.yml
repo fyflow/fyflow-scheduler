@@ -79,5 +79,19 @@ jobs:
       - name: JSR smoke test
         run: deno task jsr:smoke
 
+      # `deno install` above rewrites deno.lock: the committed lockfile pins only
+      # the JSR imports, so resolving package.json's npm devDependencies appends
+      # ~477 lines. `deno publish` then aborts on the dirty tree. deno.lock is not
+      # in the publish allowlist, so it cannot affect the published artifact.
+      #
+      # Restoring just this one path - rather than passing --allow-dirty - keeps
+      # the dirty-tree check meaningful: anything ELSE unexpectedly modified
+      # still aborts the publish.
+      #
+      # Remove this once the committed lockfile includes the npm entries, at
+      # which point `deno install` is a no-op here.
+      - name: Restore lockfile
+        run: git checkout -- deno.lock
+
       - name: Publish
         run: deno publish
