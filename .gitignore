@@ -7,6 +7,12 @@
 
 TODO_CHECKLIST.md
 CLAUDE.md
+
+# Local maintenance tooling for this mirror. Not part of the library, and it
+# refuses to run on a dirty tree - so leaving it untracked rather than ignored
+# would make it block itself on every run.
+scripts/port-from-private.ts
+
 # Node.js
 node_modules/
 npm-debug.log*
