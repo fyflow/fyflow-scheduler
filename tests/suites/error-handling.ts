@@ -189,7 +189,7 @@ class ErrorHandlingTestSuite {
     try {
       await scheduler.addTask(task, { createPromise: true });
       throw new Error('Task should have failed due to worker self-termination');
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -211,7 +211,7 @@ class ErrorHandlingTestSuite {
     const scheduler = this.createScheduler({ SelfTerminatingWorker: workerManager });
 
     let workerFailedEmitted = false;
-    let workerFailedPromise = new Promise(resolve => {
+    const workerFailedPromise = new Promise(resolve => {
       workerManager.addEventListener('worker.failed', (e: any) => {
         workerFailedEmitted = true;
         resolve(e.detail);
@@ -257,7 +257,7 @@ class ErrorHandlingTestSuite {
 
     // Track task failure events (not worker failure - worker should stay healthy)
     let taskFailedEmitted = false;
-    let taskFailedPromise = new Promise(resolve => {
+    const taskFailedPromise = new Promise(resolve => {
       scheduler.addEventListener('task.failed', (e: any) => {
         taskFailedEmitted = true;
         resolve(e.detail);
@@ -274,7 +274,7 @@ class ErrorHandlingTestSuite {
     try {
       await scheduler.addTask(task, { createPromise: true });
       throw new Error('Task should have failed due to runtime error');
-    } catch (error: any) {
+    } catch {
       // Expected - task should fail
     }
 
@@ -375,7 +375,7 @@ class ErrorHandlingTestSuite {
 
     let initFailedEmitted = false;
 
-    workerManager.addEventListener('worker.initialization.failed', (e: any) => {
+    workerManager.addEventListener('worker.initialization.failed', () => {
       initFailedEmitted = true;
     });
 
@@ -388,7 +388,7 @@ class ErrorHandlingTestSuite {
     try {
       await scheduler.addTask(task, { createPromise: true });
       throw new Error('Task should have failed due to initialization failure');
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -414,7 +414,7 @@ class ErrorHandlingTestSuite {
 
     // Track worker failure events
     let workerFailedEmitted = false;
-    let workerFailedPromise = new Promise(resolve => {
+    const workerFailedPromise = new Promise(resolve => {
       workerManager.addEventListener('worker.failed', (e: any) => {
         workerFailedEmitted = true;
         resolve(e.detail);
@@ -464,7 +464,7 @@ class ErrorHandlingTestSuite {
 
     let taskRequeuedEmitted = false;
 
-    workerManager.addEventListener('task.requeue_required', (e: any) => {
+    workerManager.addEventListener('task.requeue_required', () => {
       taskRequeuedEmitted = true;
     });
 
@@ -495,7 +495,7 @@ class ErrorHandlingTestSuite {
       while (!taskRequeuedEmitted && performance.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 20));
       }
-    } catch (error: any) {
+    } catch {
       // May or may not throw depending on timing
     }
 
@@ -515,7 +515,7 @@ class ErrorHandlingTestSuite {
 
     let requeuedTasks = 0;
 
-    workerManager.addEventListener('task.requeue_required', (e: any) => {
+    workerManager.addEventListener('task.requeue_required', () => {
       requeuedTasks++;
     });
 
@@ -557,7 +557,7 @@ class ErrorHandlingTestSuite {
     try {
       scheduler.addTask(task);
       await new Promise(resolve => setTimeout(resolve, 200));
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -583,7 +583,7 @@ class ErrorHandlingTestSuite {
 
     try {
       await scheduler.addTask(task, { createPromise: true });
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -621,7 +621,7 @@ class ErrorHandlingTestSuite {
 
     try {
       await scheduler.addTask(task, { createPromise: true });
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -659,7 +659,7 @@ class ErrorHandlingTestSuite {
 
     try {
       await scheduler.addTask(task, { createPromise: true });
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -689,7 +689,7 @@ class ErrorHandlingTestSuite {
 
     try {
       await scheduler.addTask(task, { createPromise: true });
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 
@@ -726,7 +726,7 @@ class ErrorHandlingTestSuite {
 
     try {
       await scheduler.addTask(task1, { createPromise: true });
-    } catch (error: any) {
+    } catch {
       // Expected
     }
 

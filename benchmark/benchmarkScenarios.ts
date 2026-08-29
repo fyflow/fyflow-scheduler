@@ -2,7 +2,7 @@
 import { WorkerManager } from "../core/workerManager.ts";
 import { FyflowScheduler, FyflowTask } from "../core/FyflowScheduler.ts";
 import { ConcurrentLimitGroup } from "../groups/concurrentLimitGroup.ts";
-import { PerfTimer, formatBytes, formatDuration, StatisticsCollector, RuntimeUtils, type PerfMeasurement } from "./perfUtils.ts";
+import { PerfTimer, formatBytes, formatDuration, StatisticsCollector, type PerfMeasurement } from "./perfUtils.ts";
 
 export interface BenchmarkConfig {
     name: string;
@@ -203,12 +203,12 @@ export class BenchmarkRunner {
         });
 
         //add logic to monitor the number of tasks in the scheduler
-        const monitorTasks = () => {
+        const _monitorTasks = () => {
             const stats = scheduler.stats;
             console.log(`📊 Tasks in scheduler: q:${stats.queued} r:${stats.running} d:${stats.done} f:${stats.failed}`);
         };
         
-        // const montiorInterval = setInterval(monitorTasks, 1000);
+        // const monitorInterval = setInterval(_monitorTasks, 1000);
 
         // Execute benchmark
         this.timer.start('execution');

@@ -255,6 +255,7 @@ scheduler.addEventListener('scheduler.completed', (e: any) => {
         if (typeof Deno !== 'undefined') {
             Deno.exit(0);
         } else {
+            // deno-lint-ignore no-process-global -- Node fallback; the Deno branch is above
             process.exit(0);
         }
     }, 2000);

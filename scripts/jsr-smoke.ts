@@ -31,6 +31,7 @@ async function publishedFiles(): Promise<string[]> {
   const files: string[] = [];
   let collecting = false;
   for (const rawLine of output.split("\n")) {
+    // deno-lint-ignore no-control-regex -- stripping ANSI colour codes from deno publish output
     const line = rawLine.replace(/\x1b\[[0-9;]*m/g, "").trim();
     if (line.startsWith("Simulating publish")) { collecting = true; continue; }
     if (!collecting) continue;

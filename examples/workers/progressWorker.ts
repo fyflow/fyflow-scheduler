@@ -84,7 +84,7 @@ export default class ProgressWorker implements WorkerInterface {
         };
     }
 
-    private async processItem(index: number): Promise<void> {
+    private async processItem(_index: number): Promise<void> {
         // Simulate variable processing time
         const baseTime = 5;
         const variation = Math.random() * 10;

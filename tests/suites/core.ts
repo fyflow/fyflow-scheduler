@@ -61,7 +61,7 @@ class CrossPlatformTestSuite {
     }
   }
 
-  async runAllTests(exitOnComplete = true): Promise<TestSuiteResult> {
+  async runAllTests(_exitOnComplete = true): Promise<TestSuiteResult> {
 
     if (typeof Deno !== "undefined") {
       // this.testInlineWorkerUrl = new URL("../workers/testInlineWorker.ts", import.meta.url).href;

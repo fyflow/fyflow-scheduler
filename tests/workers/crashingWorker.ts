@@ -30,7 +30,7 @@ export default class CrashingWorker extends BaseWorker {
     // console.log('CrashingWorker setup completed');
   }
 
-  async run(payload: any, context?: TaskWorkerContext): Promise<any> {
+  async run(payload: any, _context?: TaskWorkerContext): Promise<any> {
     const { action } = payload;
 
     // console.log(`CrashingWorker executing action: ${action}`);
@@ -59,10 +59,11 @@ export default class CrashingWorker extends BaseWorker {
         await new Promise(resolve => setTimeout(resolve, 10));
         throw new Error('Async operation crashed');
 
-      case 'memory-leak-simulation':
+      case 'memory-leak-simulation': {
         // Simulate a memory leak scenario (not a real leak, just for testing)
-        const bigArray = new Array(100000).fill('memory-test');
+        const _bigArray = new Array(100000).fill('memory-test');
         throw new Error('Simulated memory issue after allocation');
+      }
 
       default:
         return {

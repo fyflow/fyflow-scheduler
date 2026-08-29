@@ -211,7 +211,7 @@ export class WorkerManager extends EventTarget {
       for (const {event, listener} of listeners) {
         try {
           target.removeEventListener(event, listener);
-        } catch (error) {
+        } catch {
           // Target may already be destroyed - ignore
         }
       }
@@ -283,7 +283,7 @@ export class WorkerManager extends EventTarget {
     if (this.shuttingDown) return;
 
     const { workerId, error, metadata } = e.detail;
-    const { failureType, canRestart, restartDelay } = metadata || {};
+    const { canRestart, restartDelay } = metadata || {};
     const failedWorker = this.threads.find(w => w.id === workerId);
 
     if (!failedWorker) return;
@@ -385,7 +385,7 @@ export class WorkerManager extends EventTarget {
       this.threads.splice(workerIndex, 1);
 
       if (this.threads.length < this.maxThreads) {
-        const newWorker = this._createPredictiveThread();
+        this._createPredictiveThread();
         // Pool restart count persists across worker replacements
       }
     }

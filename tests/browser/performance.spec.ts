@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-window -- `window` here is the Playwright page context (page.evaluate/waitForFunction), not the Deno global.
 import { test, expect } from '@playwright/test';
 
 /**

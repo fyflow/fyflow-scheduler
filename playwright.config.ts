@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-process-global -- Node-only Playwright config; `process.env` is the correct API here.
 import { defineConfig, devices } from '@playwright/test';
 
 /**

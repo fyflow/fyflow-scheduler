@@ -145,10 +145,8 @@ export class PerfTimer {
         // Node.js memory usage fallback
         try {
             // @ts-ignore node specific
-            // deno-lint-ignore no-process-global
             if (typeof process !== 'undefined' && process.memoryUsage) {
                 // @ts-ignore node specific
-                // deno-lint-ignore no-process-global
                 const usage = process.memoryUsage();
                 return {
                     heapUsed: usage.heapUsed,

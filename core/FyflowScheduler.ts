@@ -895,7 +895,7 @@ export class FyflowTask {
         for (const {event, listener} of listeners) {
           try {
             target.removeEventListener(event, listener);
-          } catch (error) {
+          } catch {
             // Target may already be destroyed - ignore
           }
         }

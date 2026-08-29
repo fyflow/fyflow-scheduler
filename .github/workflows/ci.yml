@@ -65,18 +65,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Must precede setup-node so `cache: pnpm` can find the store.
+      # Version comes from the packageManager field in package.json.
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
+          cache: pnpm
 
-      # Note: `npm ci` runs the prepare script, which is `npm run build`.
-      # Installation therefore also exercises the esbuild + tsc library build.
+      # Installation also runs the prepare script, so this exercises the
+      # esbuild + tsc library build as well as resolving dependencies.
       - name: Install and build
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Test
-        run: npm test
+        run: pnpm test
 
   browser:
     name: Browser (Playwright)
@@ -84,21 +88,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: pnpm
 
       - name: Install and build
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Install browsers
-        run: npx playwright install --with-deps
+        run: pnpm exec playwright install --with-deps
 
       # Serves the built files on :3000 via the webServer block in
       # playwright.config.ts; runs chromium, firefox and webkit.
       - name: Test
-        run: npm run test:browser
+        run: pnpm run test:browser
 
       - name: Upload report
         if: failure()
@@ -109,14 +115,13 @@ jobs:
           retention-days: 7
 
   quality:
-    name: Format & lint (advisory)
+    name: Lint (gating) & format (advisory)
     runs-on: ubuntu-latest
-    # ADVISORY ONLY - does not gate merges.
-    # As of 2026-08-29 `deno fmt --check` reports 64 of 67 files unformatted and
-    # `deno lint .` reports 58 problems (32 no-unused-vars, 8 no-window,
-    # 8 no-process-global, 5 prefer-const, ...). Making either blocking today
-    # would fail every run. Once the tree is clean, delete the two
-    # continue-on-error lines below and this job starts gating.
+    # Lint gates: the tree is clean as of 2026-08-29, so a new problem fails CI.
+    # Format does not: `deno fmt --check` still reports 65 of 68 files
+    # unformatted, so making it blocking would fail every run. Reformatting is a
+    # large mechanical diff that has to originate in the private repo; once it
+    # lands, delete the continue-on-error below and this gates too.
     steps:
       - uses: actions/checkout@v4
 
@@ -133,5 +138,4 @@ jobs:
         run: deno fmt --check
 
       - name: Lint
-        continue-on-error: true
         run: deno lint .

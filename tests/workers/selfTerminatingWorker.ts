@@ -3,8 +3,8 @@
 import { BaseWorker, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from '../../core/workerInterface.ts';
 
 export default class SelfTerminatingWorker extends BaseWorker {
-  private terminationTimer: number | null = null;
-  private backgroundMonitoringInterval: number | null = null;
+  private terminationTimer: ReturnType<typeof setTimeout> | null = null;
+  private backgroundMonitoringInterval: ReturnType<typeof setInterval> | null = null;
   private taskCounter = 0;
 
   constructor(config: any = {}, workerContext?: BaseWorkerContext) {

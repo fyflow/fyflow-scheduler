@@ -2,7 +2,7 @@
 // Uses parentPort from worker_threads
 
 import { parentPort, isMainThread } from 'node:worker_threads';
-import { WorkerInterface, WorkerMessage, WorkerContext, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from './workerInterface.ts';
+import { WorkerInterface, WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext } from './workerInterface.ts';
 
 if (isMainThread) {
     throw new Error('workerWrapper.node.ts should only be used in worker threads');
@@ -119,6 +119,7 @@ parentPort?.on('message', async (data: any) => {
             // Give the message time to be sent before worker terminates
             await new Promise(resolve => setTimeout(resolve, 10));
             // Gracefully exit the worker thread instead of letting exception kill it
+            // deno-lint-ignore no-process-global -- Node-only worker wrapper
             process?.exit?.(0);
         } else {
             // Regular error

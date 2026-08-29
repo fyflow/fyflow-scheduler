@@ -1,4 +1,4 @@
-import { WorkerInstanceExtensions, WorkerInstanceState, WorkerStatus, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from "./workerInterface.ts";
+import { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from "./workerInterface.ts";
 
 export class InlineWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
     runningTasks = 0;

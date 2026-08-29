@@ -2,7 +2,7 @@
 // Uncomment the line below when building for Node.js
 // import { Worker } from 'worker_threads';
 import getWorkerUrl from "./workerWrapperUrl.ts";
-import { WorkerInstanceExtensions, WorkerInstanceState, WorkerStatus, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from "./workerInterface.ts";
+import { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, WorkerTerminationError } from "./workerInterface.ts";
 
 export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
     worker: Worker | null = null;

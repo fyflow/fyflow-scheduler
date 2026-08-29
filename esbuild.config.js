@@ -1,4 +1,5 @@
 // esbuild.config.js
+// deno-lint-ignore-file no-process-global -- Node-only build script; `process` is the correct API here.
 
 import { build } from "esbuild";
 import { Buffer } from "node:buffer";
@@ -86,8 +87,8 @@ const injectWorkerImport = {
   name: "inject-worker-import",
   setup(build) {
     build.onLoad({ filter: /threadWrapper\.ts$/ }, async (args) => {
-      let fs = await import("fs/promises");
-      let source = await fs.readFile(args.path, "utf8");
+      const fs = await import("fs/promises");
+      const source = await fs.readFile(args.path, "utf8");
 
       // Prepend the import for Node.js worker_threads
       const contents = `import { Worker } from "node:worker_threads";\n${source}`;
@@ -95,6 +96,22 @@ const injectWorkerImport = {
     });
   },
 };
+
+// Rewrite .ts import/export specifiers to .js throughout a tree of .d.ts files.
+function fixFileExtensions(dir) {
+  const files = fs.readdirSync(dir, { withFileTypes: true });
+  for (const file of files) {
+    const fullPath = path.join(dir, file.name);
+    if (file.isDirectory()) {
+      fixFileExtensions(fullPath);
+    } else if (file.name.endsWith('.d.ts')) {
+      let content = fs.readFileSync(fullPath, 'utf-8');
+      content = content.replace(/from "([^"]+)\.ts"/g, 'from "$1.js"');
+      content = content.replace(/} from "([^"]+)\.ts"/g, '} from "$1.js"');
+      fs.writeFileSync(fullPath, content);
+    }
+  }
+}
 
 if (buildType === 'development') {
   console.log("🔨 Building development files...");
@@ -190,11 +207,8 @@ if (buildType === 'library') {
     fs.mkdirSync(typesDir, { recursive: true });
     fs.mkdirSync(coreTypesDir, { recursive: true });
 
-    // Read ThreadWrapper source to generate proper declaration automatically
-    const threadWrapperSource = fs.readFileSync("./core/threadWrapper.ts", 'utf-8');
-
-    // Generate ThreadWrapper declaration from actual source structure
-    // This is better than hardcoding, but we still need manual declaration due to Worker type issues
+    // Generate the ThreadWrapper declaration. Hand-written rather than derived
+    // from the source, because the Worker types do not survive the round trip.
     const threadWrapperDeclaration = `import { WorkerInstanceExtensions, WorkerInstanceState } from "./workerInterface.js";
 
 /**
@@ -253,22 +267,6 @@ export default async function getWorkerUrl(): Promise<string> {
     console.log("✓ Original workerWrapperUrl.ts restored");
 
     // Fix file extensions in all .d.ts files (change .ts to .js)
-    function fixFileExtensions(dir) {
-      const files = fs.readdirSync(dir, { withFileTypes: true });
-      for (const file of files) {
-        const fullPath = path.join(dir, file.name);
-        if (file.isDirectory()) {
-          fixFileExtensions(fullPath);
-        } else if (file.name.endsWith('.d.ts')) {
-          let content = fs.readFileSync(fullPath, 'utf-8');
-          // Replace .ts extensions with .js in import/export statements
-          content = content.replace(/from "([^"]+)\.ts"/g, 'from "$1.js"');
-          content = content.replace(/} from "([^"]+)\.ts"/g, '} from "$1.js"');
-          fs.writeFileSync(fullPath, content);
-        }
-      }
-    }
-
     fixFileExtensions(typesDir);
 
     // Add ThreadWrapper export to main index.d.ts
