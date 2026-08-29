@@ -250,13 +250,77 @@ this task plus everything it spawns (§7).
 | `inline` | `false` | `true` runs in the main process — right for async/IO, wrong for CPU-bound |
 | `config` | `{}` | First constructor argument for every worker instance |
 | `groups` | `[]` | Group ids every task in this pool must acquire |
+| `residentGroups` | `{}` | Groups held for a **worker's** lifetime — see below |
 | `idleTimeout` | `5000` | Ms before an idle worker is terminated. `0` = never |
+| `idleCheckIntervalMs` | `5000` | How often idle workers are swept |
 | `requeueFailedTasks` | `true` | Requeue in-flight tasks when a worker dies |
 | `maxWorkerRestarts` | `3` | Then `worker.restart_limit_exceeded` |
 
 Management: `getWorkerIds()`, `getWorkerStatus(id)`, `getAllWorkerStatuses()`,
 `restartWorker(id, newConfig?)`, `replaceWorker(...)` (alias),
-`updateWorkerConfig(id, config)`, `shutdown()`.
+`updateWorkerConfig(id, config)`, `getResidentUsage()`, `shutdown()`.
+
+#### `residentGroups` — resources a worker holds by existing
+
+`groups` is scoped to a **task**: acquired at dispatch, released when the task
+settles. That cannot express a resource held because the *worker* exists — a
+model loaded on a GPU in `setup()`, a connection, a licence seat. The worker
+outlives its task by `idleTimeout`, so a second pool can take the resource while
+the first still holds it, even with a correctly behaving
+`ConcurrentLimitGroup(1)`.
+
+`residentGroups` is held from worker creation to teardown, with a cost **per
+worker**:
+
+```typescript
+const vram = new ConcurrentLimitGroup(24, 'vram');
+
+// 20 of 24 units per worker - only one of these may exist at a time
+new WorkerManager(bigModelUrl, { maxThreads: 1, residentGroups: { vram: 20 } })
+
+// 2 units each; four may exist alongside each other, none alongside the big one
+new WorkerManager(smallModelUrl, { maxThreads: 4, residentGroups: { vram: 2 } })
+
+// Shorthand for a cost of 1 per worker
+new WorkerManager(url, { residentGroups: ['vram'] })
+```
+
+A worker is not created while its cost does not fit, and tasks needing one wait
+until a holder is torn down — which happens on the normal idle-timeout path, so
+a pool with work arriving keeps its worker and its loaded model. Admission is
+head-of-line: a waiting expensive pool is not overtaken by cheaper ones.
+
+Costs must be positive integers and no larger than the group's limit; both are
+rejected at construction, as is an unknown group id. Because the release is
+driven by the idle sweep, hand-over takes up to `idleTimeout + idleCheckIntervalMs`
+— lower `idleCheckIntervalMs` if that matters.
+
+##### `idleTimeout: 0` deadlocks a *contended* resident group
+
+`idleTimeout: 0` means never terminate, so such a worker never releases its
+units. This is deliberately not rejected, because it is fine whenever nothing
+else needs the group — a sole holder, or pools whose costs all fit at once.
+
+It deadlocks only under contention: once another pool needs units that a
+never-terminating worker holds, the wait can never be satisfied. The blocked
+task stays `pending` forever, and no event fires to say so.
+
+The failure is at least not disguised as success — `scheduler.completed` does
+**not** fire, because it accounts for tasks blocked on a group. But `stats`
+reads `queued=0 running=0`, since a blocked task is removed from `queued`, so
+a stalled scheduler looks idle. Check `getResourceMetrics()` for a group
+sitting at its limit with nothing progressing.
+
+Give any pool that shares a contended resident group a non-zero `idleTimeout`.
+
+##### Starvation is different, and expected
+
+A pool with work arriving continuously keeps its worker, and so keeps its
+units. A pool waiting on those units waits for the holder's backlog to drain —
+measured at ~2s behind 60 queued tasks. This resolves on its own and is the
+intended trade: holding the resource is what stops a hot model being reloaded
+between tasks. Bound it with a shorter `idleTimeout` on the busy pool if the
+wait matters more than the reload.
 
 `WorkerStatus` = `{ id, state, tasksCompleted, errorCount, uptime, currentTasks,
 resourcesHeld, lastError? }`, where `state` is

@@ -34,8 +34,15 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
       this.id = id || `concurrent-${Math.random().toString(36).substr(2, 9)}`;
     }
 
-    canRun(): boolean {
-      return this.running < this.limit;
+    /**
+     * Room for `cost` more units (default 1).
+     *
+     * Weighted callers are worker pools declaring this group in
+     * `residentGroups`: a pool whose model needs 20 of 24 units asks for 20, and
+     * is refused while four 2-unit workers hold 8.
+     */
+    canRun(_key?: string, cost: number = 1): boolean {
+      return this.running + cost <= this.limit;
     }
 
     getMetrics(): ResourceGroupMetrics {
@@ -54,12 +61,12 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
       };
     }
 
-    onStart() {
+    onStart(_key?: string, cost: number = 1) {
       // Increment running count
       // Note: May temporarily exceed limit by 1 due to race conditions when multiple
       // workers start tasks simultaneously, but this is acceptable and resolves quickly
-      this.running++;
-      this.stats.totalAcquired++;
+      this.running += cost;
+      this.stats.totalAcquired += cost;
 
       // Emit capacity exhausted if we hit/exceed limit
       if (this.running >= this.limit) {
@@ -69,10 +76,10 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
       }
     }
 
-    onFinish() {
+    onFinish(_key?: string, cost: number = 1) {
       const wasAtLimit = this.running >= this.limit;
-      this.running = Math.max(0, this.running - 1);
-      this.stats.totalReleased++;
+      this.running = Math.max(0, this.running - cost);
+      this.stats.totalReleased += cost;
 
       // Emit slot-released event if we were at limit and now have capacity
       if (wasAtLimit && this.canRun()) {

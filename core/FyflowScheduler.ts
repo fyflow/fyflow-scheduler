@@ -215,8 +215,49 @@ export class FyflowTask {
         this.readyQueuesByWorker.set(workerType, []);
       }
 
+      // Pools are constructed with group ids; only the scheduler owns the
+      // objects. Binding here also validates resident costs against their
+      // group's limit, so an impossible pool throws at construction.
+      for (const pool of Object.values(workerPools) as any[]) {
+        pool?._bindResidentGroups?.(this.groups);
+      }
+
       this._setupWorkerPoolListeners();
       this._setupGroupEventListeners();
+    }
+
+    /** True when no existing worker in the pool could take another task. */
+    private _needsNewWorker(pool: any): boolean {
+      return !pool.threads?.some((t: any) => t.canAcceptTask && t.canAcceptTask());
+    }
+
+    /** Resident groups a pool holds per worker, as {@link _groupsForTask} entries. */
+    private _residentGroupsForPool(pool: any): Array<{ id: string; group: any; cost: number }> {
+      const declared: Record<string, number> = pool?.residentGroups || {};
+      return Object.entries(declared)
+        .map(([id, cost]) => ({ id, group: this.groups[id], cost }))
+        .filter(entry => entry.group);
+    }
+
+    /**
+     * Block `task` when dispatching it would mean creating a worker its pool has
+     * no resident capacity for.
+     *
+     * Only consulted on the create-a-worker path: a task landing on a worker
+     * that already exists costs nothing extra, because the cost is per worker.
+     */
+    private _checkAndBlockResident(task: FyflowTask, pool: any): true | 'blocked' {
+      const entries = this._residentGroupsForPool(pool);
+      if (entries.length === 0) return true;
+      if (pool.canHoldAnotherWorker?.() !== false) return true;
+
+      // Queue against the first group without room. Its release wakes the task.
+      const short = entries.find(({ group, cost }) => !group.canRun(undefined, cost));
+      const queueId = this._blockedQueueId(short ? short.id : entries[0].id);
+      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, []);
+      const queue = this.blockedQueues.get(queueId)!;
+      if (!queue.includes(task)) queue.push(task);
+      return 'blocked';
     }
 
     /** Every resource group a task must acquire: its own plus its pool's. */
@@ -537,6 +578,11 @@ export class FyflowTask {
         if (resourceResult !== true) {
           return resourceResult;
         }
+        // This dispatch creates a worker, so its resident cost has to fit too
+        const residentResult = this._checkAndBlockResident(task, pool);
+        if (residentResult !== true) {
+          return residentResult;
+        }
         // Resources available - can create thread and dispatch
         return true;
       }
@@ -800,6 +846,16 @@ export class FyflowTask {
 
         const pool = this.workerPools[task.workerType];
         if (!pool) continue;
+
+        // Head-of-line admission for resident groups. If this task would need a
+        // new worker and its pool's cost does not fit, stop scanning: nothing
+        // behind it may overtake. Letting cheaper tasks through instead starves
+        // an expensive pool indefinitely - a stream of 2-unit workers can keep a
+        // 20-unit worker out of a 24-unit group forever.
+        if (this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false) {
+          blockedTasks.unshift(task);
+          break;
+        }
 
         const entries = this._groupsForTask(task, pool);
         const keys = task._resourceKeys ?? {};

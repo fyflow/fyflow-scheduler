@@ -129,6 +129,7 @@ if (buildType === 'development') {
       "tests/suites/spawning.ts",
       "tests/suites/settlement.ts",
       "tests/suites/docs.ts",
+      "tests/suites/resident-groups.ts",
       "tests/performance/contention-scaling.ts",
       "benchmark/runBenchmarks.ts"
     ],

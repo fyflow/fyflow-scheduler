@@ -23,6 +23,15 @@ export interface WorkerManagerOptions {
   /** Ms an idle worker is kept before termination. Default 5000. `0` never terminates. */
   idleTimeout?: number;
   /**
+   * How often idle workers are swept for termination, in ms. Default 5000.
+   *
+   * This is a floor on how promptly a worker actually goes away, independent of
+   * `idleTimeout` - an `idleTimeout` of 50ms still means up to a 5s wait on the
+   * default sweep. That matters for {@link WorkerManagerOptions.residentGroups},
+   * where the sweep is what hands a held resource to a pool waiting for it.
+   */
+  idleCheckIntervalMs?: number;
+  /**
    * Run workers in the main process instead of worker threads. Default false.
    * Inline suits async/IO work; threaded suits CPU-bound work, since an inline
    * worker shares the event loop and a synchronous task blocks the scheduler.
@@ -44,6 +53,26 @@ export interface WorkerManagerOptions {
   config?: any;
   /** Resource group ids every task in this pool must acquire before running. */
   groups?: string[];
+  /**
+   * Groups held for a **worker's whole lifetime**, from creation until teardown,
+   * rather than for the duration of a task.
+   *
+   * For resources a worker holds because it exists - a model loaded on a GPU in
+   * `setup()`, a database connection, a licence seat. A task-scoped group cannot
+   * express these: it is released when the task settles, while the worker lives
+   * on until its idle timeout, so a second worker can take the resource while
+   * the first still holds it.
+   *
+   * ```typescript
+   * residentGroups: ['vram']       // one unit per worker
+   * residentGroups: { vram: 20 }   // this pool's model needs 20 units per worker
+   * ```
+   *
+   * Cost is per worker, not per pool: `maxThreads: 4` with `{ vram: 2 }` uses 8
+   * units at full spread. A worker is not created while its cost does not fit,
+   * and tasks needing one wait until a holder is torn down.
+   */
+  residentGroups?: string[] | Record<string, number>;
   /** Requeue a worker's in-flight tasks when it fails, rather than failing them. Default true. */
   requeueFailedTasks?: boolean;
   /** Restarts allowed before the pool gives up and emits `worker.restart_limit_exceeded`. Default 3. */
@@ -98,9 +127,122 @@ export class WorkerManager extends EventTarget {
   // Track initializing threads
   private initializingThreads = new Set<WorkerInstance>();
 
+  /** Group id -> units one worker of this pool holds while it exists. */
+  residentGroups: Record<string, number>;
+  /**
+   * The group objects behind {@link residentGroups}, injected by the scheduler -
+   * pools are constructed with ids, and only the scheduler owns the registry.
+   * Empty until then, which makes resident groups inert for a standalone pool.
+   */
+  private residentRegistry: Record<string, any> = {};
+  /**
+   * Ids of workers whose resident cost this pool holds. Keyed by worker rather
+   * than counted, so releasing is idempotent: a failed worker is released by
+   * `_releaseWorkerGroupResources` while it is still in `threads`, and must not
+   * be released a second time if the idle sweep also reaches it.
+   */
+  private residentHolders = new Set<string>();
+  /** Acquired, but the worker object does not exist yet. Same synchronous turn. */
+  private residentPending = 0;
+
+  private static _normalizeResidentGroups(
+    declared: string[] | Record<string, number> | undefined
+  ): Record<string, number> {
+    if (!declared) return {};
+    const costs: Record<string, number> = Array.isArray(declared)
+      ? Object.fromEntries(declared.map(id => [id, 1]))
+      : { ...declared };
+    for (const [id, cost] of Object.entries(costs)) {
+      if (!Number.isInteger(cost) || cost <= 0) {
+        throw new Error(
+          `residentGroups['${id}'] must be a positive integer, got ${cost}`
+        );
+      }
+    }
+    return costs;
+  }
+
+  /**
+   * Called by the scheduler once, with the group registry. Also the point where
+   * a cost larger than its group's limit is rejected: such a pool could never
+   * start a worker, and failing here beats blocking forever at runtime.
+   */
+  _bindResidentGroups(registry: Record<string, any>) {
+    for (const [id, cost] of Object.entries(this.residentGroups)) {
+      const group = registry[id];
+      if (!group) throw new Error(`Unknown resident group: ${id}`);
+      const limit = group.getMetrics?.().limit;
+      if (typeof limit === 'number' && cost > limit) {
+        throw new Error(
+          `residentGroups['${id}'] cost ${cost} exceeds the group limit of ${limit} - ` +
+          `a worker in this pool could never start`
+        );
+      }
+    }
+    this.residentRegistry = registry;
+  }
+
+  /** True when every resident group has room for one more worker of this pool. */
+  canHoldAnotherWorker(): boolean {
+    return Object.entries(this.residentGroups).every(([id, cost]) => {
+      const group = this.residentRegistry[id];
+      return !group || group.canRun(undefined, cost);
+    });
+  }
+
+  /**
+   * Take one worker's resident cost from every group, or nothing at all.
+   * Synchronous, and called in the same turn as the capacity check, so no other
+   * pool can interleave between the two.
+   */
+  private _acquireResident(): boolean {
+    if (!this.canHoldAnotherWorker()) return false;
+    for (const [id, cost] of Object.entries(this.residentGroups)) {
+      this.residentRegistry[id]?.onStart?.(undefined, cost);
+    }
+    this.residentPending++;
+    return true;
+  }
+
+  /** Attach a just-acquired holding to the worker it was taken for. */
+  private _bindResidentHolder(workerId: string) {
+    if (this.residentPending === 0) return;
+    this.residentPending--;
+    this.residentHolders.add(workerId);
+  }
+
+  /** Give back one worker's resident cost. No-op if it holds none. */
+  private _releaseResidentFor(workerId: string) {
+    if (!this.residentHolders.delete(workerId)) return;
+    for (const [id, cost] of Object.entries(this.residentGroups)) {
+      this.residentRegistry[id]?.onFinish?.(undefined, cost);
+    }
+  }
+
+  /** Give everything back, holders and any unbound acquisition. */
+  private _releaseAllResident() {
+    for (const workerId of [...this.residentHolders]) this._releaseResidentFor(workerId);
+    while (this.residentPending > 0) {
+      this.residentPending--;
+      for (const [id, cost] of Object.entries(this.residentGroups)) {
+        this.residentRegistry[id]?.onFinish?.(undefined, cost);
+      }
+    }
+  }
+
+  /** Units this pool currently holds in each resident group. Test/diagnostic. */
+  getResidentUsage(): Record<string, number> {
+    const held = this.residentHolders.size + this.residentPending;
+    const usage: Record<string, number> = {};
+    for (const [id, cost] of Object.entries(this.residentGroups)) {
+      usage[id] = cost * held;
+    }
+    return usage;
+  }
+
   // Centralized idle management
   private idleCheckTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly IDLE_CHECK_INTERVAL = 5000; // Check every 5 seconds
+  private readonly idleCheckIntervalMs: number;
 
   constructor(scriptUrl: string, options: WorkerManagerOptions = {}) {
     super();
@@ -108,9 +250,11 @@ export class WorkerManager extends EventTarget {
     this.maxThreads = options.maxThreads ?? 2;
     this.maxConcurrentTasks = options.maxConcurrentTasks ?? 1;
     this.idleTimeout = options.idleTimeout ?? 5000;
+    this.idleCheckIntervalMs = options.idleCheckIntervalMs ?? 5000;
     this.inline = options.inline ?? false;
     this.config = options.config ?? {};
     this.groups = options.groups ?? [];
+    this.residentGroups = WorkerManager._normalizeResidentGroups(options.residentGroups);
     this.requeueFailedTasks = options.requeueFailedTasks ?? true; // Default to requeue as specified
     this.maxWorkerRestarts = options.maxWorkerRestarts ?? 3; // Default: 3 restarts per worker
 
@@ -127,10 +271,13 @@ export class WorkerManager extends EventTarget {
 
     // If no available thread, create one if under limit
     // Note: initializingThreads tracks threads being created to prevent race conditions
-    if (!targetThread && (this.threads.length + this.initializingThreads.size) < this.maxThreads) {
+    if (!targetThread && (this.threads.length + this.initializingThreads.size) < this.maxThreads
+        && this._acquireResident()) {
       const newThread = this.inline
         ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config)
         : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config);
+
+      this._bindResidentHolder(newThread.id);
 
       // Track as initializing to prevent other tasks from creating duplicate threads
       this.initializingThreads.add(newThread);
@@ -164,6 +311,9 @@ export class WorkerManager extends EventTarget {
     }
 
     if (!targetThread) {
+      // Also the path taken when a resident group had no room for another
+      // worker. The scheduler blocks such tasks before dispatch, so reaching
+      // here means capacity went away in between - requeue rather than fail.
       throw new Error(`No worker thread available (${this.threads.length}/${this.maxThreads})`);
     }
 
@@ -171,10 +321,15 @@ export class WorkerManager extends EventTarget {
     return targetThread.runTask(taskId, payload);
   }
 
-  private _createPredictiveThread(): WorkerInstance {
+  private _createPredictiveThread(): WorkerInstance | null {
+    // A replacement worker still has to fit in the resident groups.
+    if (!this._acquireResident()) return null;
+
     const thread = this.inline
       ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config)
       : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config);
+
+    this._bindResidentHolder(thread.id);
 
     // Set up event listeners first
     this._setupWorkerEventListeners(thread);
@@ -368,14 +523,9 @@ export class WorkerManager extends EventTarget {
   }
 
   private _releaseWorkerGroupResources(workerId: string) {
-    // Release any group resources (CPU slots, etc.) immediately
-    // Worker failure shouldn't block group resources for other workers
-    const worker = this.threads.find(w => w.id === workerId);
-    if (worker) {
-      // Release CPU slots, group constraints, etc.
-      // (Implementation depends on existing resource management)
-      // For now, this is a placeholder - actual implementation would coordinate with groups
-    }
+    // A dead worker holds nothing. Its resident units must come back or the
+    // group leaks capacity permanently and every pool sharing it stalls.
+    this._releaseResidentFor(workerId);
   }
 
   private _removeAndReplaceWorker(workerId: string) {
@@ -492,7 +642,7 @@ export class WorkerManager extends EventTarget {
 
     this.idleCheckTimer = setInterval(() => {
       this.checkIdleWorkers();
-    }, this.IDLE_CHECK_INTERVAL);
+    }, this.idleCheckIntervalMs);
   }
 
   private stopIdleTimer(): void {
@@ -532,6 +682,9 @@ export class WorkerManager extends EventTarget {
 
     // Remove from threads array
     this.threads.splice(workerIndex, 1);
+    // The model this worker loaded is gone with it - hand back its units so a
+    // pool waiting on the group can start.
+    this._releaseResidentFor(worker.id);
 
     // Terminate the worker
     try {
@@ -582,6 +735,7 @@ export class WorkerManager extends EventTarget {
 
     await Promise.all(shutdownPromises);
     this.threads = [];
+    this._releaseAllResident();
 
     // Remove ALL event listeners to prevent process hanging
     this._removeAllListeners();

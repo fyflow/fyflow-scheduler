@@ -39,8 +39,21 @@ export interface ResourceGroup extends EventTarget {
    * Capacity check (synchronous). `key` is supplied only for keyed groups; a
    * keyed group called without one reports whether ANY key has capacity, which
    * the scheduler uses as a cheap pre-filter.
+   *
+   * `cost` is how many units the caller intends to take, defaulting to 1. Only
+   * concurrency groups weigh it - see {@link ResourceGroup.onStart}.
    */
-  canRun(key?: string): boolean;
+  canRun(key?: string, cost?: number): boolean;
+
+  /**
+   * Take `cost` units (default 1). Called synchronously at the moment the
+   * scheduler commits to running a task, or to creating a worker that declares
+   * the group in `residentGroups`.
+   */
+  onStart?(key?: string, cost?: number): void;
+
+  /** Return `cost` units (default 1). Must mirror the matching `onStart`. */
+  onFinish?(key?: string, cost?: number): void;
 
   // Get current metrics
   getMetrics(): ResourceGroupMetrics;

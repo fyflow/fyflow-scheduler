@@ -76,6 +76,9 @@ class TestRunner {
       // Run task settlement tests
       await this.runSuite('Settlement', `./suites/settlement${ext}`);
 
+      // Run resident (worker-lifetime) resource group tests
+      await this.runSuite('Resident Groups', `./suites/resident-groups${ext}`);
+
       // Run the executable documentation examples
       await this.runSuite('Documentation Examples', `./suites/docs${ext}`);
 
@@ -97,6 +100,8 @@ class TestRunner {
       'spawning': `./suites/spawning${ext}`,
       'settlement': `./suites/settlement${ext}`,
       'docs': `./suites/docs${ext}`,
+      'resident': `./suites/resident-groups${ext}`,
+      'resident-groups': `./suites/resident-groups${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
 
@@ -134,6 +139,7 @@ async function main() {
     console.log('  spawning    - Task spawning and descendant tracking tests');
     console.log('  settlement  - Task settlement and failure accounting tests');
     console.log('  docs        - Executable documentation examples');
+    console.log('  resident    - Resident (worker-lifetime) resource groups');
     console.log('  performance - Performance tests');
     console.log('');
     console.log('Browser testing:');
