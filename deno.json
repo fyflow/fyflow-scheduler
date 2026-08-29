@@ -19,6 +19,7 @@
         "!groups/rateLimitGroup.ts",
         "!groups/keyedRateLimitGroup.ts",
         "!README.md",
+        "!LICENSE",
         ".claude",
         ".vscode",
         ".github"

@@ -1,0 +1,83 @@
+name: Publish
+
+# Tag-triggered publish to JSR.
+#
+# Requires, one time, on jsr.io: the @fyflow scope to exist, the
+# @fyflow/scheduler package to be created in it, and that package linked to the
+# fyflow/fyflow-scheduler GitHub repository. The link is what makes the OIDC
+# token below sufficient - no token or secret is stored here.
+#
+# npm is NOT published from here. The npm package ships the esbuild bundles and
+# needs an NPM_TOKEN; adding it is a separate decision.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for JSR's OIDC publish
+
+jobs:
+  publish:
+    name: Publish to JSR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          # Keep in step with ci.yml. See the note there on why this is pinned.
+          deno-version: v2.9.6
+
+      - name: Install dependencies
+        run: deno install
+
+      # A JSR version is immutable once published - it cannot be replaced or
+      # unpublished. Everything below therefore runs before `deno publish`,
+      # rather than trusting that CI was green on this SHA.
+
+      - name: Check versions agree
+        run: |
+          DENO_VERSION=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('deno.json')).version)")
+          NPM_VERSION=$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('package.json')).version)")
+
+          echo "deno.json:    $DENO_VERSION"
+          echo "package.json: $NPM_VERSION"
+
+          if [ "$DENO_VERSION" != "$NPM_VERSION" ]; then
+            echo "::error::deno.json ($DENO_VERSION) and package.json ($NPM_VERSION) disagree. They are published as two separately-named packages and must stay in step."
+            exit 1
+          fi
+
+          # Only enforce the tag on a tag push; workflow_dispatch has no tag.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "tag:          $TAG_VERSION"
+            if [ "$TAG_VERSION" != "$DENO_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match deno.json version $DENO_VERSION. Bump the manifests or retag."
+              exit 1
+            fi
+          fi
+
+      - name: Type check
+        run: deno task check
+
+      - name: Lint
+        run: deno lint .
+
+      - name: Test
+        run: deno task test
+
+      - name: Test scripts
+        run: deno task test:scripts
+
+      # Runs a real threaded worker against only the files that would ship, and
+      # asserts the package has no dependencies and no Node-specific files.
+      # This is the check that catches core/workerWrapper.ts going missing -
+      # it is absent from the module graph, so `publish` alone cannot see it.
+      - name: JSR smoke test
+        run: deno task jsr:smoke
+
+      - name: Publish
+        run: deno publish
