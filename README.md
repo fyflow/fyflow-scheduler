@@ -67,6 +67,7 @@ is resolved - it differs between Deno, Node and the browser.
 
 - **Parallel Task Execution**: High-performance concurrent task processing
 - **Resource Management**: Named concurrency and rate-limit groups applied per pool or per task
+- **Resident Resources**: Groups held for a worker's lifetime, with per-worker costs - for a model on a GPU, a connection, a licence seat
 - **Dynamic Task Spawning**: Workers can create new tasks at runtime
 - **Cross-Platform**: Node.js, Browser, and Deno support
 - **Worker Pools**: Thread-based and inline execution modes
@@ -183,6 +184,59 @@ const gpuWorkerPool = new WorkerManager('./gpu-worker.js', {
 });
 ```
 
+### Resident Groups
+
+`groups` is scoped to a **task** - taken at dispatch, released when the task
+settles. That cannot bound a resource the **worker** holds simply by existing,
+like a model loaded in `setup()`. The worker outlives its task by the idle
+timeout, so a second pool can load a second model onto a full GPU even with a
+`ConcurrentLimitGroup(1)` behaving perfectly correctly.
+
+`residentGroups` is held from worker creation to teardown, with a cost **per
+worker**:
+
+```typescript
+const vram = new ConcurrentLimitGroup(24, 'vram');   // 24GB of VRAM
+
+// A 20GB model - only one such worker fits
+const big = new WorkerManager('./llama-worker.js', {
+  maxThreads: 1,
+  residentGroups: { vram: 20 },
+  idleTimeout: 2000            // how long it keeps the GPU after its last task
+});
+
+// 2GB models - several coexist, but not alongside the big one
+const embed = new WorkerManager('./embed-worker.js', {
+  maxThreads: 4,
+  residentGroups: { vram: 2 }
+});
+
+// Array form is shorthand for a cost of 1 per worker
+const one = new WorkerManager('./worker.js', { residentGroups: ['gpu'] });
+
+const scheduler = new FyflowScheduler({ Big: big, Embed: embed }, { vram });
+```
+
+A worker is not created while its cost does not fit, and tasks needing one wait
+until a holder is torn down. Release happens on the ordinary idle-timeout path,
+so a pool with work still arriving keeps its worker and its loaded model -
+avoiding a reload is usually worth more than the wait. Admission is
+head-of-line, so an expensive pool is not starved by cheaper ones queued behind
+it.
+
+Costs must be positive integers no larger than the group's limit, and the group
+must exist; all three are rejected at construction.
+
+> **`idleTimeout: 0` never releases.** That is fine when nothing else needs the
+> group, but under contention it is a permanent deadlock - the waiting task
+> stays `pending` forever. `scheduler.completed` correctly does not fire, but
+> `stats` shows `queued=0 running=0` because blocked tasks leave the queued
+> count, so a stalled scheduler looks idle; check `getResourceMetrics()` for a
+> group pinned at its limit. Give any pool sharing a contended resident group a
+> non-zero `idleTimeout`.
+
+See `examples/resident-groups.ts` for a runnable walkthrough.
+
 ### Event Monitoring
 
 ```typescript
@@ -236,9 +290,13 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   for throughput — the split controls how much per-instance state (connections,
   caches) is duplicated
 - `maxConcurrentTasks`: Tasks per instance
-- `groups`: Resource group names
+- `groups`: Resource group names, acquired per **task**
+- `residentGroups`: Groups held for a **worker's** lifetime, `string[]` (cost 1
+  each) or `Record<string, number>` for weighted costs. Per worker, not per pool
 - `inline`: Use inline execution (default: false)
 - `idleTimeout`: Ms before an idle worker is terminated (0 = never, default 5000)
+- `idleCheckIntervalMs`: How often idle workers are swept (default 5000). This is
+  the floor on how promptly a resident group is handed over
 
 **ConcurrentLimitGroup(limit, id?)**
 - Resource constraint with a concurrent execution limit. Optimistic: may briefly
@@ -266,6 +324,7 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `restartWorker(id, newConfig?)` / `replaceWorker(...)`: terminate and rebuild a
   worker, optionally with new config. The replacement gets a new id
 - `updateWorkerConfig(id, config)`: merge config into a live worker
+- `getResidentUsage()`: units this pool currently holds in each resident group
 - `shutdown()`: terminate the pool
 
 **Worker self-termination** — a worker can ask to be torn down, e.g. after
@@ -394,6 +453,7 @@ See the `examples/` directory for comprehensive usage examples:
 - `enhanced-features.ts`: Progress reporting, dynamic task spawning and `onCompleteDescendants()`
 - `worker-types.ts`: Thread vs inline worker comparison
 - `performance-groups.ts`: Resource management, rate limits and constraints
+- `resident-groups.ts`: Worker-lifetime resources and weighted per-worker costs
 - `monitor-resource-health.ts`: Drop-in resource health monitor helper
 - `deno-only/minimal.ts`: The plain Deno form - a worker URL with no build step
   and none of this repo's bundler convention

@@ -1,6 +1,6 @@
 {
   "name": "fyflow-scheduler",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Parallel task scheduler with resource management, worker pools, and cross-platform support",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
