@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deno:
+    name: Deno — typecheck, tests, JSR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # `deno task check` resolves @types/node from package.json devDependencies,
+      # so it fails with 'Could not find "@types/node"' unless deps are installed
+      # first. This is the whole reason for the step - do not drop it.
+      - name: Install dependencies
+        run: deno install
+
+      - name: Type check
+        run: deno task check
+
+      - name: Test (core, error handling, spawning, settlement, docs)
+        run: deno task test
+
+      # Publishability gate. Catches config regressions - a missing name field,
+      # a query-suffixed specifier in the module graph, newly introduced slow
+      # types - before they reach a release tag.
+      - name: JSR publish dry run
+        run: deno publish --dry-run --allow-dirty
+
+      # Stronger than the dry run: stages only the files that would actually be
+      # published and runs a real threaded worker against them. core/workerWrapper.ts
+      # is reached via new URL(), not an import, so it is absent from the module
+      # graph - the dry run would pass with it missing and every consumer would
+      # fail on their first threaded task. This is the check that catches that.
+      - name: JSR smoke test
+        run: deno task jsr:smoke
+
+  node:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # Note: `npm ci` runs the prepare script, which is `npm run build`.
+      # Installation therefore also exercises the esbuild + tsc library build.
+      - name: Install and build
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+  browser:
+    name: Browser (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install and build
+        run: npm ci
+
+      - name: Install browsers
+        run: npx playwright install --with-deps
+
+      # Serves the built files on :3000 via the webServer block in
+      # playwright.config.ts; runs chromium, firefox and webkit.
+      - name: Test
+        run: npm run test:browser
+
+      - name: Upload report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  quality:
+    name: Format & lint (advisory)
+    runs-on: ubuntu-latest
+    # ADVISORY ONLY - does not gate merges.
+    # As of 2026-08-29 `deno fmt --check` reports 64 of 67 files unformatted and
+    # `deno lint .` reports 58 problems (32 no-unused-vars, 8 no-window,
+    # 8 no-process-global, 5 prefer-const, ...). Making either blocking today
+    # would fail every run. Once the tree is clean, delete the two
+    # continue-on-error lines below and this job starts gating.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Format
+        continue-on-error: true
+        run: deno fmt --check
+
+      - name: Lint
+        continue-on-error: true
+        run: deno lint .
