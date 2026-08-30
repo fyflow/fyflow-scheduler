@@ -14,7 +14,29 @@ export { RateLimitGroup } from "./groups/rateLimitGroup.ts";
 export type { RateWindow } from "./groups/rateLimitGroup.ts";
 export { KeyedRateLimitGroup } from "./groups/keyedRateLimitGroup.ts";
 export type { KeyedRateLimitGroupOptions, KeyedTaskLike } from "./groups/keyedRateLimitGroup.ts";
-export type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from "./groups/resourceGroup.ts";
+export type {
+  ResourceGroup,
+  ResourceGroupMetrics,
+  ResourceGroupStats,
+  GaugeKind,
+  GaugeSpec,
+  GaugeReading,
+  GaugeDescription
+} from "./groups/resourceGroup.ts";
+
+// Resource events (scheduler-only - a WorkerManager never dispatches these)
+export type {
+  ResourceLifetime,
+  HolderKind,
+  ResourceReleaseReason,
+  ResourceUnblockReason,
+  ResourceEventDetail,
+  ResourceAcquiredDetail,
+  ResourceReleasedDetail,
+  ResourceBlockedDetail,
+  ResourceUnblockedDetail,
+  AdmissionWaiter
+} from "./core/resourceEvents.ts";
 
 // Worker management
 export { WorkerManager } from "./core/workerManager.ts";

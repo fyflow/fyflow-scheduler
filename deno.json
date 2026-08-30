@@ -1,6 +1,6 @@
 {
     "name": "@fyflow/scheduler",
-    "version": "0.2.1",
+    "version": "0.3.0",
     "license": "MIT",
     "exports": "./index.ts",
     "publish": {
@@ -12,6 +12,7 @@
         "!core/threadWrapper.ts",
         "!core/inlineWrapper.ts",
         "!core/workerInterface.ts",
+        "!core/resourceEvents.ts",
         "!core/workerWrapperUrl.ts",
         "!core/workerWrapper.ts",
         "!groups/resourceGroup.ts",
@@ -53,6 +54,7 @@
       "test:settlement": "deno run --allow-read --allow-net tests/runner.ts settlement",
       "test:docs": "deno run --allow-read --allow-net tests/runner.ts docs",
       "test:resident": "deno run --allow-read --allow-net tests/runner.ts resident",
+      "test:events": "deno run --allow-read --allow-net tests/runner.ts events",
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
       "test:scripts": "deno test scripts/",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",

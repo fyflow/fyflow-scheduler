@@ -1,6 +1,6 @@
 {
   "name": "fyflow-scheduler",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Parallel task scheduler with resource management, worker pools, and cross-platform support",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
@@ -17,6 +17,8 @@
     "test:spawning": "npm run build:dev && node dev-dist/node/tests/runner.js spawning",
     "test:settlement": "npm run build:dev && node dev-dist/node/tests/runner.js settlement",
     "test:docs": "npm run build:dev && node dev-dist/node/tests/runner.js docs",
+    "test:resident": "npm run build:dev && node dev-dist/node/tests/runner.js resident",
+    "test:events": "npm run build:dev && node dev-dist/node/tests/runner.js events",
     "test:performance": "npm run build:dev && node dev-dist/node/tests/runner.js performance",
     "test:deno": "deno task test",
     "test:deno:core": "deno task test:core",

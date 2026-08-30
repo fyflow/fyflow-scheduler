@@ -79,6 +79,9 @@ class TestRunner {
       // Run resident (worker-lifetime) resource group tests
       await this.runSuite('Resident Groups', `./suites/resident-groups${ext}`);
 
+      // Run resource event tests
+      await this.runSuite('Resource Events', `./suites/resource-events${ext}`);
+
       // Run the executable documentation examples
       await this.runSuite('Documentation Examples', `./suites/docs${ext}`);
 
@@ -102,6 +105,8 @@ class TestRunner {
       'docs': `./suites/docs${ext}`,
       'resident': `./suites/resident-groups${ext}`,
       'resident-groups': `./suites/resident-groups${ext}`,
+      'events': `./suites/resource-events${ext}`,
+      'resource-events': `./suites/resource-events${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
 

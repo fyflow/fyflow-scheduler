@@ -4,6 +4,26 @@ import { WorkerStatus } from "./workerInterface.ts";
 
 type WorkerInstance = ThreadWrapper | InlineWrapper;
 
+/**
+ * A resident holding taken or returned by a pool.
+ *
+ * The pool reports it; the **scheduler** turns it into a `resource.*` event and
+ * is the sole emitter. See `core/resourceEvents.ts` for why a pool-level mirror
+ * would be a double count rather than a convenience.
+ */
+export type ResidentResourceNotice =
+  | { type: 'acquired'; workerId: string; groupId: string; cost: number }
+  | {
+      type: 'released';
+      workerId: string;
+      groupId: string;
+      cost: number;
+      reason: 'worker-teardown' | 'shutdown';
+    };
+
+/** Injected by the scheduler at {@link WorkerManager._bindResidentGroups}. */
+export type ResidentResourceNotifier = (notice: ResidentResourceNotice) => void;
+
 export interface WorkerManagerOptions {
   /**
    * Maximum worker instances in this pool. Default 2.
@@ -144,6 +164,11 @@ export class WorkerManager extends EventTarget {
   private residentHolders = new Set<string>();
   /** Acquired, but the worker object does not exist yet. Same synchronous turn. */
   private residentPending = 0;
+  /**
+   * Injected alongside the registry. Undefined for a standalone pool, and for
+   * one the scheduler bound before this existed.
+   */
+  private residentNotify?: ResidentResourceNotifier;
 
   private static _normalizeResidentGroups(
     declared: string[] | Record<string, number> | undefined
@@ -167,7 +192,7 @@ export class WorkerManager extends EventTarget {
    * a cost larger than its group's limit is rejected: such a pool could never
    * start a worker, and failing here beats blocking forever at runtime.
    */
-  _bindResidentGroups(registry: Record<string, any>) {
+  _bindResidentGroups(registry: Record<string, any>, notify?: ResidentResourceNotifier) {
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       const group = registry[id];
       if (!group) throw new Error(`Unknown resident group: ${id}`);
@@ -180,6 +205,7 @@ export class WorkerManager extends EventTarget {
       }
     }
     this.residentRegistry = registry;
+    this.residentNotify = notify;
   }
 
   /** True when every resident group has room for one more worker of this pool. */
@@ -204,24 +230,49 @@ export class WorkerManager extends EventTarget {
     return true;
   }
 
-  /** Attach a just-acquired holding to the worker it was taken for. */
+  /**
+   * Attach a just-acquired holding to the worker it was taken for.
+   *
+   * Also where the acquire is announced, rather than in
+   * {@link _acquireResident}: the worker id does not exist yet at acquire time,
+   * and both call sites bind in the same synchronous turn. A holding that is
+   * acquired and never bound is a bug, not a state worth modelling.
+   */
   private _bindResidentHolder(workerId: string) {
     if (this.residentPending === 0) return;
     this.residentPending--;
     this.residentHolders.add(workerId);
+
+    if (!this.residentNotify) return;
+    for (const [id, cost] of Object.entries(this.residentGroups)) {
+      // Only groups the registry actually knows were charged by _acquireResident
+      if (this.residentRegistry[id]) {
+        this.residentNotify({ type: 'acquired', workerId, groupId: id, cost });
+      }
+    }
   }
 
   /** Give back one worker's resident cost. No-op if it holds none. */
-  private _releaseResidentFor(workerId: string) {
+  private _releaseResidentFor(
+    workerId: string,
+    reason: 'worker-teardown' | 'shutdown' = 'worker-teardown'
+  ) {
     if (!this.residentHolders.delete(workerId)) return;
     for (const [id, cost] of Object.entries(this.residentGroups)) {
-      this.residentRegistry[id]?.onFinish?.(undefined, cost);
+      const group = this.residentRegistry[id];
+      if (!group) continue;
+      group.onFinish?.(undefined, cost);
+      this.residentNotify?.({ type: 'released', workerId, groupId: id, cost, reason });
     }
   }
 
   /** Give everything back, holders and any unbound acquisition. */
   private _releaseAllResident() {
-    for (const workerId of [...this.residentHolders]) this._releaseResidentFor(workerId);
+    for (const workerId of [...this.residentHolders]) {
+      this._releaseResidentFor(workerId, 'shutdown');
+    }
+    // An unbound acquisition never announced itself - emitting a release for it
+    // would leave the fold one release ahead of its acquires forever
     while (this.residentPending > 0) {
       this.residentPending--;
       for (const [id, cost] of Object.entries(this.residentGroups)) {

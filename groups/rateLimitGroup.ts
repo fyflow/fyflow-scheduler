@@ -1,4 +1,10 @@
-import type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from './resourceGroup.ts';
+import type {
+  GaugeDescription,
+  GaugeReading,
+  ResourceGroup,
+  ResourceGroupMetrics,
+  ResourceGroupStats
+} from './resourceGroup.ts';
 
 /** Per-window view returned by {@link RateLimitGroup.getStatus}. */
 export interface RateWindowStatus {
@@ -142,6 +148,59 @@ export class RateLimitGroup extends EventTarget implements ResourceGroup {
   }
 
   /**
+   * One `window` gauge per configured window, because this group enforces all
+   * of them together and a single bar would be a lie.
+   */
+  describe(): GaugeDescription {
+    return {
+      gauges: this.windows.map((window, index) => ({
+        id: `window-${index}`,
+        label: `${window.limit} per ${formatWindow(window.windowMs)}`,
+        kind: 'window' as const,
+        unit: 'requests',
+        limit: window.limit,
+        windowMs: window.windowMs
+      }))
+    };
+  }
+
+  /**
+   * Requests counted inside each window, running plus completed - the same
+   * total {@link canRun} tests against.
+   *
+   * `resetAt` is when the oldest counted request falls out of the window, i.e.
+   * the next moment a slot frees. It is deliberately not
+   * `getStatus().resetTime`, which is `windowStart + windowMs` and so always
+   * evaluates to now.
+   */
+  read(): GaugeReading[] {
+    const now = Date.now();
+
+    return this.windows.map((window, index) => {
+      const windowStart = now - window.windowMs;
+      const counted: number[] = [];
+
+      for (const [timestamp] of this.requestCounts.get(index.toString())!) {
+        if (timestamp >= windowStart) counted.push(timestamp);
+      }
+      for (const startTime of this.runningStartTimes) {
+        if (startTime >= windowStart) counted.push(startTime);
+      }
+
+      // A running request has no expiry until it completes, so an all-running
+      // window reports `now` rather than pretending to know when it drains
+      const oldest = counted.length > 0 ? Math.min(...counted) : undefined;
+
+      return {
+        id: `window-${index}`,
+        value: counted.length,
+        limit: window.limit,
+        resetAt: oldest === undefined ? now : oldest + window.windowMs
+      };
+    });
+  }
+
+  /**
    * Get current status for monitoring
    */
   getStatus(): RateLimitStatus {
@@ -199,6 +258,11 @@ export class RateLimitGroup extends EventTarget implements ResourceGroup {
       windowMs: config.seconds * 1000
     }));
   }
+}
+
+/** `1000` -> `'1s'`, `60000` -> `'60s'`, `500` -> `'500ms'`. Labels only. */
+function formatWindow(windowMs: number): string {
+  return windowMs % 1000 === 0 ? `${windowMs / 1000}s` : `${windowMs}ms`;
 }
 
 // Helper function to create rate limit group with common patterns

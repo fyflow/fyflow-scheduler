@@ -134,6 +134,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Isolates A Saturated Key', () => this.docKeyedIsolation()));
     this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
+    this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -312,9 +313,11 @@ class DocsTestSuite {
     const scheduler = this.makeScheduler();
 
     const seen: number[] = [];
+    const details: any[] = [];
     scheduler.addEventListener('task.progress', (e: any) => {
       // progress is 0-1
       seen.push(e.detail.progress);
+      details.push({ ...e.detail });
     });
 
     await scheduler.addTask(new FyflowTask({
@@ -325,6 +328,26 @@ class DocsTestSuite {
 
     if (seen.length !== 4) throw new Error(`Expected 4 progress events, got ${seen.length}`);
     if (seen[seen.length - 1] !== 1) throw new Error(`Expected final progress 1, got ${seen[seen.length - 1]}`);
+
+    // The scheduler's detail is the task spread flat, so the id is `id`. The
+    // POOL's task.progress carries `taskId`; the two were documented as one
+    // shape for a long time, and README's snippet printed "Task undefined".
+    const first = details[0];
+    if (first.id !== 'doc-progress') {
+      throw new Error(`Expected detail.id "doc-progress", got "${first.id}"`);
+    }
+    if ('taskId' in first) {
+      throw new Error('detail.taskId exists now - the docs say it does not and need updating');
+    }
+    // `workerType` is the WRAPPER's, not the pool key: the spread puts the pool
+    // key there and the forwarder overwrites it. Easy to misread as the task's.
+    if (first.workerType !== 'inline' && first.workerType !== 'thread') {
+      throw new Error(
+        `detail.workerType is "${first.workerType}" - if it is the pool key now, ` +
+        `the warning in AGENTS.md section 6 needs updating`
+      );
+    }
+    if (typeof first.timestamp !== 'number') throw new Error('task.progress carried no timestamp');
   }
 
   private async docSpawning(): Promise<void> {
@@ -914,6 +937,69 @@ class DocsTestSuite {
   // library, so a new export that never reaches it is invisible to that audience.
   // Deno-only: the Node build runs from dev-dist and has no repo-relative access
   // to the markdown.
+  /**
+   * AGENTS.md section 6 warns that a `task.*` detail IS the live `FyflowTask`,
+   * and that keeping the reference logs whatever the task holds later. This
+   * pins that contract in both directions: keeping goes stale, projecting does
+   * not, and `scheduler.completed` is exempt because it hands out a copy.
+   *
+   * If someone ever decides to snapshot details after all, this test fails and
+   * the warning gets deleted with the change rather than outliving it.
+   */
+  private async docDetailsAreLive(): Promise<void> {
+    const scheduler = this.makeScheduler();
+
+    // RECIPE: the natural thing to write, and why it is wrong
+    const kept: any[] = [];
+    const projected: Array<{ id: string; state: string; timestamp: number }> = [];
+
+    scheduler.addEventListener('task.running', (e: any) => {
+      kept.push(e.detail);                       // a reference to a live object
+      projected.push({                           // a value, read synchronously
+        id: e.detail.id,
+        state: e.detail.state,
+        timestamp: e.detail.timestamp
+      });
+    });
+
+    let completedDetail: any;
+    scheduler.addEventListener('scheduler.completed', (e: any) => { completedDetail = e.detail; });
+
+    await scheduler.addTask(new FyflowTask({
+      id: 'doc-live-detail',
+      workerType: 'DocsWorker',
+      payload: { id: 'doc-live-detail', value: 1 }
+    }), { createPromise: true });
+
+    if (kept.length === 0) throw new Error('task.running never fired');
+
+    // The kept reference now reads the terminal state, not the running one
+    if (kept[0].state !== 'done') {
+      throw new Error(
+        `The kept detail reads state "${kept[0].state}" - if it is no longer live, ` +
+        `the warning in AGENTS.md section 6 needs deleting`
+      );
+    }
+    // The projection captured the state at emit and cannot drift
+    if (projected[0].state !== 'running') {
+      throw new Error(`The projection captured "${projected[0].state}", expected "running"`);
+    }
+    if (typeof projected[0].timestamp !== 'number') {
+      throw new Error('task.running carried no timestamp');
+    }
+
+    await this.waitFor(() => completedDetail !== undefined, 2000, 'scheduler.completed');
+
+    // scheduler.completed is exempt: its detail is a copy of stats, not the
+    // live counters object, so holding two of them does not hold one twice
+    if (completedDetail === (scheduler as any).stats) {
+      throw new Error('scheduler.completed handed out the live stats object');
+    }
+    if (typeof completedDetail.timestamp !== 'number') {
+      throw new Error('scheduler.completed carried no timestamp');
+    }
+  }
+
   private async docExportsDocumented(): Promise<void> {
     if (typeof Deno === 'undefined') return; // Covered by the Deno run
 

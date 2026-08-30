@@ -231,9 +231,10 @@ must exist; all three are rejected at construction.
 > group, but under contention it is a permanent deadlock - the waiting task
 > stays `pending` forever. `scheduler.completed` correctly does not fire, but
 > `stats` shows `queued=0 running=0` because blocked tasks leave the queued
-> count, so a stalled scheduler looks idle; check `getResourceMetrics()` for a
-> group pinned at its limit. Give any pool sharing a contended resident group a
-> non-zero `idleTimeout`.
+> count, so a stalled scheduler looks idle. `resource.blocked` names the
+> contended group as the task is queued, and `getAdmissionQueue()` says what is
+> waiting and for how many units. Give any pool sharing a contended resident
+> group a non-zero `idleTimeout`.
 
 See `examples/resident-groups.ts` for a runnable walkthrough.
 
@@ -245,8 +246,9 @@ scheduler.addEventListener('task.completed', (e) => {
 });
 
 scheduler.addEventListener('task.progress', (e) => {
-  // progress is 0-1
-  console.log(`Task ${e.detail.taskId}: ${(e.detail.progress * 100).toFixed(0)}%`);
+  // The detail is the task's fields spread flat, so the id is `id` - there is
+  // no `taskId`. (The pool's own task.progress does carry `taskId`.)
+  console.log(`Task ${e.detail.id}: ${(e.detail.progress * 100).toFixed(0)}%`);
 });
 
 scheduler.addEventListener('scheduler.completed', (e) => {
@@ -262,13 +264,21 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `options.maxCompletedTasks`: cap how many terminal tasks stay in
   `scheduler.tasks` (default: unlimited). Set it for long-lived schedulers -
   completed tasks otherwise pin their payloads and results forever
-- `options.periodicRetryIntervalMs`: retry interval for blocked tasks (default 50ms)
+- `options.periodicRetryIntervalMs`: heartbeat for waking blocked tasks
+  (default 50ms). Groups that free a slot retry their own queue directly; this
+  covers what raises no signal - rate-limit windows rolling over, and resident
+  admission
 - `addTask(task, options?)`: Add a task. Fire-and-forget by default; pass
   `{ createPromise: true }` to get a promise back
 - `addTasks(tasks, options?)`: Batch version, optimised for bulk additions.
   Throws on an unknown `workerType`, validating the batch before queueing any of it
 - `stats`: Current execution statistics
 - `getResourceMetrics()` / `getResourceStats()`: Per-group utilisation and lifetime counters
+- `describeResources()`: The gauges every group presents. Schema, not state -
+  safe to read once and cache
+- `getAdmissionQueue(groupId?)`: Everything currently waiting on a resource
+  group, in admission order, with the cost each waiter needs - the head is what
+  explains a stall
 - `shutdown()`: Terminate worker pools and release all listeners
 - `addEventListener(event, handler)`: Event monitoring
 
@@ -354,13 +364,29 @@ worker that cannot be built and one that keeps dying.
 
 On the **scheduler**: `task.running`, `task.completed`, `task.failed`,
 `task.progress`, `task.user_action`, `task.spawn_request`, `task.spawn_failed`,
-`scheduler.completed`.
+`scheduler.completed`, `resource.acquired`, `resource.released`,
+`resource.blocked`, `resource.unblocked`. Every one carries a `timestamp`.
+
+The four `resource.*` events let a resource view be a fold of a stream rather
+than a poll of four accessors that describe four different instants. They fire
+on the **scheduler only** - a `WorkerManager` never dispatches them, so a
+consumer subscribing to both cannot double-count. See `AGENTS.md` section 6 for
+the payload, the four ways a blocked task leaves its queue, and the two
+conservation invariants worth folding against.
 
 On a **WorkerManager**: `task.started`, `task.completed`, `task.failed`,
 `task.progress`, `task.spawn_request`, `task.requeue_required`, `worker.failed`,
 `worker.self_terminated`, `worker.restart_limit_exceeded`, plus the worker
 lifecycle events `worker.initialization.started|completed|failed`,
 `worker.setup.started|completed` and `worker.teardown.started|completed|failed`.
+
+> An event `detail` is a **live object, not a snapshot**. For `task.running`,
+> `task.completed`, `task.failed` and `task.user_action` it *is* the
+> `FyflowTask` the scheduler keeps mutating, so `arr.push(e.detail)` gives you
+> entries that all read the terminal state later. Listeners run synchronously -
+> project the fields you need inside the listener instead. `task.progress`,
+> `scheduler.completed` and the `resource.*` events are unaffected; their
+> details are copies.
 
 Lifecycle events carry `{ workerId, workerType, timestamp }`, plus `duration` on
 `*.completed` and `error` on `*.failed`. Inline and threaded pools emit the same

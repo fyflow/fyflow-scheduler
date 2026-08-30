@@ -1,4 +1,10 @@
-import type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from './resourceGroup.ts';
+import type {
+  GaugeDescription,
+  GaugeReading,
+  ResourceGroup,
+  ResourceGroupMetrics,
+  ResourceGroupStats
+} from './resourceGroup.ts';
 
 /**
  * ConcurrentLimitGroup - Optimistic resource limits with soft concurrency control
@@ -59,6 +65,27 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
         totalAcquired: this.stats.totalAcquired,
         totalReleased: this.stats.totalReleased
       };
+    }
+
+    /** One `level` gauge: units held out of the limit. */
+    describe(): GaugeDescription {
+      return {
+        gauges: [{
+          id: 'units',
+          label: this.id,
+          kind: 'level',
+          unit: 'units',
+          limit: this.limit
+        }]
+      };
+    }
+
+    /**
+     * Never clamped - an optimistic group can sit above its limit, and hiding
+     * that would make the reading disagree with {@link getMetrics}.
+     */
+    read(): GaugeReading[] {
+      return [{ id: 'units', value: this.running, limit: this.limit }];
     }
 
     onStart(_key?: string, cost: number = 1) {

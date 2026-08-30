@@ -1,4 +1,10 @@
-import type { ResourceGroup, ResourceGroupMetrics, ResourceGroupStats } from './resourceGroup.ts';
+import type {
+  GaugeDescription,
+  GaugeReading,
+  ResourceGroup,
+  ResourceGroupMetrics,
+  ResourceGroupStats
+} from './resourceGroup.ts';
 import type { RateWindow } from './rateLimitGroup.ts';
 
 /** Shape the group needs from a task in order to derive its key. */
@@ -198,6 +204,71 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
       totalAcquired: this.stats.totalAcquired,
       totalReleased: this.stats.totalReleased
     };
+  }
+
+  /**
+   * One `window` gauge per configured window. The limits are *per key*, so a
+   * reading is only meaningful alongside the key it was taken for - which is
+   * why {@link read} requires one.
+   */
+  describe(): GaugeDescription {
+    return {
+      gauges: this.windows.map((window, index) => ({
+        id: `window-${index}`,
+        label: `${window.limit} per ${window.windowMs % 1000 === 0
+          ? `${window.windowMs / 1000}s`
+          : `${window.windowMs}ms`} per key`,
+        kind: 'window' as const,
+        unit: 'requests',
+        limit: window.limit,
+        windowMs: window.windowMs
+      }))
+    };
+  }
+
+  /**
+   * One bucket's windows, counting running plus completed exactly as
+   * {@link _keyCanRun} does.
+   *
+   * Called without a key this returns nothing rather than an aggregate: summing
+   * buckets against a per-key limit produces a number that looks like
+   * utilisation and cannot say whether anything may run. Every resource event
+   * for a keyed group carries its key, so the keyless call is the odd one out.
+   *
+   * An untouched key reads as an empty bucket without creating state for it -
+   * `read()` is called on the event path and must not turn observation into
+   * allocation.
+   */
+  read(key?: string): GaugeReading[] {
+    if (key === undefined) return [];
+
+    const now = Date.now();
+    const state = this.keys.get(key);
+
+    return this.windows.map((window, index) => {
+      const windowStart = now - window.windowMs;
+      const counted: number[] = [];
+
+      if (state) {
+        for (const timestamp of state.completed[index]) {
+          if (timestamp >= windowStart) counted.push(timestamp);
+        }
+        for (const startTime of state.runningStartTimes) {
+          if (startTime >= windowStart) counted.push(startTime);
+        }
+      }
+
+      // Running requests have no expiry until they complete, so a bucket held
+      // entirely by running work reports `now` rather than guessing
+      const oldest = counted.length > 0 ? Math.min(...counted) : undefined;
+
+      return {
+        id: `window-${index}`,
+        value: counted.length,
+        limit: window.limit,
+        resetAt: oldest === undefined ? now : oldest + window.windowMs
+      };
+    });
   }
 
   private _tightestLimit(): number {

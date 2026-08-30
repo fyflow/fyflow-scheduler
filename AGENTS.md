@@ -189,7 +189,13 @@ import type {
   WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerContext,
   SpawnTaskConfig, ProgressData,
   ResourceGroup, ResourceGroupMetrics, ResourceGroupStats,
-  RateWindow, KeyedRateLimitGroupOptions, KeyedTaskLike
+  RateWindow, KeyedRateLimitGroupOptions, KeyedTaskLike,
+  GaugeKind, GaugeSpec, GaugeReading, GaugeDescription,       // gauges
+  ResourceLifetime, HolderKind, ResourceReleaseReason,        // resource events
+  ResourceUnblockReason, ResourceEventDetail,
+  ResourceAcquiredDetail, ResourceReleasedDetail,
+  ResourceBlockedDetail, ResourceUnblockedDetail,
+  AdmissionWaiter
 } from 'fyflow-scheduler';
 ```
 
@@ -204,7 +210,7 @@ worker wrappers the pool manages for you - you should not construct them.
 | `workerPools` | `Record<string, WorkerManager>` | Keys are the `workerType` values tasks refer to |
 | `resourceGroups` | `Record<string, ResourceGroup>` | Keys are the group ids used in `groups` / `workerGroups` |
 | `options.maxCompletedTasks` | `number` | Cap on retained terminal tasks. Default: unlimited |
-| `options.periodicRetryIntervalMs` | `number` | Retry interval for blocked tasks. Default `50` |
+| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks. Default `50` |
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -214,6 +220,8 @@ worker wrappers the pool manages for you - you should not construct them.
 | `tasks` | `Map<string, FyflowTask>` | Live and completed tasks (see `maxCompletedTasks`) |
 | `getResourceMetrics()` | `Record<string, { limit, running, available, utilization }>` | `utilization` is 0–1 |
 | `getResourceStats()` | `Record<string, { totalAcquired, totalReleased }>` | Lifetime counters |
+| `describeResources()` | `Record<string, { gauges: GaugeSpec[] }>` | The gauges every group presents. **Schema, not state** — it cannot change over a group's lifetime, so read it once and cache it |
+| `getAdmissionQueue(groupId?)` | `Record<string, AdmissionWaiter[]>` | Everything currently waiting on a resource group, in admission order — see below |
 | `shutdown()` | `Promise<void>` | Always call when finished |
 
 ### `new FyflowTask(config)`
@@ -303,13 +311,26 @@ else needs the group — a sole holder, or pools whose costs all fit at once.
 
 It deadlocks only under contention: once another pool needs units that a
 never-terminating worker holds, the wait can never be satisfied. The blocked
-task stays `pending` forever, and no event fires to say so.
+task stays `pending` forever.
 
 The failure is at least not disguised as success — `scheduler.completed` does
 **not** fire, because it accounts for tasks blocked on a group. But `stats`
 reads `queued=0 running=0`, since a blocked task is removed from `queued`, so
-a stalled scheduler looks idle. Check `getResourceMetrics()` for a group
-sitting at its limit with nothing progressing.
+a stalled scheduler looks idle.
+
+Three ways to see it, in order of directness:
+
+```typescript
+// 1. The event names the contended group as the task is queued
+scheduler.addEventListener('resource.blocked', e =>
+  console.log(`${e.detail.holderId} waiting on ${e.detail.groupId} (${e.detail.lifetime})`));
+
+// 2. The accessor says what is waiting, and for how many units
+scheduler.getAdmissionQueue();   // { vram: [{ holderId: 'b1', cost: 1, position: 0, ... }] }
+
+// 3. And the group is pinned at its limit with nothing progressing
+scheduler.getResourceMetrics();  // { vram: { limit: 1, running: 1, available: 0, ... } }
+```
 
 Give any pool that shares a contended resident group a non-zero `idleTimeout`.
 
@@ -360,9 +381,9 @@ new RateLimitGroup(windows: { limit: number, windowMs: number }[], id?: string)
 new KeyedRateLimitGroup(windows, { id?, keyFrom?, idleKeyTtlMs? })
 ```
 
-Both expose `canRun()`, `getMetrics()`, `getStats()`. Tasks over a limit wait in
-a blocked queue and are retried — never dropped. Multiple rate-limit windows are
-enforced together.
+All three expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
+`read()` for gauges (below). Tasks over a limit wait in a blocked queue and are
+retried — never dropped. Multiple rate-limit windows are enforced together.
 
 ---
 
@@ -395,6 +416,52 @@ const scheduler = new FyflowScheduler({ ApiWorker: pool }, { api });
 The limit is per key, not global: with 3 keys and a limit of 2, up to 6 tasks run
 at once.
 
+---
+
+#### Gauges — how a group describes itself
+
+A group's state is not always one number. `RateLimitGroup` enforces *10/sec AND
+100/min* together, and no single bar can show that. Worse, `getMetrics()` is
+actively misleading for a rate group — with 10 completions in the last second
+and nothing in flight:
+
+```typescript
+group.getMetrics()  // { limit: 10, running: 0, available: 10 }  - looks idle
+group.canRun()      // false                                      - actually saturated
+```
+
+So a group may declare **gauges** instead. A consumer renders one *kind*, never
+a group type:
+
+```typescript
+group.describe()   // { gauges: GaugeSpec[] }   static:  id, label, kind, unit, limit, windowMs?
+group.read(key?)   // GaugeReading[]            dynamic: id, value, limit, resetAt?
+```
+
+| Group | Gauges |
+|---|---|
+| `ConcurrentLimitGroup` | 1 × `level`, id `units` |
+| `RateLimitGroup` | one `window` per configured window, ids `window-0`, `window-1`, … |
+| `KeyedRateLimitGroup` | the same windows, **per key** — `read()` requires a key and returns `[]` without one |
+| anything else | 1 × `level` derived from `getMetrics()` |
+
+**Both methods are optional.** A group implementing only `canRun`, `onStart`,
+`onFinish` and `getMetrics` — which is every group written before gauges existed,
+and any you write yourself — is described as a single `level` gauge with no
+changes. Implement them when one number would be a lie.
+
+Two rules that are part of the contract, not implementation detail:
+
+- **An unrecognised `kind` renders as `level`**, using `value` and `limit`.
+  Without this, adding a third kind later breaks every viewer already deployed.
+- **Readings are never clamped.** Groups are optimistic, so a `level` reading may
+  exceed its limit; clamping would make the event disagree with `getMetrics()`
+  exactly when the disagreement matters.
+
+`ResourceGroup.type` is `string`, not a closed union, so a group defined outside
+this library can name itself. Do not `switch` exhaustively on it — that is what
+`kind` is for.
+
 ## 6. Events
 
 Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
@@ -406,11 +473,41 @@ Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
 | `task.running` | the `FyflowTask` |
 | `task.completed` | the `FyflowTask` (with `result`, `executionTime`) |
 | `task.failed` | the task, plus `error` |
-| `task.progress` | `{ taskId, workerId, progress (0–1), message, details }` |
+| `task.progress` | the task's fields **spread flat** (so the id is `id`, **not** `taskId`), plus `{ workerId, workerType, progress (0–1), message, details, timestamp }` |
 | `task.user_action` | the task — failed, out of retries, not optional. Fires once, only after the retry budget is spent |
 | `task.spawn_request` | `{ parentTask, spawnConfig, workerId, workerType }` |
 | `task.spawn_failed` | `{ parentTask, spawnConfig, error }` |
-| `scheduler.completed` | the `stats` object |
+| `scheduler.completed` | a **copy** of `stats`, plus `timestamp` |
+| `resource.acquired` | `ResourceEventDetail` — see below |
+| `resource.released` | the same, plus `reason` |
+| `resource.blocked` | the same, plus `queuePosition` |
+| `resource.unblocked` | the same, plus `reason` |
+
+Every event above carries a `timestamp` (`Date.now()` at emit). On the four
+`task.*` events that is a field on the task itself — see the live-reference
+warning immediately below.
+
+> ⚠️ **An event `detail` is a live object, not a snapshot.** For `task.running`,
+> `task.completed`, `task.failed` and `task.user_action`, `detail` **is** the
+> `FyflowTask` — the same object the scheduler keeps mutating. Listeners run
+> synchronously, so reading it inside the listener is correct; keeping it is not:
+>
+> ```javascript
+> const seen = [];
+> scheduler.addEventListener('task.running', e => seen.push(e.detail));
+> // later: every entry reads state:'done'. Nothing threw. The log is just wrong.
+> ```
+>
+> **Project what you need inside the listener** — `seen.push({ id: e.detail.id,
+> state: e.detail.state, timestamp: e.detail.timestamp })` — rather than keeping
+> the reference. This is why `timestamp` is not derivable from `startTime` or
+> `endTime`: those are fields on the same live object.
+>
+> Not affected: `task.progress` (`detail` is a shallow copy),
+> `scheduler.completed` (a copy of `stats`, not the live counters), and the four
+> `resource.*` events (a fresh object per event). Details are not frozen or
+> defensively copied on the hot path — this is a documented contract, not an
+> oversight.
 
 **On a `WorkerManager`:** `task.started`, `task.completed`, `task.failed`,
 `task.progress`, `task.spawn_request`, `task.requeue_required`, `worker.failed`,
@@ -436,6 +533,125 @@ idle-timeout teardown, so keep their listeners cheap.
 > `scheduler.completed` fires **every time the scheduler drains**, so it can fire
 > more than once when tasks arrive in waves. It does account for tasks blocked on
 > a resource group, so it will not fire while work is still waiting for capacity.
+
+### `resource.*` — building a resource view from the stream
+
+These exist so resource state can be a **fold of an event stream** rather than a
+poll. Four accessors read in sequence describe four different instants; a stream
+does not have that problem.
+
+```typescript
+interface ResourceEventDetail {
+  groupId:    string;
+  groupType:  string;              // the group's own `type`. Open - do not switch on it
+  lifetime:   'task-held' | 'resident';
+  holderKind: 'task' | 'worker';
+  holderId:   string;              // task id, or worker id
+  workerType: string;              // the POOL KEY - see the warning below
+  cost:       number;              // units taken. Always 1 except for a weighted resident hold
+  key?:       string;              // the bucket, for keyed groups
+  timestamp:  number;
+  readings:   GaugeReading[];      // group state AFTER the operation
+}
+```
+
+| | Fired |
+|---|---|
+| `resource.acquired` | immediately after `onStart`, both lifetimes |
+| `resource.released` | immediately after `onFinish`. `reason`: `'settled'` \| `'worker-teardown'` \| `'shutdown'` |
+| `resource.blocked` | on **every** push onto a blocked queue, naming the one group the waiter is short of |
+| `resource.unblocked` | on **every** exit from a blocked queue, tagged with which |
+
+`'settled'` is broader than it sounds: it means *the task attempt that held this
+ended*. A task released and re-acquired by a **retry**, or **requeued** because
+its worker died, emits one `settled` release per attempt. Fold acquire/release
+pairs per attempt, not per task — a task with two retries produces three pairs.
+
+**`resource.*` fires on the scheduler only.** A `WorkerManager` never dispatches
+them, not even for the resident holdings it acquires itself — the scheduler
+injects a notifier and re-emits. Subscribing to both the scheduler and every pool
+is the natural thing to do, and if pools mirrored these you would count every
+resident acquire twice and see conservation drift by exactly the resident share.
+
+> ⚠️ `workerType` here is the **pool key** in `workerPools`. On the `worker.*`
+> lifecycle events — and on `task.progress`, where the wrapper's value
+> overwrites the task's — the same field name means `'inline'` or `'thread'`.
+> They are different things. `task.progress` is the one to watch: its detail is
+> the task spread flat, so `workerType` *looks* like the task's own field and is
+> not.
+
+**A blocked task leaves its queue four ways**, and `unblocked.reason` says which:
+
+| `reason` | What happened |
+|---|---|
+| `admitted` | Moved to the ready queue — the ordinary exit |
+| `superseded` | Admitted via a *different* group and spliced out of this one |
+| `orphaned` | Its worker pool no longer exists. The task is **failed terminally** — `task.failed`, then `user_action` unless it is optional, and its promise rejects. Retries are skipped: the pool is gone |
+| `shutdown` | The scheduler tore down and discarded every remaining waiter |
+
+Two invariants worth folding against, because a fold can stay internally
+consistent while being wrong:
+
+- **Holdings.** Over a run that completes, `Σ acquired.cost − Σ released.cost === 0`
+  for every `(groupId, key)`, and never negative. At a quiescent moment the
+  folded occupancy equals `getMetrics().running` for a **concurrent** group. It
+  does not for a rate group, and should not — compare the latest `window`
+  readings against `getStatus()` instead.
+- **Queue membership.** `Σ blocked − Σ unblocked === 0` for every
+  `(groupId, key, holderId)` over a run that reaches shutdown, so one group's
+  queue is exactly reconstructible — not just the set of waiting tasks.
+
+### `getAdmissionQueue(groupId?)` — what is waiting right now
+
+```typescript
+interface AdmissionWaiter {
+  holderId:   string;                    // task id - blocked queues hold tasks, both lifetimes
+  workerType: string;                    // its pool
+  lifetime:   'task-held' | 'resident';  // what it is waiting to acquire
+  cost:       number;                    // the pool's per-worker cost, or 1 for task-held
+  position:   number;                    // 0-based; 0 is the head, and the head gates the rest
+  key?:       string;                    // the bucket, for keyed groups
+}
+```
+
+Keyed by **group id**, with the bucket on the waiter. A keyed group has one
+sub-queue per key; they are concatenated in key order, each numbered from 0. A
+group with an empty queue is absent rather than present-and-empty.
+
+`cost` is what makes a stall legible: a 20-unit waiter at position 0 is the
+entire reason four 2-unit pools are not starting, because head-of-line admission
+means nothing behind it may overtake.
+
+Uncapped and `O(total blocked tasks)` — the panel this exists for is the
+starvation case, which is exactly when the queue is long. With `resource.blocked`
+/ `resource.unblocked` available, prefer the stream: this is for late-joiner
+catch-up, since two reads describe two instants and a view built from them is not
+a fold.
+
+### How a blocked task wakes up
+
+Two mechanisms, and knowing which applies explains the latency you see:
+
+- **Directly**, when a slot frees. Releasing a task-held group retries that
+  group's queue in the same turn, so a task waiting on a concurrency limit
+  starts as soon as one finishes.
+- **On the heartbeat**, every `periodicRetryIntervalMs` (default 50ms), for
+  everything with no such signal — a **rate-limit window** rolling over, and
+  **resident admission**, neither of which raises an event when it becomes
+  satisfiable.
+
+The heartbeat runs on a fixed interval while work exists. It used to be
+restarted on every settle, which made it a debounce: a scheduler completing
+tasks faster than the interval pushed its deadline out forever and it never
+fired, so rate-limited and resident waiters starved indefinitely beside a busy
+pool. Fixed in 0.3.0 — worth knowing if you are reading behaviour from an
+earlier version.
+
+**Cost.** One acquire and one release per task per group: 5 000 tasks/s across 3
+groups is 30 000 events/s. Nothing is built and no `read()` runs while nobody is
+subscribed, so an unused subscription is free — but a subscribed listener is on
+the hot path, and there is no throttling or coalescing in the library. Keep
+listeners cheap, or coalesce on your side.
 
 ---
 
@@ -537,6 +753,7 @@ pool.addEventListener('worker.initialization.failed', (e) => {
 | Limit briefly exceeded | Groups are optimistic by design (§1) |
 | A resource group has no effect at all | The pool never declared it. Registering a group on the scheduler is not enough - add it to the pool's `groups` or the task's `workerGroups` |
 | `Missing limit key for group "x"` | The task belongs to a `KeyedRateLimitGroup` but has no `limitKey`, and the group's `keyFrom` returned nothing |
+| `Worker pool "x" no longer exists` | A task was waiting on a resource group when its pool was removed from `workerPools`. The library never does this, so something outside it mutated the map |
 
 ---
 
