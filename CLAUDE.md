@@ -42,6 +42,28 @@ exports — one entrypoint maps to exactly one file for every runtime — and it
 serves `.ts` to Deno and transpiled `.js` to everyone else. Node and browser
 consumers need the esbuild bundles, which only npm can carry.
 
+## Downstream consumers
+
+This library is no longer only consumed by end users. Sibling libraries in the
+same ecosystem depend on the published packages — one building on the resource
+model, another importing the scheduler to build flow planning on top of it. That
+is invisible from inside this repository, and it changes how two things should
+be weighed:
+
+- **Breaking changes have consequences beyond this repo.** Judge them against
+  code you cannot see and cannot fix in the same commit. The `ResourceGroup.type`
+  widening in 0.3.0 is the reference case: source-breaking for an exhaustive
+  switch, deliberately released as a minor, and the reasoning belongs in the
+  release commit whenever a call like that is made again.
+- **The no-dependencies invariant matters more than it looks.** Consumers
+  inherit anything this package depends on, transitively. `jsr:smoke` enforces
+  it; do not relax it for convenience.
+
+Feature requests can also arrive as a specification from a consumer rather than
+as an issue — the 0.3.0 resource events were designed as a counter-proposal to
+one. When that happens, the plan for it belongs in `doc/design/` and the
+resulting contract in `AGENTS.md`.
+
 ## Architecture
 
 **`core/FyflowScheduler.ts`** — the orchestrator. Task states are
