@@ -4,8 +4,10 @@
 // consumer can build a resource view as a pure fold of a stream rather than by
 // polling four accessors that describe four different instants.
 //
-// The acceptance criteria these check come from RESOURCE_EVENTS_PLAN.md section
-// 9, and each one exists because a fold can be internally consistent while
+// The acceptance criteria these check came from the resource-events plan,
+// section 9. That plan shipped in 0.3.0 and was retired per the doc/design/
+// convention - recover it with `git log -- doc/design/resource-events.md`.
+// Each criterion exists because a fold can be internally consistent while
 // being wrong. Conservation catches a missed emit; agreement with the accessor
 // catches the fold and the group disagreeing; the single-emitter check catches
 // the double count a consumer listening to both the scheduler and its pools
