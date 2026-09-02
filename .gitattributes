@@ -1,0 +1,16 @@
+# Line endings are normalised to LF in the repository and in the working tree.
+#
+# Before this, endings were inconsistent - most files CRLF, several MIXED within
+# a single file. Any edit that rewrote a whole file normalised it as a side
+# effect, so a 180-line change arrived as a 4,400-line diff and the real work was
+# unreviewable. This file stops that recurring.
+#
+# LF rather than CRLF: the published packages ship this source to consumers on
+# every platform, CI runs on Linux, and LF is what every tool here emits by
+# default. Windows development is fully supported - modern editors and Git for
+# Windows handle LF working trees without configuration.
+* text=auto eol=lf
+
+# Lockfiles are generated; keep them out of diffs and merges.
+pnpm-lock.yaml -diff linguist-generated
+deno.lock      -diff linguist-generated
