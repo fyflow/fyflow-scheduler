@@ -115,7 +115,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Seven suites, 130 tests, all in the default `deno task test` run:
+Seven suites, 132 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -125,7 +125,7 @@ Seven suites, 130 tests, all in the default `deno task test` run:
 | settlement | 17 | exactly-once settlement, counter cardinality |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 23 | `resource.*` events, gauges, admission queue |
-| docs | 31 | **executes every snippet in README.md and AGENTS.md** |
+| docs | 33 | **executes every snippet in README.md and AGENTS.md** |
 
 `deno task test:scripts` is separate and not included in `deno task test` — it
 unit-tests `scripts/publishOutput.ts`.
@@ -155,9 +155,9 @@ Neither registry needs a stored token.
 `.github/workflows/ci.yml` runs on every push and PR: a Deno job, a Node matrix
 (22 and 24), Playwright across three engines, and lint.
 
-Version must be bumped in `deno.json`, `package.json` **and**
-`package-lock.json`. The first two are checked by the publish workflow;
-`pnpm-lock.yaml` does not pin the root version so it needs nothing.
+Version must be bumped in **both** `deno.json` and `package.json`, which the
+publish workflow checks against each other and against the tag.
+`pnpm-lock.yaml` does not pin the root version, so it needs nothing.
 
 ## Things that will bite you
 
@@ -211,9 +211,11 @@ leaves the tree dirty — which `deno publish` refuses. `publish.yml` restores t
 one path before publishing. Committing a lockfile that pins the npm dependencies
 too would retire the workaround.
 
-**pnpm, not npm.** `packageManager` declares it and `pnpm-lock.yaml` is current.
-`pnpm publish` runs git checks that fail on a detached tag checkout, so the
-release uses `npm publish`. `package-lock.json` is redundant and drifts.
+**pnpm, not npm.** `packageManager` declares it, `pnpm-lock.yaml` is the only
+lockfile, and CI installs with `pnpm install --frozen-lockfile`. `pnpm publish`
+runs git checks that fail on a detached tag checkout, so the release step itself
+uses `npm publish`. There is deliberately no `package-lock.json`: nothing
+validated it, so it silently fell a release behind twice before being removed.
 
 **npm errors on republishing an existing version; JSR skips it.** The publish
 workflow queries the registry first so re-running a released tag is a no-op on
