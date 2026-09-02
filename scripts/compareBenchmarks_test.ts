@@ -43,6 +43,16 @@ Deno.test("unmatched scenarios are reported from both sides", () => {
   assertEquals(m.headOnly, ["added"]);
 });
 
+Deno.test("efficiency is reported in percentage points, not relative percent", () => {
+  // Efficiency is already a percentage. A relative delta of it explodes near
+  // zero - 0.04% vs 0.02% is a -50% "regression" that is pure rounding.
+  const rows = compareSuites(suite([["alpha", 100, 0.04]]), suite([["alpha", 100, 0.02]]));
+  assertEquals(Number(rows[0].efficiencyDeltaPoints.toFixed(2)), -0.02);
+  const md = toMarkdown(rows, { baseRef: "a", headRef: "b", runs: "1", missing: { baseOnly: [], headOnly: [] } });
+  assertEquals(md.includes("pp"), true);
+  assertEquals(md.includes("-50.0%"), false);
+});
+
 Deno.test("markdown carries the sign and the caveat", () => {
   const md = toMarkdown(compareSuites(suite([["alpha", 100, 50]]), suite([["alpha", 120, 55]])), {
     baseRef: "v1", headRef: "v2", runs: "3", missing: { baseOnly: [], headOnly: [] }

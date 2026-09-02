@@ -15,7 +15,13 @@ export interface ComparisonRow {
   throughputDelta: number;
   baseEfficiency: number;
   headEfficiency: number;
-  efficiencyDelta: number;
+  /**
+   * Percentage POINTS, not a relative percentage. Efficiency is already a
+   * percentage, so a relative change of it amplifies noise near zero: two
+   * values that both render as 0.0% once compared as -46.0%, which reads as a
+   * catastrophe and means nothing.
+   */
+  efficiencyDeltaPoints: number;
 }
 
 interface SuiteLike {
@@ -60,7 +66,7 @@ export function compareSuites(base: SuiteLike, head: SuiteLike): ComparisonRow[]
       throughputDelta: percentDelta(b.throughput, headThroughput),
       baseEfficiency: b.efficiency,
       headEfficiency,
-      efficiencyDelta: percentDelta(b.efficiency, headEfficiency)
+      efficiencyDeltaPoints: headEfficiency - b.efficiency
     });
   }
   return rows;
@@ -90,13 +96,14 @@ export function toMarkdown(
       `Compare the two columns against each other, not against any stored baseline.`
   );
   out.push("");
-  out.push("| Scenario | Throughput base | Throughput head | Δ | Efficiency base | Efficiency head | Δ |");
+  out.push("| Scenario | Throughput base | Throughput head | Δ | Efficiency base | Efficiency head | Δ pp |");
   out.push("|---|---:|---:|---:|---:|---:|---:|");
   for (const r of rows) {
     const sign = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
+    const signPoints = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(1)}pp`;
     out.push(
       `| ${r.scenario} | ${r.baseThroughput.toFixed(1)} | ${r.headThroughput.toFixed(1)} | ${sign(r.throughputDelta)} ` +
-        `| ${r.baseEfficiency.toFixed(1)}% | ${r.headEfficiency.toFixed(1)}% | ${sign(r.efficiencyDelta)} |`
+        `| ${r.baseEfficiency.toFixed(1)}% | ${r.headEfficiency.toFixed(1)}% | ${signPoints(r.efficiencyDeltaPoints)} |`
     );
   }
   if (!rows.length) out.push("| _no scenarios matched_ | | | | | | |");
