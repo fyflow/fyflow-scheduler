@@ -442,6 +442,7 @@ export class WorkerManager extends EventTarget {
       { event: 'worker.initialization.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.initialization.failed', { detail: e.detail })) },
       { event: 'worker.setup.started', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.setup.started', { detail: e.detail })) },
       { event: 'worker.setup.completed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.setup.completed', { detail: e.detail })) },
+      { event: 'worker.setup.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.setup.failed', { detail: e.detail })) },
       { event: 'worker.teardown.started', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.teardown.started', { detail: e.detail })) },
       { event: 'worker.teardown.completed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.teardown.completed', { detail: e.detail })) },
       { event: 'worker.teardown.failed', handler: (e: any) => this.dispatchEvent(new CustomEvent('worker.teardown.failed', { detail: e.detail })) },

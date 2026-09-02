@@ -81,7 +81,15 @@ parentPort?.on('message', async (data: any) => {
             // worker.setup.* events an inline worker emits
             sendMessage({ type: 'setup_started' });
             const setupStart = performance.now();
-            await workerInstance.setup?.();
+            try {
+                await workerInstance.setup?.();
+            } catch (setupError: any) {
+                // Report the setup failure in its own right before letting it
+                // become an initialization failure, so worker.setup.started
+                // always reaches a terminal event of its own.
+                sendMessage({ type: 'setup_failed', data: { message: setupError?.message ?? String(setupError) } });
+                throw setupError;
+            }
             sendMessage({ type: 'setup_completed', data: { duration: performance.now() - setupStart } });
 
             sendMessage({ type: 'init' });

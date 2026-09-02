@@ -522,6 +522,7 @@ warning immediately below.
 | `worker.initialization.failed` | `{ workerId, workerType, timestamp, error }` |
 | `worker.setup.started` | `{ workerId, workerType, timestamp }` |
 | `worker.setup.completed` | `{ workerId, workerType, timestamp, duration }` |
+| `worker.setup.failed` | `{ workerId, workerType, timestamp, error }` |
 | `worker.teardown.started` | `{ workerId, workerType, timestamp }` |
 | `worker.teardown.completed` | `{ workerId, workerType, timestamp, duration }` |
 | `worker.teardown.failed` | `{ workerId, workerType, timestamp, error }` |
@@ -530,16 +531,24 @@ warning immediately below.
 set with the same shape. These fire on every worker creation and every
 idle-timeout teardown, so keep their listeners cheap.
 
-**Teardown events are unconditional and always paired.** `teardown()` is optional
-on `WorkerInterface`, but the events are not: they report that a worker is being
-destroyed, not that it implemented a hook. Any worker that was constructed emits
-`worker.teardown.started`, followed by exactly one of `worker.teardown.completed`
-or `worker.teardown.failed`. That holds in all four cases — no `teardown()` at
-all, one that returns, one that throws, and one that stops answering, where the
-pool gives up on it and reports the failure itself. A `started` with no terminal
-event is a bug, so you can safely fold these into worker state and expect the
-pair to close. A worker that was never constructed emits nothing, since no worker
-is being destroyed.
+**Setup and teardown events are unconditional and always paired.** `setup()` and
+`teardown()` are both optional on `WorkerInterface`, but the events are not: they
+report that a worker is being initialized or destroyed, not that it implemented a
+hook. Any worker that was constructed emits `worker.setup.started` followed by
+exactly one of `worker.setup.completed` or `worker.setup.failed`, and
+`worker.teardown.started` followed by exactly one of `worker.teardown.completed`
+or `worker.teardown.failed`.
+
+That holds whether the hook is absent, returns, throws, or — for teardown —
+stops answering, in which case the pool gives up on it and reports the failure
+itself. A `started` with no terminal event is a bug, so you can safely fold these
+into worker state and expect every pair to close. A worker that was never
+constructed emits nothing, since no worker is being initialized or destroyed.
+
+A failing `setup()` emits **both** `worker.setup.failed` and, after it,
+`worker.initialization.failed`. They are not duplicates: the first closes the
+setup pair, the second is the signal the pool acts on when deciding to restart or
+give up. Count failures from `worker.initialization.failed`, not from both.
 
 > `scheduler.completed` fires **every time the scheduler drains**, so it can fire
 > more than once when tasks arrive in waves. It does account for tasks blocked on

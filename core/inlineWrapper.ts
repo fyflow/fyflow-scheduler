@@ -142,24 +142,48 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             const baseWorkerContext = this.createBaseWorkerContext();
             instance = new module.default(this.config, baseWorkerContext);
 
-            // Call setup if it exists
-            if (instance.setup) {
-                this.dispatchEvent(new CustomEvent('worker.setup.started', {
-                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
-                }));
+            // setup() is optional on WorkerInterface - the events are not. They
+            // report that a worker is being initialized, which is true whether or
+            // not it implemented a hook, so a consumer tracking worker state can
+            // rely on seeing them. Guarding the events on the method's existence
+            // meant a worker without setup() was constructed silently, and made
+            // inline pools emit a different set from threaded ones - the
+            // worker-side wrapper has always got this right via `setup?.()`.
+            // Same defect the teardown events had.
+            this.dispatchEvent(new CustomEvent('worker.setup.started', {
+                detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
+            }));
 
-                const setupStartTime = performance.now();
-                await instance.setup();
-
-                this.dispatchEvent(new CustomEvent('worker.setup.completed', {
+            const setupStartTime = performance.now();
+            try {
+                await instance.setup?.();
+            } catch (setupError) {
+                // Close the pair before the error becomes an initialization
+                // failure. Without this, setup.started had no terminal event of
+                // its own: the outer initialization pair closed, the inner setup
+                // pair did not, and a consumer folding setup state was left
+                // holding a worker that never finished setting up.
+                this.dispatchEvent(new CustomEvent('worker.setup.failed', {
                     detail: {
                         workerId: this.id,
                         workerType: 'inline',
                         timestamp: Date.now(),
-                        duration: performance.now() - setupStartTime
+                        error: setupError
                     }
                 }));
+                // Rethrow: this is still an initialization failure, and
+                // worker.initialization.failed remains the signal the pool acts on.
+                throw setupError;
             }
+
+            this.dispatchEvent(new CustomEvent('worker.setup.completed', {
+                detail: {
+                    workerId: this.id,
+                    workerType: 'inline',
+                    timestamp: Date.now(),
+                    duration: performance.now() - setupStartTime
+                }
+            }));
 
             // Threaded workers emit this once the worker thread confirms init;
             // inline workers reach the equivalent point here

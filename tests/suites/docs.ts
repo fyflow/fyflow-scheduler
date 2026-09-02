@@ -143,7 +143,8 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
-    this.results.push(await this.runTest('Doc: Teardown Events Fire Without A teardown() Method', () => this.docTeardownEventsAreUnconditional()));
+    this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
+    this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -1022,7 +1023,77 @@ class DocsTestSuite {
   // without teardown() was destroyed silently while a threaded one emitted both.
   // Every other worker in tests/workers/ implements teardown(), which is why
   // nothing caught it.
-  private async docTeardownEventsAreUnconditional(): Promise<void> {
+  // A setup failure is still an initialization failure - worker.initialization.failed
+  // remains the signal the pool acts on - but worker.setup.started needs a
+  // terminal event of its own or its pair never closes. Both are emitted, in
+  // that order, by both pool types.
+  private async docSetupFailure(): Promise<void> {
+    const crashUrl = typeof Deno !== "undefined"
+      ? new URL("../workers/crashingWorker.ts", import.meta.url).href
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      : new URL((await import('../workers/crashingWorker.ts?worker-direct')).default).href;
+
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(crashUrl, {
+        maxThreads: 1, maxConcurrentTasks: 1, inline,
+        // A pool whose workers cannot start would otherwise keep retrying
+        maxWorkerRestarts: 0, requeueFailedTasks: false,
+        config: { crashInSetup: true }
+      });
+      const scheduler = new FyflowScheduler({ CrashingWorker: pool });
+
+      const order: string[] = [];
+      let failureDetail: any = null;
+      pool.addEventListener('worker.setup.started', () => order.push('setup.started'));
+      pool.addEventListener('worker.setup.completed', () => order.push('setup.completed'));
+      pool.addEventListener('worker.setup.failed', (e: any) => {
+        order.push('setup.failed');
+        failureDetail = e.detail;
+      });
+      pool.addEventListener('worker.initialization.failed', () => order.push('init.failed'));
+
+      // The task cannot succeed - the worker never starts. Bounded rather than
+      // awaited, so a regression fails this test instead of hanging the suite.
+      // addTask returns void | Promise<any>; Promise.resolve normalises it
+      const settled = Promise.resolve(scheduler.addTask(new FyflowTask({
+        id: `doc-setup-fail-${inline}`, workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+      }), { createPromise: true })).catch(() => {});
+      await Promise.race([settled, new Promise(resolve => setTimeout(resolve, 3000))]);
+      await Promise.race([
+        scheduler.shutdown().catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, 2000))
+      ]);
+
+      if (!order.includes('setup.started')) {
+        throw new Error(`${kind}: worker.setup.started did not fire`);
+      }
+      if (order.includes('setup.completed')) {
+        throw new Error(`${kind}: setup threw, so worker.setup.completed must not fire`);
+      }
+      if (!order.includes('setup.failed')) {
+        throw new Error(
+          `${kind}: expected worker.setup.failed, saw [${order.join(', ')}]. A ` +
+          `setup.started with no terminal event of its own leaves a consumer ` +
+          `holding a worker that never finished setting up.`
+        );
+      }
+      // The setup failure is the more specific signal and must precede the
+      // initialization failure it becomes
+      if (order.includes('init.failed') &&
+          order.indexOf('setup.failed') > order.indexOf('init.failed')) {
+        throw new Error(`${kind}: worker.setup.failed must precede worker.initialization.failed, saw [${order.join(', ')}]`);
+      }
+      if (failureDetail?.workerType !== (inline ? 'inline' : 'thread')) {
+        throw new Error(`${kind}: worker.setup.failed has workerType ${failureDetail?.workerType}`);
+      }
+      if (!failureDetail?.error) {
+        throw new Error(`${kind}: worker.setup.failed carries no error`);
+      }
+    }
+  }
+
+  private async docLifecycleEventsAreUnconditional(): Promise<void> {
     const workerUrl = await this.resolveNoTeardownWorkerUrl();
 
     for (const inline of [true, false]) {
@@ -1034,7 +1105,10 @@ class DocsTestSuite {
       this.schedulers.push(scheduler);
 
       const seen = new Map<string, any>();
-      for (const event of ['worker.teardown.started', 'worker.teardown.completed', 'worker.teardown.failed']) {
+      for (const event of [
+        'worker.setup.started', 'worker.setup.completed',
+        'worker.teardown.started', 'worker.teardown.completed', 'worker.teardown.failed'
+      ]) {
         pool.addEventListener(event, (e: any) => seen.set(event, e.detail ?? {}));
       }
 
@@ -1050,12 +1124,17 @@ class DocsTestSuite {
         throw new Error(`${kind}: a missing teardown() is not a failure, but worker.teardown.failed fired`);
       }
 
-      for (const event of ['worker.teardown.started', 'worker.teardown.completed']) {
+      for (const event of [
+        'worker.setup.started', 'worker.setup.completed',
+        'worker.teardown.started', 'worker.teardown.completed'
+      ]) {
         const detail = seen.get(event);
         if (!detail) {
+          const hook = event.startsWith('worker.setup') ? 'setup()' : 'teardown()';
+          const verb = event.startsWith('worker.setup') ? 'initialized' : 'destroyed';
           throw new Error(
-            `${kind}: ${event} did not fire for a worker without teardown(). ` +
-            `The events report that a worker is being destroyed, not that it implemented a hook.`
+            `${kind}: ${event} did not fire for a worker without ${hook}. ` +
+            `The events report that a worker is being ${verb}, not that it implemented a hook.`
           );
         }
         if (!detail.workerId) throw new Error(`${kind}: ${event} missing workerId`);
@@ -1065,8 +1144,10 @@ class DocsTestSuite {
         }
       }
 
-      if (typeof seen.get('worker.teardown.completed').duration !== 'number') {
-        throw new Error(`${kind}: worker.teardown.completed missing duration`);
+      for (const event of ['worker.setup.completed', 'worker.teardown.completed']) {
+        if (typeof seen.get(event).duration !== 'number') {
+          throw new Error(`${kind}: ${event} missing duration`);
+        }
       }
     }
   }

@@ -274,6 +274,20 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
             }));
             return;
 
+          // A setup failure is still an initialization failure - the worker
+          // rethrows and 'error' with taskId 'init' follows - but setup.started
+          // needs a terminal event of its own, or its pair never closes.
+          case 'setup_failed':
+            this.dispatchEvent(new CustomEvent('worker.setup.failed', {
+              detail: {
+                workerId: this.id,
+                workerType: 'thread',
+                timestamp: Date.now(),
+                error: new Error(data?.message || String(data))
+              }
+            }));
+            return;
+
           case 'teardown':
             this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
               detail: {

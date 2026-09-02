@@ -31,7 +31,7 @@ export interface WorkerConfig {
  */
 export interface WorkerMessage {
     type: 'init' | 'teardown' | 'result' | 'error' | 'progress' | 'spawn_task'
-        | 'setup_started' | 'setup_completed';
+        | 'setup_started' | 'setup_completed' | 'setup_failed';
     taskId?: string; // Only for task-related messages
     data?: any; // Message-specific payload
     timestamp?: number;
