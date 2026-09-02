@@ -530,6 +530,17 @@ warning immediately below.
 set with the same shape. These fire on every worker creation and every
 idle-timeout teardown, so keep their listeners cheap.
 
+**Teardown events are unconditional and always paired.** `teardown()` is optional
+on `WorkerInterface`, but the events are not: they report that a worker is being
+destroyed, not that it implemented a hook. Any worker that was constructed emits
+`worker.teardown.started`, followed by exactly one of `worker.teardown.completed`
+or `worker.teardown.failed`. That holds in all four cases — no `teardown()` at
+all, one that returns, one that throws, and one that stops answering, where the
+pool gives up on it and reports the failure itself. A `started` with no terminal
+event is a bug, so you can safely fold these into worker state and expect the
+pair to close. A worker that was never constructed emits nothing, since no worker
+is being destroyed.
+
 > `scheduler.completed` fires **every time the scheduler drains**, so it can fire
 > more than once when tasks arrive in waves. It does account for tasks blocked on
 > a resource group, so it will not fire while work is still waiting for capacity.
