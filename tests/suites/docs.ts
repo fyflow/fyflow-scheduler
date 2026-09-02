@@ -53,6 +53,14 @@ class DocsTestSuite {
     return new URL((await import('../workers/docsWorker.ts?worker-direct')).default).href;
   }
 
+  private async resolveNoTeardownWorkerUrl(): Promise<string> {
+    if (typeof Deno !== "undefined") {
+      return new URL("../workers/noTeardownWorker.ts", import.meta.url).href;
+    }
+    // @ts-expect-error - esbuild rewrites the ?worker-direct import at build time
+    return new URL((await import('../workers/noTeardownWorker.ts?worker-direct')).default).href;
+  }
+
   private makeScheduler(
     poolOptions: any = {},
     groups: Record<string, any> = {},
@@ -135,6 +143,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
+    this.results.push(await this.runTest('Doc: Teardown Events Fire Without A teardown() Method', () => this.docTeardownEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -946,6 +955,66 @@ class DocsTestSuite {
    * If someone ever decides to snapshot details after all, this test fails and
    * the warning gets deleted with the change rather than outliving it.
    */
+  // AGENTS.md: "Inline and threaded pools emit the same set with the same shape.
+  // These fire on every worker creation and every idle-timeout teardown."
+  //
+  // teardown() is OPTIONAL on WorkerInterface, but the events are not: they say a
+  // worker is being destroyed, which is true whether or not it implemented a
+  // hook. A consumer tracking worker state has to be able to rely on that.
+  //
+  // Inline pools used to guard the events on the method existing, so a worker
+  // without teardown() was destroyed silently while a threaded one emitted both.
+  // Every other worker in tests/workers/ implements teardown(), which is why
+  // nothing caught it.
+  private async docTeardownEventsAreUnconditional(): Promise<void> {
+    const workerUrl = await this.resolveNoTeardownWorkerUrl();
+
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(workerUrl, {
+        maxThreads: 1, maxConcurrentTasks: 1, inline
+      });
+      const scheduler = new FyflowScheduler({ NoTeardownWorker: pool });
+      this.schedulers.push(scheduler);
+
+      const seen = new Map<string, any>();
+      for (const event of ['worker.teardown.started', 'worker.teardown.completed', 'worker.teardown.failed']) {
+        pool.addEventListener(event, (e: any) => seen.set(event, e.detail ?? {}));
+      }
+
+      await scheduler.addTask(new FyflowTask({
+        id: `doc-teardown-optional-${inline}`,
+        workerType: 'NoTeardownWorker',
+        payload: { id: `doc-teardown-optional-${inline}`, value: 1 }
+      }), { createPromise: true });
+
+      await scheduler.shutdown();
+
+      if (seen.has('worker.teardown.failed')) {
+        throw new Error(`${kind}: a missing teardown() is not a failure, but worker.teardown.failed fired`);
+      }
+
+      for (const event of ['worker.teardown.started', 'worker.teardown.completed']) {
+        const detail = seen.get(event);
+        if (!detail) {
+          throw new Error(
+            `${kind}: ${event} did not fire for a worker without teardown(). ` +
+            `The events report that a worker is being destroyed, not that it implemented a hook.`
+          );
+        }
+        if (!detail.workerId) throw new Error(`${kind}: ${event} missing workerId`);
+        if (typeof detail.timestamp !== 'number') throw new Error(`${kind}: ${event} missing timestamp`);
+        if (detail.workerType !== (inline ? 'inline' : 'thread')) {
+          throw new Error(`${kind}: ${event} has workerType ${detail.workerType}`);
+        }
+      }
+
+      if (typeof seen.get('worker.teardown.completed').duration !== 'number') {
+        throw new Error(`${kind}: worker.teardown.completed missing duration`);
+      }
+    }
+  }
+
   private async docDetailsAreLive(): Promise<void> {
     const scheduler = this.makeScheduler();
 

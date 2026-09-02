@@ -351,32 +351,42 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     }
 
     async _destroyWorkerInstance() {
-        if (this.workerInstance?.teardown) {
-            try {
-                this.dispatchEvent(new CustomEvent('worker.teardown.started', {
-                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
-                }));
+        // Nothing was ever constructed, so no worker is being destroyed and there
+        // is no lifecycle to report.
+        if (!this.workerInstance) return;
 
-                const teardownStartTime = performance.now();
-                await this.workerInstance.teardown();
+        this.dispatchEvent(new CustomEvent('worker.teardown.started', {
+            detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
+        }));
 
-                this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
-                    detail: {
-                        workerId: this.id,
-                        workerType: 'inline',
-                        timestamp: Date.now(),
-                        duration: performance.now() - teardownStartTime
-                    }
-                }));
-            } catch (teardownError) {
-                // Emit failure event but continue with cleanup
-                this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
-                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now(), error: teardownError }
-                }));
+        const teardownStartTime = performance.now();
 
-                // Log for debugging but don't throw
-                console.warn(`Worker ${this.id} teardown failed:`, teardownError);
-            }
+        try {
+            // teardown() is optional on WorkerInterface - the events are not. They
+            // report that a worker is being destroyed, which is true whether or not
+            // it chose to implement a hook, so a consumer tracking worker state can
+            // rely on seeing them. Guarding the events on the method's existence
+            // meant a worker without teardown() was destroyed silently, and made
+            // inline pools emit a different set from threaded ones, which the
+            // worker-side wrapper has always got right via `teardown?.()`.
+            await this.workerInstance.teardown?.();
+
+            this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
+                detail: {
+                    workerId: this.id,
+                    workerType: 'inline',
+                    timestamp: Date.now(),
+                    duration: performance.now() - teardownStartTime
+                }
+            }));
+        } catch (teardownError) {
+            // Emit failure event but continue with cleanup
+            this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
+                detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now(), error: teardownError }
+            }));
+
+            // Log for debugging but don't throw
+            console.warn(`Worker ${this.id} teardown failed:`, teardownError);
         }
 
         // Always proceed with de-instantiation regardless of teardown success
