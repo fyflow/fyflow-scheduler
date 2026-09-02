@@ -588,23 +588,79 @@ class DocsTestSuite {
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       : new URL((await import('../workers/crashingWorker.ts?worker-direct')).default).href;
 
-    const pool = new WorkerManager(crashUrl, {
-      maxThreads: 1, maxConcurrentTasks: 1, inline: true, config: { crashOnTeardown: true }
+    // Both pool types, deliberately. This test used to cover inline only, which
+    // is why threaded pools could emit worker.teardown.started and then nothing:
+    // a worker whose teardown() throws replies with an error rather than the
+    // teardown acknowledgement, so 'failed' was documented but unreachable and
+    // terminate() sat out its full acknowledgement timeout.
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(crashUrl, {
+        maxThreads: 1, maxConcurrentTasks: 1, inline, config: { crashOnTeardown: true }
+      });
+      const scheduler = new FyflowScheduler({ CrashingWorker: pool });
+
+      let teardownFailed = 0;
+      let teardownStarted = 0;
+      let failureDetail: any = null;
+      pool.addEventListener('worker.teardown.started', () => { teardownStarted++; });
+      pool.addEventListener('worker.teardown.failed', (e: any) => {
+        teardownFailed++;
+        failureDetail = e.detail;
+      });
+
+      await scheduler.addTask(new FyflowTask({
+        id: `teardown-${inline}`, workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+      }), { createPromise: true });
+
+      // Shutdown tears the worker down, and its teardown throws
+      await scheduler.shutdown();
+
+      if (teardownFailed !== 1) {
+        throw new Error(`${kind}: expected 1 worker.teardown.failed, got ${teardownFailed}`);
+      }
+      // Every started must reach a terminal event, or a consumer folding these
+      // into worker state is left holding a worker that never finished tearing down
+      if (teardownStarted !== 1) {
+        throw new Error(`${kind}: expected 1 worker.teardown.started, got ${teardownStarted}`);
+      }
+      if (failureDetail?.workerType !== (inline ? 'inline' : 'thread')) {
+        throw new Error(`${kind}: worker.teardown.failed has workerType ${failureDetail?.workerType}`);
+      }
+      if (!failureDetail?.error) {
+        throw new Error(`${kind}: worker.teardown.failed carries no error`);
+      }
+    }
+
+    // A worker that neither completes nor throws must still close the pair. The
+    // wrapper's acknowledgement timeout has to stay below WorkerManager's own
+    // termination timeout, or the manager abandons the terminate() it is
+    // awaiting and the failure it reports is never observed by anyone.
+    const hangPool = new WorkerManager(crashUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: false, config: { hangOnTeardown: true }
     });
-    const scheduler = new FyflowScheduler({ CrashingWorker: pool });
+    const hangScheduler = new FyflowScheduler({ CrashingWorker: hangPool });
 
-    let teardownFailed = 0;
-    pool.addEventListener('worker.teardown.failed', () => { teardownFailed++; });
+    const hangSeen: string[] = [];
+    for (const event of ['worker.teardown.started', 'worker.teardown.completed', 'worker.teardown.failed']) {
+      hangPool.addEventListener(event, () => hangSeen.push(event.replace('worker.teardown.', '')));
+    }
 
-    await scheduler.addTask(new FyflowTask({
-      id: 'teardown', workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+    await hangScheduler.addTask(new FyflowTask({
+      id: 'teardown-hang', workerType: 'CrashingWorker', payload: { action: 'normal-task' }
     }), { createPromise: true });
 
-    // Shutdown tears the worker down, and its teardown throws
-    await scheduler.shutdown();
+    await hangScheduler.shutdown();
 
-    if (teardownFailed !== 1) {
-      throw new Error(`Expected 1 worker.teardown.failed, got ${teardownFailed}`);
+    if (!hangSeen.includes('started')) {
+      throw new Error('hanging teardown: worker.teardown.started did not fire');
+    }
+    if (!hangSeen.includes('failed')) {
+      throw new Error(
+        `hanging teardown: expected worker.teardown.failed once the worker stopped ` +
+        `answering, saw [${hangSeen.join(', ') || 'nothing'}]. A started with no ` +
+        `terminal event leaves a consumer holding a worker that never finished.`
+      );
     }
   }
 

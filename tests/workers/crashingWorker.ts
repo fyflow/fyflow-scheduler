@@ -74,6 +74,13 @@ export default class CrashingWorker extends BaseWorker {
   }
 
   async teardown(): Promise<void> {
+    // Never settles. Lets a test observe the OTHER route to
+    // worker.teardown.failed: a worker that neither completes nor throws, where
+    // the wrapper has to give up on it and report that itself.
+    if (this.config.hangOnTeardown) {
+      await new Promise<void>(() => {});
+    }
+
     // Lets a test observe worker.teardown.failed, which nothing else emits
     if (this.config.crashOnTeardown) {
       throw new Error('Intentional crash during worker teardown');

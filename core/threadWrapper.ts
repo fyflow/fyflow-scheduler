@@ -4,6 +4,18 @@
 import getWorkerUrl from "./workerWrapperUrl.ts";
 import { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, WorkerTerminationError } from "./workerInterface.ts";
 
+// How long terminate() waits for the worker to acknowledge teardown before
+// giving up on it. A module constant rather than a field or an option:
+// ThreadWrapper is exported, so a public field would be API surface, and this is
+// a backstop rather than something worth tuning.
+//
+// It MUST stay below WorkerManager.shutdown()'s own 1000ms termination timeout.
+// At an equal value the manager's timer - started first - always wins, it
+// abandons the terminate() it is awaiting, and the worker.teardown.failed
+// reported here is never observed by anyone. Measured: a worker whose teardown()
+// hangs emitted only 'started' with both set to 1000ms.
+const TEARDOWN_ACK_TIMEOUT_MS = 500;
+
 export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
     worker: Worker | null = null;
     runningTasks = 0;
@@ -321,6 +333,24 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
               return;
             }
 
+            // Teardown has no task callback either. A worker whose teardown()
+            // threw sends its error here rather than the 'teardown' reply, so
+            // without this branch the pool emitted worker.teardown.started and
+            // then nothing at all - no completed, no failed - and terminate()
+            // sat out its full acknowledgement timeout. worker.teardown.failed
+            // was documented for both pool types but unreachable on this one.
+            if (taskId === 'teardown') {
+              this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
+                detail: {
+                  workerId: this.id,
+                  workerType: 'thread',
+                  timestamp: Date.now(),
+                  error: new Error(data?.message || String(data))
+                }
+              }));
+              return;
+            }
+
             // Initialization has no task callback registered, so without this the
             // error was dropped and _ensureInitialized() hung until its 30s
             // timeout instead of failing immediately
@@ -513,16 +543,42 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
           // Give worker a chance to clean up
           this.worker?.postMessage({ taskId: 'teardown', action: 'teardown' });
 
-          // Wait a short time for teardown response
-          await new Promise<void>((resolve) => {
-            const timeout = setTimeout(resolve, 1000); // 1 second timeout
-            const onTeardown = () => {
-              clearTimeout(timeout);
-              this.removeEventListener('worker.teardown.completed', onTeardown);
-              resolve();
+          // Wait for EITHER terminal event, not just completed. Waiting only on
+          // completed meant a failed teardown sat here until the timeout, and the
+          // timeout resolved silently - so a caller watching worker state saw
+          // started and never anything else.
+          const acknowledged = await new Promise<boolean>((resolve) => {
+            // settle() closes over `timer` before it is declared. That is safe:
+            // it can only run from the timer callback or a listener, both of
+            // which fire after the declaration below has been evaluated.
+            const settle = (value: boolean) => {
+              clearTimeout(timer);
+              this.removeEventListener('worker.teardown.completed', onCompleted);
+              this.removeEventListener('worker.teardown.failed', onFailed);
+              resolve(value);
             };
-            this.addEventListener('worker.teardown.completed', onTeardown);
+            const onCompleted = () => settle(true);
+            const onFailed = () => settle(true);
+            const timer = setTimeout(() => settle(false), TEARDOWN_ACK_TIMEOUT_MS);
+            this.addEventListener('worker.teardown.completed', onCompleted);
+            this.addEventListener('worker.teardown.failed', onFailed);
           });
+
+          // Silence is itself a failure to tear down: the worker is about to be
+          // terminated with its cleanup unacknowledged, and a consumer folding
+          // these events needs the pair to close.
+          if (!acknowledged) {
+            this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
+              detail: {
+                workerId: this.id,
+                workerType: 'thread',
+                timestamp: Date.now(),
+                error: new Error(
+                  `Worker did not acknowledge teardown within ${TEARDOWN_ACK_TIMEOUT_MS}ms`
+                )
+              }
+            }));
+          }
         } catch (error) {
           this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
             detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now(), error }
