@@ -1,0 +1,110 @@
+name: Benchmark
+
+# Manual only, deliberately. Benchmarks are slow, and their numbers are not a
+# pass/fail signal - gating merges on them would block work on noise.
+#
+# A note on why this exists, since "CI is more consistent than my laptop" is only
+# half true. GitHub-hosted runners are shared-tenancy VMs: absolute numbers from
+# them are NOT low-variance, and their core count differs from most dev machines,
+# so threading scenarios behave differently here than in production.
+#
+# What this buys is the comparison. Both commits run back to back in the SAME
+# job, on the SAME runner, in the same order - which controls for the machine
+# entirely and is exactly the methodology TODO_CHECKLIST prescribes. Read the
+# two columns against each other. Never against a number recorded on another day.
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Commit/tag/branch to compare against'
+        required: true
+        default: 'main'
+      category:
+        description: 'Benchmark category'
+        required: true
+        default: 'quick'
+        type: choice
+        options: [quick, startup, contention, overlapping, baseline, group_scaling, fire_and_forget, stress]
+      runs:
+        description: 'Runs per scenario (1-10). More runs, less noise, longer job.'
+        required: true
+        default: '3'
+      performance_suite:
+        description: 'Also run the contention scaling suite (head only)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: ${{ inputs.category }} — head vs ${{ inputs.base }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # the base ref must be reachable
+
+      - uses: denoland/setup-deno@v2
+        with:
+          # Same pin as ci.yml. A benchmark comparing two commits on two Deno
+          # versions would measure the toolchain, not the change.
+          deno-version: v2.9.6
+
+      - name: Install dependencies
+        run: deno install
+
+      - name: Record environment
+        run: |
+          {
+            echo "### Environment"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| runner | \`${{ runner.os }}\` |"
+            echo "| cores | \`$(nproc)\` |"
+            echo "| memory | \`$(free -h | awk '/^Mem:/{print $2}')\` |"
+            echo "| deno | \`$(deno --version | head -1)\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Head first, then base, then head is NOT re-run: the pair is what matters,
+      # and a third run would only add wall-clock without improving the comparison.
+      - name: Benchmark HEAD
+        run: |
+          deno run --allow-read --allow-net --allow-write --allow-env benchmark/runBenchmarks.ts \
+            --categories '${{ inputs.category }}' --runs '${{ inputs.runs }}' \
+            --format json --output head.json
+
+      - name: Benchmark base (${{ inputs.base }})
+        run: |
+          git checkout --detach '${{ inputs.base }}'
+          deno run --allow-read --allow-net --allow-write --allow-env benchmark/runBenchmarks.ts \
+            --categories '${{ inputs.category }}' --runs '${{ inputs.runs }}' \
+            --format json --output base.json
+          git checkout --force -
+
+      - name: Compare
+        run: |
+          deno run --allow-read scripts/compareBenchmarks.ts base.json head.json \
+            --base-ref='${{ inputs.base }}' --head-ref="$(git rev-parse --short HEAD)" \
+            --runs='${{ inputs.runs }}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Not a benchmark - it asserts the scheduler still drains under contention
+      # at up to 25k tasks, which no other job covers.
+      - name: Contention scaling suite
+        if: ${{ inputs.performance_suite }}
+        run: deno task test:performance
+
+      - name: Upload raw reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ inputs.category }}-${{ github.run_id }}
+          path: |
+            head.json
+            base.json
+          retention-days: 30
