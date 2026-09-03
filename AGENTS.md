@@ -550,6 +550,15 @@ A failing `setup()` emits **both** `worker.setup.failed` and, after it,
 setup pair, the second is the signal the pool acts on when deciding to restart or
 give up. Count failures from `worker.initialization.failed`, not from both.
 
+**A failing `setup()` still tears the worker down.** `setup()` runs after the
+instance is constructed, so one that throws partway may already hold something
+only `teardown()` releases — a connection, a lock, a remote session. `teardown()`
+is therefore invoked, with its own `worker.teardown.started` and terminal event,
+before the initialization failure is reported. Write `teardown()` so it tolerates
+partially-initialised state: it can run against an instance whose `setup()` never
+finished. A `teardown()` that throws there is reported as
+`worker.teardown.failed` and does not replace the setup error.
+
 > `scheduler.completed` fires **every time the scheduler drains**, so it can fire
 > more than once when tasks arrive in waves. It does account for tasks blocked on
 > a resource group, so it will not fire while work is still waiting for capacity.

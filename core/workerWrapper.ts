@@ -83,6 +83,23 @@ self.onmessage = async (e) => {
                 // become an initialization failure, so worker.setup.started
                 // always reaches a terminal event of its own.
                 sendMessage({ type: 'setup_failed', data: { message: setupError?.message ?? String(setupError) } });
+
+                // The instance exists - it was constructed before setup ran - so if
+                // setup threw partway it may hold something only teardown() frees.
+                // Terminating the thread reclaims memory but not a remote session, a
+                // lock, or a registered listener, so this ran nowhere and leaked.
+                sendMessage({ type: 'teardown_started' });
+                try {
+                    await workerInstance.teardown?.();
+                    sendMessage({ type: 'teardown' });
+                } catch (teardownError: any) {
+                    // Reported, never rethrown: the setup error below is the one the
+                    // pool acts on, and a cleanup failure must not replace it.
+                    sendMessage({ type: 'error', taskId: 'teardown', data: { message: teardownError?.message ?? String(teardownError) } });
+                }
+                workerInstance = null;
+                WorkerClass = null;
+
                 throw setupError;
             }
             sendMessage({ type: 'setup_completed', data: { duration: performance.now() - setupStart } });

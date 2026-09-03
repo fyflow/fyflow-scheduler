@@ -201,11 +201,34 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             return instance;
 
         } catch (error) {
-            // Always attempt teardown if instance was created
-            if (instance?.teardown) {
+            // The instance was constructed before setup() ran, so if setup threw
+            // partway it may hold something that only teardown() releases. Tear it
+            // down, and report that as the lifecycle event it is - this used to
+            // happen silently, which meant a worker was destroyed with no
+            // worker.teardown.* pair at all, and the threaded path did not do it
+            // at all.
+            if (instance) {
+                this.dispatchEvent(new CustomEvent('worker.teardown.started', {
+                    detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now() }
+                }));
+                const cleanupStart = performance.now();
                 try {
-                    await instance.teardown();
+                    await instance.teardown?.();
+                    this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
+                        detail: {
+                            workerId: this.id,
+                            workerType: 'inline',
+                            timestamp: Date.now(),
+                            duration: performance.now() - cleanupStart
+                        }
+                    }));
                 } catch (teardownError) {
+                    // Reported, never rethrown: the initialization failure below is
+                    // the one the pool acts on, and masking it with a cleanup error
+                    // would lose the reason the worker could not start.
+                    this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
+                        detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now(), error: teardownError }
+                    }));
                     console.warn('Teardown failed during initialization cleanup:', teardownError);
                 }
             }

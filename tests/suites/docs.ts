@@ -145,6 +145,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
+    this.results.push(await this.runTest('Doc: A Failed Setup Still Tears The Worker Down', () => this.docSetupFailureTearsDown()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -1027,6 +1028,70 @@ class DocsTestSuite {
   // remains the signal the pool acts on - but worker.setup.started needs a
   // terminal event of its own or its pair never closes. Both are emitted, in
   // that order, by both pool types.
+  // setup() runs AFTER the instance is constructed, so a setup that throws
+  // partway may hold something only teardown() releases. Terminating a worker
+  // thread reclaims its memory but not a remote session, a lock or a registered
+  // listener, so the cleanup has to actually run - and be reported, or the
+  // worker is destroyed with no teardown pair at all.
+  //
+  // crashOnTeardown is what makes this test prove INVOCATION rather than just
+  // event emission: worker.teardown.failed can only arrive if teardown() ran.
+  private async docSetupFailureTearsDown(): Promise<void> {
+    const crashUrl = typeof Deno !== "undefined"
+      ? new URL("../workers/crashingWorker.ts", import.meta.url).href
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      : new URL((await import('../workers/crashingWorker.ts?worker-direct')).default).href;
+
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(crashUrl, {
+        maxThreads: 1, maxConcurrentTasks: 1, inline,
+        maxWorkerRestarts: 0, requeueFailedTasks: false,
+        config: { crashInSetup: true, crashOnTeardown: true }
+      });
+      const scheduler = new FyflowScheduler({ CrashingWorker: pool });
+
+      const order: string[] = [];
+      for (const [event, label] of [
+        ['worker.setup.failed', 'setup.failed'],
+        ['worker.teardown.started', 'teardown.started'],
+        ['worker.teardown.completed', 'teardown.completed'],
+        ['worker.teardown.failed', 'teardown.failed']
+      ] as const) {
+        pool.addEventListener(event, () => order.push(label));
+      }
+
+      const settled = Promise.resolve(scheduler.addTask(new FyflowTask({
+        id: `doc-setup-teardown-${inline}`, workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+      }), { createPromise: true })).catch(() => {});
+      await Promise.race([settled, new Promise(resolve => setTimeout(resolve, 3000))]);
+      await Promise.race([
+        scheduler.shutdown().catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, 2000))
+      ]);
+
+      if (!order.includes('teardown.started')) {
+        throw new Error(
+          `${kind}: a worker whose setup() threw was destroyed with no ` +
+          `worker.teardown.started, saw [${order.join(', ')}]`
+        );
+      }
+      // Only reachable by actually calling teardown(), which is the point
+      if (!order.includes('teardown.failed')) {
+        throw new Error(
+          `${kind}: teardown() was not invoked after setup() threw, saw ` +
+          `[${order.join(', ')}]. Whatever setup acquired before throwing is leaked.`
+        );
+      }
+      if (order.includes('teardown.completed')) {
+        throw new Error(`${kind}: teardown threw, so completed must not fire: [${order.join(', ')}]`);
+      }
+      if (order.indexOf('setup.failed') > order.indexOf('teardown.started')) {
+        throw new Error(`${kind}: setup.failed must precede the cleanup teardown: [${order.join(', ')}]`);
+      }
+    }
+  }
+
   private async docSetupFailure(): Promise<void> {
     const crashUrl = typeof Deno !== "undefined"
       ? new URL("../workers/crashingWorker.ts", import.meta.url).href

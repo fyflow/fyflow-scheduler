@@ -274,6 +274,17 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
             }));
             return;
 
+          // Sent when the worker tears itself down after a failed setup.
+          // terminate() emits this itself on the ordinary path, but that path is
+          // gated on `initialized`, which a worker that never finished setup
+          // never reaches - so without this the cleanup teardown had no pair.
+          case 'teardown_started':
+            this.teardownStartTime = performance.now();
+            this.dispatchEvent(new CustomEvent('worker.teardown.started', {
+              detail: { workerId: this.id, workerType: 'thread', timestamp: Date.now() }
+            }));
+            return;
+
           // A setup failure is still an initialization failure - the worker
           // rethrows and 'error' with taskId 'init' follows - but setup.started
           // needs a terminal event of its own, or its pair never closes.
