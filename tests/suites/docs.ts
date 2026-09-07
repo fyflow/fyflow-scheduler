@@ -146,6 +146,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
     this.results.push(await this.runTest('Doc: A Failed Setup Still Tears The Worker Down', () => this.docSetupFailureTearsDown()));
+    this.results.push(await this.runTest('Doc: A Typed .ts Worker Runs Under Node Type Stripping', () => this.docTypeScriptWorkerOnNode()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -1268,6 +1269,84 @@ class DocsTestSuite {
     }
     if (typeof completedDetail.timestamp !== 'number') {
       throw new Error('scheduler.completed carried no timestamp');
+    }
+  }
+
+  // RECIPE: AGENTS.md section 3 - a `.ts` worker on Node, with no build step.
+  //
+  // Section 3 told every Node consumer to compile their worker to JavaScript.
+  // That stopped being true at Node 22.18, where type stripping is on by
+  // default, and the advice was costing consumers a build step they did not
+  // need. This test is what keeps the corrected claim honest.
+  //
+  // It is deliberately Node-only. On Deno the same claim is proved by every
+  // other test in this repository - they all point at `.ts` workers - and the
+  // Deno test task runs without --allow-write, so it could not stage the file
+  // anyway.
+  //
+  // The worker below is deliberately self-contained - no imports - so it tests
+  // the loader and nothing else: a typed constructor, a typed run() and an
+  // `interface`, all of which section 3 promises are erasable. Add an `enum` to
+  // it and this test fails with the ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX that
+  // section 3 now documents, which is how it was checked to be non-vacuous.
+  //
+  // The import half of section 3's claim is guarded elsewhere:
+  // `verbatimModuleSyntax` in tsconfig.json and deno.json makes a type imported
+  // as a value a compile error, and scripts/jsr-smoke.ts loads the published
+  // source through Node's real stripping loader.
+  private async docTypeScriptWorkerOnNode(): Promise<void> {
+    if (typeof Deno !== 'undefined') return;
+
+    const [major, minor] = process.versions.node.split('.').map(Number);
+    if (!(major > 22 || (major === 22 && minor >= 18))) return;
+
+    const fs = await import('node:fs/promises');
+    const os = await import('node:os');
+    const nodePath = await import('node:path');
+    const nodeUrl = await import('node:url');
+
+    const dir = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'fyflow-ts-worker-'));
+    const workerFile = nodePath.join(dir, 'typedWorker.ts');
+
+    await fs.writeFile(workerFile, [
+      "interface Payload { value: number }",
+      "",
+      "export default class TypedWorker {",
+      "  private factor: number;",
+      "  constructor(config: { factor?: number } = {}) {",
+      "    this.factor = config.factor ?? 2;",
+      "  }",
+      "  async setup(): Promise<void> {}",
+      "  async teardown(): Promise<void> {}",
+      "  async run(payload: Payload): Promise<number> {",
+      "    return payload.value * this.factor;",
+      "  }",
+      "}",
+      ""
+    ].join('\n'));
+
+    const workerUrl = nodeUrl.pathToFileURL(workerFile).href;
+
+    try {
+      // Both pool modes, because they load the worker by different paths:
+      // inline imports it in-process, threaded imports it inside the worker
+      // thread through core/workerWrapper.ts.
+      for (const inline of [true, false]) {
+        const pool = new WorkerManager(workerUrl, { maxThreads: 2, inline, idleTimeout: 0 });
+        const scheduler = new FyflowScheduler({ TypedWorker: pool });
+        this.schedulers.push(scheduler);
+
+        const result = await scheduler.addTask(
+          new FyflowTask({ id: `ts-worker-${inline}`, workerType: 'TypedWorker', payload: { value: 21 } }),
+          { createPromise: true }
+        );
+
+        if (result !== 42) {
+          throw new Error(`inline=${inline}: expected 42, got ${JSON.stringify(result)}`);
+        }
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
     }
   }
 

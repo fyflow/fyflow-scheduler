@@ -1,7 +1,8 @@
 // Worker used by the documentation examples in tests/suites/docs.ts.
 // Kept deliberately close to the snippet published in README.md / AGENTS.md.
 
-import { BaseWorker, WorkerConfig, BaseWorkerContext, TaskWorkerContext } from '../../index.ts';
+import { BaseWorker } from '../../index.ts';
+import type { WorkerConfig, BaseWorkerContext, TaskWorkerContext } from '../../index.ts';
 
 export default class DocsWorker extends BaseWorker {
   private multiplier: number;

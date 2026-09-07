@@ -113,18 +113,20 @@ export default class MyWorker extends BaseWorker {
 
 Point the pool at your worker file's URL.
 
-**npm (Node and browser)** - ship a compiled `.js` worker:
+**npm (Node and browser)** - a compiled `.js` worker always works:
 
 ```javascript
 const workerUrl = new URL('./myWorker.js', import.meta.url).href;
 const pool = new WorkerManager(workerUrl, { maxThreads: 4 });
 ```
 
-No bundler plugin and no build step for the worker itself. Node cannot import
-TypeScript, so a `.ts` worker fails with `Unknown file extension`; compile it as
-part of your own build. In the browser, your bundler needs to emit the worker as
-a separate asset, which most do automatically for
-`new URL('./myWorker.js', import.meta.url)`.
+No bundler plugin and no build step for the worker itself. On Node >= 22.18 a
+`.ts` worker works too, with no build step, as long as it sticks to erasable
+syntax - types must be imported with `import type`, and `enum` is out. See
+AGENTS.md §3 for the full conditions. In the browser there is no type
+stripping, so the worker must be JavaScript by the time it reaches the page,
+and your bundler needs to emit it as a separate asset - which most do
+automatically for `new URL('./myWorker.js', import.meta.url)`.
 
 **Deno (JSR)** - point at the TypeScript source, which Deno loads directly:
 

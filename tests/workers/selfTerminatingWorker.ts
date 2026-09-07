@@ -1,6 +1,7 @@
 // Test worker that can self-terminate using the terminateWithError API
 
-import { BaseWorker, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from '../../core/workerInterface.ts';
+import { BaseWorker, WorkerTerminationError } from '../../core/workerInterface.ts';
+import type { BaseWorkerContext, TaskWorkerContext } from '../../core/workerInterface.ts';
 
 export default class SelfTerminatingWorker extends BaseWorker {
   private terminationTimer: ReturnType<typeof setTimeout> | null = null;

@@ -1,4 +1,5 @@
-import { BaseWorker, WorkerConfig } from "../../core/workerInterface.ts";
+import { BaseWorker } from "../../core/workerInterface.ts";
+import type { WorkerConfig } from "../../core/workerInterface.ts";
 
 /**
  * Simple Worker - Basic class-based worker template

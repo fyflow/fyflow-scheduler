@@ -115,7 +115,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Seven suites, 132 tests, all in the default `deno task test` run:
+Seven suites, 134 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -125,7 +125,7 @@ Seven suites, 132 tests, all in the default `deno task test` run:
 | settlement | 17 | exactly-once settlement, counter cardinality |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 23 | `resource.*` events, gauges, admission queue |
-| docs | 33 | **executes every snippet in README.md and AGENTS.md** |
+| docs | 35 | **executes every snippet in README.md and AGENTS.md** |
 
 `deno task test:scripts` is separate and not included in `deno task test` — it
 unit-tests `scripts/publishOutput.ts`.
@@ -170,6 +170,23 @@ warning, the package would publish, and every consumer would fail on their first
 threaded task. `deno task jsr:smoke` exists to catch exactly this — it stages
 only the publishable files and runs a real threaded worker against them. **A
 green dry run is not evidence the package works.**
+
+**No typechecker in this repo can see a type imported as a value.** Node runs
+TypeScript by *erasing* types, not compiling them, so `import { SomeInterface }`
+survives erasure as a real named import and throws
+`does not provide an export named 'SomeInterface'` at load. `deno check` and
+`tsc` both resolve types and pass it green. That is how 0.5.1 shipped with five
+core modules unloadable by Node, found by a downstream consumer rather than by
+CI. Two guards now exist and both must stay: `verbatimModuleSyntax` in
+`tsconfig.json` and `deno.json` turns it into TS1484, and `deno task jsr:smoke`
+loads the staged package through Node's real stripping loader — which is the
+only thing here that catches the other half of the class, non-erasable syntax
+(`enum`, runtime `namespace`, parameter properties, decorators), because that
+typechecks green everywhere too.
+
+Consumers are affected by the same rule: a `.ts` worker on Node >= 22.18 needs
+no build step, but only if it is erasable. `AGENTS.md` §3 documents the
+conditions and the docs suite tests them.
 
 **`publish.exclude` in `deno.json` is an allowlist** (`**` plus `!` exceptions),
 so a new published module must be added explicitly. It currently ships 16 files.

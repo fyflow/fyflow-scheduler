@@ -1,6 +1,6 @@
 import { ThreadWrapper } from "./threadWrapper.ts";
 import { InlineWrapper } from "./inlineWrapper.ts";
-import { WorkerStatus } from "./workerInterface.ts";
+import type { WorkerStatus } from "./workerInterface.ts";
 
 type WorkerInstance = ThreadWrapper | InlineWrapper;
 

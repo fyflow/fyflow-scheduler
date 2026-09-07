@@ -1,7 +1,8 @@
 // Universal worker wrapper for thread-based workers
 // Handles message protocol and dynamically imports the actual worker class
 
-import { WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext, WorkerTerminationError } from './workerInterface.ts';
+import type { WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext } from './workerInterface.ts';
+import { WorkerTerminationError } from './workerInterface.ts';
 
 let WorkerClass: any = null;
 let workerInstance: any = null;

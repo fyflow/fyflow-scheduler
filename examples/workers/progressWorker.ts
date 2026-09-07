@@ -1,4 +1,4 @@
-import { WorkerInterface, WorkerConfig, WorkerContext } from "../../core/workerInterface.ts";
+import type { WorkerInterface, WorkerConfig, WorkerContext } from "../../core/workerInterface.ts";
 
 /**
  * Progress Worker - Demonstrates real-time progress reporting

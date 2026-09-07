@@ -11,7 +11,7 @@
 //
 // Run: deno task jsr:smoke
 
-import { basename, dirname, fromFileUrl, join } from "jsr:@std/path@^1.1.2";
+import { basename, dirname, fromFileUrl, join, toFileUrl } from "jsr:@std/path@^1.1.2";
 import { externalImports, parsePublishedFileUrls, stagingPlan } from "./publishOutput.ts";
 
 const repoRoot = new URL("../", import.meta.url);
@@ -142,7 +142,60 @@ if (code !== 0 || !out.includes("THREAD_WORKER_OK")) {
   Deno.exit(1);
 }
 
+// The published source must also load on a runtime that ERASES types rather
+// than compiling them - Node >= 22.18, where type stripping is on by default.
+// Nothing else in this repo can see that class of bug: `deno check` and `tsc`
+// both resolve types, so a type imported as a value typechecks green here and
+// throws "does not provide an export named X" the moment Node loads the file.
+// That exact defect shipped in 0.5.1 (core/threadWrapper.ts and four others),
+// and it was a downstream consumer importing the JSR source under Node that
+// found it. `verbatimModuleSyntax` in tsconfig.json is the compile-time half of
+// the guard; this is the half that runs the real loader.
+const nodeStripCheck = await nodeTypeStrippingCheck(join(staging, "index.ts"));
+if (nodeStripCheck === "skipped") {
+  console.log("⚠️  Node type-stripping check skipped (needs Node >= 22.18)");
+} else if (nodeStripCheck !== "ok") {
+  console.error("❌ The published TypeScript source does not load under Node type stripping");
+  console.error(nodeStripCheck);
+  console.error("");
+  console.error("Two causes. A type imported as a value - use `import type`, and");
+  console.error("`tsc -p tsconfig.json --noEmit` will report it as TS1484. Or syntax");
+  console.error("that stripping cannot erase (enum, runtime namespace, parameter");
+  console.error("property, decorator), which no typechecker here flags at all - that");
+  console.error("is ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX above, and this run is the only");
+  console.error("thing in the repo that sees it.");
+  Deno.exit(1);
+}
+
 await Deno.remove(staging, { recursive: true });
 console.log("✅ Threaded worker ran against the published files only");
 console.log("✅ No Node-specific files in the package");
 console.log("✅ No dependencies - every import stays inside the package");
+
+// Loads `entry` with Node's ESM loader. Returns "ok", "skipped" when Node is
+// absent or predates default type stripping, and otherwise Node's own output.
+//
+// Only erasable syntax survives stripping, so this also rejects an `enum`, a
+// runtime `namespace` or a parameter property reaching the published source.
+async function nodeTypeStrippingCheck(entry: string): Promise<string> {
+  let version: string;
+  try {
+    const probe = await new Deno.Command("node", { args: ["--version"], stdout: "piped", stderr: "null" }).output();
+    if (!probe.success) return "skipped";
+    version = new TextDecoder().decode(probe.stdout).trim();
+  } catch {
+    return "skipped";
+  }
+
+  const [major, minor] = version.replace(/^v/, "").split(".").map(Number);
+  if (!(major > 22 || (major === 22 && minor >= 18))) return "skipped";
+
+  const run = await new Deno.Command("node", {
+    args: ["--input-type=module", "-e", `await import(${JSON.stringify(toFileUrl(entry).href)});`],
+    stdout: "piped",
+    stderr: "piped"
+  }).output();
+
+  if (run.success) return "ok";
+  return new TextDecoder().decode(run.stdout) + new TextDecoder().decode(run.stderr);
+}

@@ -1,4 +1,5 @@
-import { BaseWorker, WorkerConfig, TaskWorkerContext } from "../../core/workerInterface.ts";
+import { BaseWorker } from "../../core/workerInterface.ts";
+import type { WorkerConfig, TaskWorkerContext } from "../../core/workerInterface.ts";
 
 /**
  * Test Spawning Worker - spawns tasks at runtime via context.spawnTask()

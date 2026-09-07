@@ -2,7 +2,8 @@
 // Uncomment the line below when building for Node.js
 // import { Worker } from 'worker_threads';
 import getWorkerUrl from "./workerWrapperUrl.ts";
-import { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, WorkerTerminationError } from "./workerInterface.ts";
+import type { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext } from "./workerInterface.ts";
+import { WorkerTerminationError } from "./workerInterface.ts";
 
 // How long terminate() waits for the worker to acknowledge teardown before
 // giving up on it. A module constant rather than a field or an option:

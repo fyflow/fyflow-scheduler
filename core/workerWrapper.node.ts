@@ -2,7 +2,7 @@
 // Uses parentPort from worker_threads
 
 import { parentPort, isMainThread } from 'node:worker_threads';
-import { WorkerInterface, WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext } from './workerInterface.ts';
+import type { WorkerInterface, WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext } from './workerInterface.ts';
 
 if (isMainThread) {
     throw new Error('workerWrapper.node.ts should only be used in worker threads');

@@ -1,6 +1,7 @@
 // Test worker that can crash in various ways for error handling tests
 
-import { BaseWorker, BaseWorkerContext, TaskWorkerContext } from '../../core/workerInterface.ts';
+import { BaseWorker } from '../../core/workerInterface.ts';
+import type { BaseWorkerContext, TaskWorkerContext } from '../../core/workerInterface.ts';
 
 export default class CrashingWorker extends BaseWorker {
   private shouldCrashOnInit = false;

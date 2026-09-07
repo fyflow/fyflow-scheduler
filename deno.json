@@ -1,6 +1,6 @@
 {
     "name": "@fyflow/scheduler",
-    "version": "0.5.1",
+    "version": "0.5.2",
     "license": "MIT",
     "exports": "./index.ts",
     "publish": {
@@ -29,6 +29,7 @@
     "compilerOptions": {
       "lib": ["deno.ns", "dom", "dom.iterable", "esnext"],
       "checkJs": false,
+      "verbatimModuleSyntax": true,
       "jsx": "react",
       "strict": true
     },

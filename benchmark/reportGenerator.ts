@@ -1,6 +1,6 @@
 // Benchmark report generation and analysis
 /// <reference lib="deno.ns" />
-import { BenchmarkResult } from "./benchmarkScenarios.ts";
+import type { BenchmarkResult } from "./benchmarkScenarios.ts";
 import { formatBytes, formatDuration } from "./perfUtils.ts";
 
 export interface BenchmarkSuite {

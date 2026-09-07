@@ -1,4 +1,5 @@
-import { BaseWorker, WorkerConfig } from "../index.ts";
+import { BaseWorker } from "../index.ts";
+import type { WorkerConfig } from "../index.ts";
 
 // No-operation worker for benchmarking scheduler overhead
 // Minimizes actual work to isolate scheduler performance

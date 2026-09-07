@@ -1,4 +1,5 @@
-import { BaseWorker, WorkerConfig } from "../../core/workerInterface.ts";
+import { BaseWorker } from "../../core/workerInterface.ts";
+import type { WorkerConfig } from "../../core/workerInterface.ts";
 
 /**
  * CPU Worker - Thread-based CPU-intensive worker

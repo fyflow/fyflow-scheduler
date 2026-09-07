@@ -1,5 +1,5 @@
 // Predefined benchmark scenarios for comprehensive testing
-import { BenchmarkConfig } from "./benchmarkScenarios.ts";
+import type { BenchmarkConfig } from "./benchmarkScenarios.ts";
 
 export const BENCHMARK_SCENARIOS: BenchmarkConfig[] = [
     // 1. Large Task Volume Scenarios - Inline Workers

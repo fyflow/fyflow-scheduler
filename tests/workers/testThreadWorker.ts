@@ -1,4 +1,5 @@
-import { BaseWorker, WorkerConfig } from "../../core/workerInterface.ts";
+import { BaseWorker } from "../../core/workerInterface.ts";
+import type { WorkerConfig } from "../../core/workerInterface.ts";
 
 /**
  * Test Thread Worker - Dedicated worker file for test suite threaded execution

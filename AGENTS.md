@@ -72,7 +72,7 @@ workers and a retry timer running.
 
 A worker is loaded by URL, and what you pass depends on your runtime.
 
-### npm (Node and browser) - ship a `.js` worker
+### npm (Node and browser)
 
 ```typescript
 const workerUrl = new URL('./myWorker.js', import.meta.url).href;
@@ -84,12 +84,37 @@ That is all. No bundler plugin, no build step for the worker, no query suffix.
 Verified against the published package with both `inline: true` and
 `inline: false`.
 
-- The file must be **JavaScript**. Node cannot import TypeScript, so a `.ts`
-  worker fails with `Unknown file extension ".ts"`. Compile your worker as part
-  of your own build.
-- In the browser the URL must be reachable by the page, and your bundler needs to
-  emit the worker as a separate asset. Most bundlers do this for
-  `new URL('./myWorker.js', import.meta.url)` automatically.
+A `.js` worker always works and is the portable choice. On **Node >= 22.18** a
+`.ts` worker also works, unchanged, in both inline and threaded pools - Node
+strips types by default from that version (and from 23.6), so no build step is
+needed. Two conditions apply, and both are on your file, not on the scheduler:
+
+- **Node < 22.18 cannot do this.** This package supports Node >= 22, and type
+  stripping is off by default below 22.18, where a `.ts` worker fails with
+  `Unknown file extension ".ts"`. If you support that range, ship `.js`.
+- **Only erasable syntax survives.** Stripping deletes types, it does not
+  compile them. `enum`, a `namespace` with runtime code, parameter properties
+  (`constructor(private x: number)`) and decorators all fail with
+  `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`. A type imported without the `type`
+  keyword is the one that catches people, because it typechecks green
+  everywhere and throws only at load:
+
+  ```typescript
+  import { BaseWorker } from 'fyflow-scheduler';           // value - fine
+  import type { WorkerConfig } from 'fyflow-scheduler';    // type  - REQUIRED
+
+  // import { WorkerConfig } from 'fyflow-scheduler';
+  //   -> SyntaxError: does not provide an export named 'WorkerConfig'
+  ```
+
+  Set `"verbatimModuleSyntax": true` in your tsconfig and this becomes a
+  compile error (TS1484) instead of a runtime one.
+
+**The browser is different: it has no type stripping at all.** A browser worker
+must be JavaScript by the time it reaches the page, whatever your source
+language. The URL must be reachable by the page, and your bundler needs to emit
+the worker as a separate asset - most do this for
+`new URL('./myWorker.js', import.meta.url)` automatically.
 
 ### Deno (JSR) - point at the TypeScript source
 
@@ -101,13 +126,26 @@ Deno loads the source directly. No build step.
 
 ### Cross-runtime code
 
-Only needed if one codebase must run on both:
+On Deno and Node >= 22.18 one `.ts` worker serves both, with no branch and no
+build step:
+
+```typescript
+const workerUrl = new URL('./myWorker.ts', import.meta.url).href;
+```
+
+Branch only if the browser is a target too, or if you support Node < 22.18 -
+both need the compiled file:
 
 ```typescript
 const workerUrl = typeof Deno !== 'undefined'
   ? new URL('./myWorker.ts', import.meta.url).href
   : new URL('./myWorker.js', import.meta.url).href;
 ```
+
+Note this is about your **worker file**. Importing the scheduler itself is
+unaffected: Node and the browser take the npm package's bundles, and the JSR
+package is the Deno build - it refuses to spawn threaded workers on any other
+runtime and tells you to install the npm package instead.
 
 > **`?worker-direct` is not part of this API.** You will see it in this
 > repository's own examples and tests. It is a convention of *this repo's*
@@ -123,7 +161,8 @@ The worker file must `export default` a class. Anything else fails with
 ## 4. Writing a worker
 
 ```typescript
-import { BaseWorker, WorkerConfig, BaseWorkerContext, TaskWorkerContext }
+import { BaseWorker } from 'fyflow-scheduler';
+import type { WorkerConfig, BaseWorkerContext, TaskWorkerContext }
   from 'fyflow-scheduler';
 
 export default class MyWorker extends BaseWorker {
@@ -772,7 +811,9 @@ pool.addEventListener('worker.initialization.failed', (e) => {
 | Process never exits | `shutdown()` not called |
 | `Unknown worker type: X` | `workerType` is not a key of `workerPools` |
 | `Worker script <url> must export a default class` | Worker has no `export default class`, or the URL is wrong for the runtime (§3) |
-| `Unknown file extension ".ts"` on Node | Node cannot import TypeScript - ship a compiled `.js` worker (§3) |
+| `Unknown file extension ".ts"` on Node | Node < 22.18 has no type stripping - ship a compiled `.js` worker (§3) |
+| `SyntaxError: does not provide an export named X` loading a `.ts` worker on Node | A type imported as a value. Use `import type` (§3) |
+| `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` on Node | A `.ts` worker using non-erasable syntax - `enum`, runtime `namespace`, parameter property, decorator (§3) |
 | `Task must be added to a scheduler before tracking descendants` | `onCompleteDescendants()` called before `addTask` |
 | `terminateWithError` does nothing | Worker constructor did not forward `workerContext` to `super` |
 | Progress bar shows 0–1 instead of 0–100 | `progress` is a fraction; multiply by 100 yourself |

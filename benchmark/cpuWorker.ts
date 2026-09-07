@@ -1,4 +1,5 @@
-import { BaseWorker, WorkerConfig } from "../index.ts";
+import { BaseWorker } from "../index.ts";
+import type { WorkerConfig } from "../index.ts";
 function heavyWork(iterations = 1000) {
     // A tight math loop that's reasonably heavy per iteration.
     // Doing many trig + pow ops prevents JS engines from optimizing it away.

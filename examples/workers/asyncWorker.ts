@@ -1,4 +1,4 @@
-import { WorkerInterface, WorkerConfig } from "../../core/workerInterface.ts";
+import type { WorkerInterface, WorkerConfig } from "../../core/workerInterface.ts";
 
 /**
  * Async Worker - High-concurrency inline worker
