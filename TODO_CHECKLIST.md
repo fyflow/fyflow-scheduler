@@ -384,22 +384,45 @@ runs span 38k-76k (base) and 31k-84k (fix); 1K is bimodal as before and moved
 
 **Status**: 🟢 Completed - Deno and Node 22 144/144
 
-#### 🔵 Ready and blocked queues are quadratic above ~16K tasks
-Both are plain arrays consumed with `shift()` (and `unshift()`). V8 makes
+#### 🟢 Ready and blocked queues are quadratic above ~16K tasks
+Both were plain arrays consumed with `shift()` (and `unshift()`). V8 makes
 `shift()` effectively free on small arrays, but above roughly 16,000 elements it
 copies the array on every call. Measured on Deno 2.9.6, per `shift()`: 0.1 µs at
 15,000 elements, 79 µs at 17,000, 232 µs at 50,000. Every dispatch from a large
-ready queue pays it, so draining a 50,000-task queue spends seconds copying.
-This may account for part of the Fire-and-Forget 50K benchmark result. The two
-`!queue.includes(task)` guards before a blocked push are linear too. Fix: an
-internal queue with a head index (append at the tail, advance the head, trim
-when the head passes half the length), and replace the `includes()` guards with
-a recorded "which queue is this task in" field, since a task is in at most one
-blocked queue. Cancellation (#1) builds its constant-time `cancel()` on this
-queue. The class is a new published module (`core/taskQueue.ts`), so it needs
-its own line in the `deno.json` publish allowlist. Benchmark before and after.
+ready queue paid it. The two `!queue.includes(task)` guards before a blocked push
+were linear too: building a 100,000-task blocked queue one task at a time took
+42.7 s.
 
-**Status**: 🔵 Not Started - prerequisite for pass 1 #1
+**Outcome**: a small internal `TaskQueue` (`core/taskQueue.ts`, added to the
+publish allowlist; 17 files now ship) replaces both kinds of queue. The head is
+an index, and the consumed prefix is dropped once it passes half the array, so
+`shift()` is amortised O(1); putting a task straight back reuses its slot.
+Blocked queues opt into a membership `Set`, so their `includes()` guard is O(1).
+The plan's alternative for that guard - a "which queue is this task in" field on
+the task - was not used: a stale field would make the guard skip a push and lose
+the task, which is worse than slow, and membership kept inside the queue cannot
+go stale. The class keeps `length`, `push`, `shift`, `unshift` and iteration, so
+the scheduler's call sites barely changed, and so does `examples/
+test-deadlock.ts`, which reads the queues. `readyQueuesByWorker` and
+`blockedQueues` are public fields, so their element type changing from an array
+is visible to anyone reaching into them; neither is documented.
+
+Benchmark (`benchmark:quick --runs 3`, alternated with the previous commit, six
+runs each), medians: 50K inline 13,871 -> 82,115 tasks/sec (5.9x); 100K inline
+7,595 -> 82,984 (10.9x); 10K +43% with a wide spread. Throughput is now flat
+across 10K-100K. Threaded scenarios -3% to +2%, within their spread. 1K is
+bimodal (~1150 or ~1300 per run) as in every comparison so far; this time all
+six fix runs landed low (-10.8%), the previous comparison's landed high, and
+that scenario never queues enough to reach the changed code.
+
+Tests: FIFO order against a plain-array model over 20,000 seeded operations,
+with and without membership tracking; draining 100,000 items and building a
+100,000-item blocked queue, each bounded at 500 ms (they take tens of ms).
+Mutation checks: an array-copying `shift()` takes 3.1 s to drain; untracked
+membership takes 42.7 s to block; a reversed `unshift` breaks the order test.
+`jsr:smoke` fails without the allowlist line.
+
+**Status**: 🟢 Completed - Deno and Node 22 146/146, browser 75/75, `jsr:smoke`
 
 #### 🔵 `shutdown()` stops listening to its pools before draining them
 `shutdown()` calls `_removeAllListeners()` before its 5 s wait for running tasks.

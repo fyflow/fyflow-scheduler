@@ -6,6 +6,7 @@ import type {
   ResourceReleaseReason,
   ResourceUnblockReason
 } from './resourceEvents.ts';
+import { TaskQueue } from './taskQueue.ts';
 
 /**
  * Delimiter between a group id and a key in a blocked-queue id.
@@ -218,8 +219,11 @@ export class FyflowTask {
    */
   export class FyflowScheduler extends EventTarget {
     tasks: Map<string, FyflowTask> = new Map<string, FyflowTask>();
-    readyQueuesByWorker: Map<string, FyflowTask[]> = new Map<string, FyflowTask[]>(); // Per-worker-type queues for O(1) dispatch
-    blockedQueues: Map<string, FyflowTask[]> = new Map<string, FyflowTask[]>(); // Grouped by blocking group IDs for faster lookup
+    // Head-indexed queues rather than arrays: Array.shift() copies the whole
+    // array once it passes ~16K elements, which made draining a large queue
+    // quadratic. See core/taskQueue.ts.
+    readyQueuesByWorker: Map<string, TaskQueue<FyflowTask>> = new Map<string, TaskQueue<FyflowTask>>(); // Per-worker-type queues for O(1) dispatch
+    blockedQueues: Map<string, TaskQueue<FyflowTask>> = new Map<string, TaskQueue<FyflowTask>>(); // Grouped by blocking group IDs for faster lookup
     workerPools: any;
     groups: Record<string, any>;
     stats = {queued:0, running:0, done:0, failed:0};
@@ -263,7 +267,7 @@ export class FyflowTask {
 
       // Initialize per-worker-type ready queues
       for (const workerType of Object.keys(workerPools)) {
-        this.readyQueuesByWorker.set(workerType, []);
+        this.readyQueuesByWorker.set(workerType, new TaskQueue<FyflowTask>());
       }
 
       // Pools are constructed with group ids; only the scheduler owns the
@@ -311,7 +315,7 @@ export class FyflowTask {
       // Queue against the first group without room. Its release wakes the task.
       const short = entries.find(({ group, cost }) => !group.canRun(undefined, cost)) ?? entries[0];
       const queueId = this._blockedQueueId(short.id);
-      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, []);
+      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, new TaskQueue<FyflowTask>({ trackMembership: true }));
       const queue = this.blockedQueues.get(queueId)!;
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
@@ -644,7 +648,7 @@ export class FyflowTask {
           // Blocked on this group - and on this key, when the group is keyed
           const queueId = this._blockedQueueId(id, key);
           if (!this.blockedQueues.has(queueId)) {
-            this.blockedQueues.set(queueId, []);
+            this.blockedQueues.set(queueId, new TaskQueue<FyflowTask>({ trackMembership: true }));
           }
           const blockedQueue = this.blockedQueues.get(queueId)!;
           // It has left the ready queue: count it out of `queued` before
@@ -1068,9 +1072,7 @@ export class FyflowTask {
           if (otherQueueId === queueId) continue;
           const otherQueue = this.blockedQueues.get(otherQueueId);
           if (otherQueue) {
-            const index = otherQueue.indexOf(task);
-            if (index !== -1) {
-              otherQueue.splice(index, 1);
+            if (otherQueue.remove(task)) {
               if (this._resourceObserved) {
                 this._emitResource('resource.unblocked', g, {
                   groupId: id,
@@ -1170,9 +1172,7 @@ export class FyflowTask {
       // a queue still holding it would never drain in a consumer's fold
       this._emitOrphanedExit(task, leftQueueId);
       for (const [queueId, queue] of this.blockedQueues) {
-        const index = queue.indexOf(task);
-        if (index === -1) continue;
-        queue.splice(index, 1);
+        if (!queue.remove(task)) continue;
         this._emitOrphanedExit(task, queueId);
       }
 
@@ -1764,7 +1764,7 @@ export class FyflowTask {
         const { groupId: id, key } = this._splitQueueId(queueId);
         if (groupId !== undefined && id !== groupId) continue;
 
-        const waiters = queue.map((task, position) => {
+        const waiters = queue.toArray().map((task, position) => {
           const pool = this.workerPools[task.workerType];
           const waiter: AdmissionWaiter = {
             holderId: task.id,
@@ -1841,7 +1841,7 @@ export class FyflowTask {
         );
       }
       // 3. Clear all queues
-      this.readyQueuesByWorker.forEach(q => q.length = 0);
+      this.readyQueuesByWorker.forEach(q => q.clear());
 
       // Exit (d). Every remaining waiter is discarded, so each gets its
       // unblocked - without them a run that shuts down with tasks still blocked

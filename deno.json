@@ -13,6 +13,7 @@
         "!core/inlineWrapper.ts",
         "!core/workerInterface.ts",
         "!core/resourceEvents.ts",
+        "!core/taskQueue.ts",
         "!core/workerWrapperUrl.ts",
         "!core/workerWrapper.ts",
         "!groups/resourceGroup.ts",

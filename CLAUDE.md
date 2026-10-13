@@ -115,11 +115,11 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Seven suites, 144 tests, all in the default `deno task test` run:
+Seven suites, 146 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| core | 23 | scheduling, groups, pooling, retention |
+| core | 25 | scheduling, groups, pooling, retention, queue scaling |
 | error-handling | 12 | worker failure, restart, requeue |
 | spawning | 12 | dynamic spawning, `onCompleteDescendants()` |
 | settlement | 25 | exactly-once settlement, counter cardinality, requeue, self-termination |
@@ -189,7 +189,7 @@ no build step, but only if it is erasable. `AGENTS.md` §3 documents the
 conditions and the docs suite tests them.
 
 **`publish.exclude` in `deno.json` is an allowlist** (`**` plus `!` exceptions),
-so a new published module must be added explicitly. It currently ships 16 files.
+so a new published module must be added explicitly. It currently ships 17 files.
 
 **The package must have no dependencies.** `scripts/` uses `@std/path` and is
 kept out of the package by the allowlist alone — Deno has no devDependencies — so

@@ -5,6 +5,7 @@
 import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
 import { ConcurrentLimitGroup } from '../../groups/concurrentLimitGroup.ts';
 import { RateLimitGroup } from '../../groups/rateLimitGroup.ts';
+import { TaskQueue } from '../../core/taskQueue.ts';
 
 // Node.js process declaration for cross-platform compatibility
 declare const process: any;
@@ -126,6 +127,8 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('Batch Task Addition', () => this.testBatchTaskAddition()));
     this.results.push(await this.runTest('handleRejection Silences Fire-And-Forget Failures', () => this.testHandleRejection()));
     this.results.push(await this.runTest('periodicRetryIntervalMs Is Honoured', () => this.testPeriodicRetryInterval()));
+    this.results.push(await this.runTest('TaskQueue Keeps FIFO Order', () => this.testTaskQueueOrder()));
+    this.results.push(await this.runTest('TaskQueue Stays Linear At Scale', () => this.testTaskQueueScales()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -659,6 +662,69 @@ class CrossPlatformTestSuite {
 
   // Blocked tasks are released by the periodic retry, so a custom interval must
   // still drain them - this is the only thing the option controls
+  // TaskQueue replaces the arrays behind the ready and blocked queues. Checked
+  // against a plain array as the model, with a long, seeded mix of operations
+  // that crosses its compaction threshold many times.
+  private async testTaskQueueOrder(): Promise<void> {
+    let seed = 42;
+    const random = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+
+    for (const trackMembership of [false, true]) {
+      const queue = new TaskQueue<number>({ trackMembership });
+      const model: number[] = [];
+      let next = 0;
+      for (let step = 0; step < 20_000; step++) {
+        const roll = random();
+        if (roll < 0.5) {
+          queue.push(next); model.push(next); next++;
+        } else if (roll < 0.85) {
+          if (queue.shift() !== model.shift()) throw new Error(`shift diverged at step ${step}`);
+        } else if (roll < 0.95 && model.length > 0) {
+          // Take some off the head and put them back, as the scheduler does
+          const back = model.slice(0, 1 + Math.floor(random() * 3));
+          back.forEach(() => { queue.shift(); model.shift(); });
+          queue.unshift(...back); model.unshift(...back);
+        } else if (model.length > 0) {
+          const victim = model[Math.floor(random() * model.length)];
+          if (!queue.remove(victim)) throw new Error(`remove failed at step ${step}`);
+          model.splice(model.indexOf(victim), 1);
+        }
+        if (queue.length !== model.length) throw new Error(`length diverged at step ${step}`);
+        if (queue.at(0) !== model[0]) throw new Error(`head diverged at step ${step}`);
+      }
+      if (JSON.stringify(queue.toArray()) !== JSON.stringify(model)) throw new Error('contents diverged');
+      if (JSON.stringify([...queue]) !== JSON.stringify(model)) throw new Error('iteration diverged');
+      for (const item of model) {
+        if (!queue.includes(item)) throw new Error(`includes(${item}) is false for a queued item`);
+      }
+      if (queue.includes(-1)) throw new Error('includes() is true for an item never queued');
+    }
+  }
+
+  // The reason TaskQueue exists. Draining 100,000 items with Array.shift()
+  // takes seconds on V8, which copies the array on every shift above ~16K
+  // elements; the same goes for building a blocked queue behind a linear
+  // includes() guard. Both must stay linear.
+  private async testTaskQueueScales(): Promise<void> {
+    const N = 100_000;
+    const ready = new TaskQueue<object>();
+    const items = Array.from({ length: N }, () => ({}));
+    let start = performance.now();
+    for (const item of items) ready.push(item);
+    while (ready.length > 0) ready.shift();
+    const drainMs = performance.now() - start;
+
+    const blocked = new TaskQueue<object>({ trackMembership: true });
+    start = performance.now();
+    for (const item of items) if (!blocked.includes(item)) blocked.push(item);
+    const blockMs = performance.now() - start;
+
+    // Generous bounds: the linear versions take a few ms, the quadratic ones
+    // take seconds
+    if (drainMs > 500) throw new Error(`Draining ${N} items took ${drainMs.toFixed(0)}ms`);
+    if (blockMs > 500) throw new Error(`Building a ${N}-item blocked queue took ${blockMs.toFixed(0)}ms`);
+  }
+
   private async testPeriodicRetryInterval(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
     const workerManager = new WorkerManager(this.testInlineWorkerUrl, {
