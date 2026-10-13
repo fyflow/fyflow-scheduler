@@ -26,6 +26,7 @@ class SettlementTestSuite {
   private startTime = 0;
   private crashWorkerUrl = "";
   private selfTerminatingWorkerUrl = "";
+  private requeueWorkerUrl = "";
   private schedulers: FyflowScheduler[] = [];
 
   private track(scheduler: FyflowScheduler): FyflowScheduler {
@@ -59,11 +60,14 @@ class SettlementTestSuite {
     if (typeof Deno !== "undefined") {
       this.crashWorkerUrl = new URL("../workers/crashingWorker.ts", import.meta.url).href;
       this.selfTerminatingWorkerUrl = new URL("../workers/selfTerminatingWorker.ts", import.meta.url).href;
+      this.requeueWorkerUrl = new URL("../workers/requeueWorker.ts", import.meta.url).href;
     } else {
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       this.crashWorkerUrl = new URL((await import('../workers/crashingWorker.ts?worker-direct')).default).href;
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       this.selfTerminatingWorkerUrl = new URL((await import('../workers/selfTerminatingWorker.ts?worker-direct')).default).href;
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      this.requeueWorkerUrl = new URL((await import('../workers/requeueWorker.ts?worker-direct')).default).href;
     }
 
     const platform = typeof globalThis !== 'undefined' && 'Deno' in globalThis ? 'Deno' : 'Node.js';
@@ -90,6 +94,9 @@ class SettlementTestSuite {
     this.results.push(await this.runTest('Unstartable Pool Raises The Alarm', () => this.testUnstartablePoolAlarms()));
     this.results.push(await this.runTest('Stats Account For Each Task Once', () => this.testStatsAccountEachTaskOnce()));
     this.results.push(await this.runTest('Requeue Does Not Also Count A Failure', () => this.testRequeueNotAlsoFailed()));
+    this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Result', () => this.testRequeueAbandonedResultIgnored()));
+    this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Failure', () => this.testRequeueAbandonedFailureIgnored()));
+    this.results.push(await this.runTest('Requeue Drops The Abandoned Run\'s Progress And Spawns', () => this.testRequeueAbandonedSideEffectsDropped()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -511,6 +518,169 @@ class SettlementTestSuite {
     }
     if (scheduler.stats.failed !== 6) {
       throw new Error(`Expected stats.failed 6 for 6 failing tasks, got ${scheduler.stats.failed}`);
+    }
+  }
+
+  // --- requeue: the abandoned run must not settle the live attempt ------------
+  //
+  // When a worker fails, its running tasks are requeued and dispatched again,
+  // but the run on the failed worker keeps executing: an inline run() cannot be
+  // interrupted, and a threaded one lives until its worker's teardown is
+  // acknowledged. Its outcome used to settle the NEW attempt.
+
+  /**
+   * Run one task, fail its worker partway through, and report what happened.
+   *
+   * The failure is injected as the `worker.failed` event a crashing worker
+   * produces (ThreadWrapper reports an unexpected exit the same way), so the
+   * test exercises the pool's real failure handling without needing a worker
+   * that crashes on its first attempt but not its second.
+   *
+   * Timing is pinned rather than guessed. A second worker is warmed up first,
+   * so the requeued task is re-dispatched at once instead of waiting 100ms or
+   * more for a replacement thread. And RequeueWorker ends a run 50ms after its
+   * worker's teardown starts, so the abandoned run's outcome always arrives
+   * after that re-dispatch, and before a threaded worker's thread is killed.
+   */
+  private async requeueAbandonedRun(inline: boolean, payload: any) {
+    // The live attempt's run, on a worker that is never torn down
+    const LIVE_RUN_MS = 400;
+    const pool = new WorkerManager(this.requeueWorkerUrl, {
+      maxThreads: 2, maxConcurrentTasks: 1, inline,
+      requeueFailedTasks: true, maxWorkerRestarts: 3
+    });
+    const scheduler = this.track(new FyflowScheduler({ Requeue: pool }));
+
+    const starts: Array<{ workerId: string; at: number }> = [];
+    pool.addEventListener('task.started', (e: any) => {
+      if (e.detail.taskId === 'tenant') starts.push({ workerId: e.detail.workerId, at: performance.now() });
+    });
+    const outcomes: string[] = [];
+    scheduler.addEventListener('task.completed', (e: any) => {
+      if (e.detail.id === 'tenant') outcomes.push(`completed:${e.detail.result}`);
+    });
+    scheduler.addEventListener('task.failed', (e: any) => {
+      if (e.detail.id === 'tenant') outcomes.push(`failed:${e.detail.error}`);
+    });
+    const progress: string[] = [];
+    scheduler.addEventListener('task.progress', (e: any) => {
+      if (e.detail.id === 'tenant') progress.push(e.detail.message);
+    });
+
+    const promise = scheduler.addTask(new FyflowTask({
+      id: 'tenant', workerType: 'Requeue',
+      payload: { ms: LIVE_RUN_MS, spawnWorkerType: 'Requeue', ...payload }
+    }), { createPromise: true });
+    // Lands on a second worker, since the first is busy, and leaves it idle and
+    // initialised for the requeue
+    const warmup = scheduler.addTask(new FyflowTask({
+      id: 'warmup', workerType: 'Requeue', payload: { ms: 0 }
+    }), { createPromise: true });
+
+    const startDeadline = performance.now() + 5000;
+    while (starts.length === 0 && performance.now() < startDeadline) {
+      await new Promise(r => setTimeout(r, 5));
+    }
+    if (starts.length === 0) throw new Error('The task never started');
+    const first = starts[0];
+    if (await this.settle(warmup as Promise<any>, 5000) === 'NEVER SETTLED') {
+      throw new Error('The warm-up task never finished');
+    }
+
+    const failedAt = performance.now();
+    (pool as any).threads.find((w: any) => w.id === first.workerId).dispatchEvent(
+      new CustomEvent('worker.failed', {
+        detail: {
+          workerId: first.workerId,
+          error: new Error('simulated crash'),
+          metadata: { failureType: 'runtime', canRestart: true, restartDelay: 10 },
+          timestamp: Date.now()
+        }
+      })
+    );
+
+    const settled = await this.settle(promise as Promise<any>, 5000);
+    // Long enough for a late outcome from either run to arrive
+    await new Promise(r => setTimeout(r, 300));
+
+    if (starts.length < 2) throw new Error(`The task was never re-dispatched (${starts.length} start)`);
+    const second = starts[1];
+    // A re-dispatch onto the failed worker would make every assertion below
+    // compare a worker id with itself
+    if (second.workerId === first.workerId) {
+      throw new Error(`The task was re-dispatched onto the worker that failed (${first.workerId})`);
+    }
+    // Without this the test is vacuous: an abandoned run that finishes before
+    // the re-dispatch meets the previous attempt's settle flag and is ignored
+    // anyway, fix or no fix. It finishes 50ms after the failure.
+    if (second.at - failedAt >= 50) {
+      throw new Error(
+        `Precondition not met: re-dispatch took ${(second.at - failedAt).toFixed(0)}ms ` +
+        `after the failure, by when the abandoned run had already finished`
+      );
+    }
+
+    return { scheduler, first, second, settled, outcomes, progress };
+  }
+
+  private async testRequeueAbandonedResultIgnored(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const { scheduler, first, second, settled, outcomes } = await this.requeueAbandonedRun(inline, {});
+
+      if (outcomes.length !== 1) {
+        throw new Error(`${kind}: expected one outcome, got ${JSON.stringify(outcomes)}`);
+      }
+      if (settled !== `resolved:${JSON.stringify(second.workerId)}`) {
+        throw new Error(
+          `${kind}: settled ${settled}, expected the live attempt's result ${second.workerId} ` +
+          `(the abandoned run was on ${first.workerId})`
+        );
+      }
+      // Two done: the task, and the warm-up task
+      if (scheduler.stats.done !== 2 || scheduler.stats.running !== 0) {
+        throw new Error(`${kind}: stats ${JSON.stringify(scheduler.stats)}`);
+      }
+      await scheduler.shutdown();
+    }
+  }
+
+  // An inline run that throws reports it as a wrapper `task.failed` event, which
+  // the scheduler settles from directly. That path carries no dispatch token,
+  // so only the failed worker forgetting the task keeps it from failing the
+  // live attempt.
+  private async testRequeueAbandonedFailureIgnored(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      // Both runs fail, each naming its own worker, so the assertion is on
+      // which failure is reported: the abandoned run's arrives first.
+      const { scheduler, second, outcomes } = await this.requeueAbandonedRun(inline, { fail: true });
+
+      if (outcomes.length !== 1 || outcomes[0] !== `failed:failed on ${second.workerId}`) {
+        throw new Error(`${kind}: expected the live attempt's failure only, got ${JSON.stringify(outcomes)}`);
+      }
+      await scheduler.shutdown();
+    }
+  }
+
+  // Progress and spawns sent by the abandoned run after the re-dispatch belong
+  // to no live attempt and must be dropped, or the live attempt reports another
+  // run's progress and the task spawns its children twice.
+  private async testRequeueAbandonedSideEffectsDropped(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const { scheduler, first, second, progress } = await this.requeueAbandonedRun(inline, { report: true });
+
+      if (progress.some(m => m === `from ${first.workerId}`)) {
+        throw new Error(`${kind}: progress from the abandoned run was delivered: ${JSON.stringify(progress)}`);
+      }
+      if (scheduler.tasks.has(`tenant-child-${first.workerId}`)) {
+        throw new Error(`${kind}: the abandoned run's spawn was added`);
+      }
+      if (!scheduler.tasks.has(`tenant-child-${second.workerId}`)) {
+        throw new Error(`${kind}: the live attempt's spawn is missing`);
+      }
+      await scheduler.shutdown();
     }
   }
 }

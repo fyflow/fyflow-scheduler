@@ -8,10 +8,11 @@ the contract to `AGENTS.md` first.
 **Depends on** `doc/design/attempt-accounting.md` (the backoff wait, and
 `attemptNumber`) and on three known issues in `TODO_CHECKLIST.md`:
 
-- "A requeued task can be settled by its abandoned run": the per-dispatch token,
-  and the wrapper's *release* operation (forget a task and reject its promise),
-  which the forced stop reuses. Cancel wins only if a stale outcome cannot settle
-  the task first.
+- "A requeued task can be settled by its abandoned run": the per-dispatch token
+  (`task._dispatchToken`) and the wrappers' `forgetTask()`. Cancel wins only if a
+  stale outcome cannot settle the task first. That fix deliberately stopped at
+  forgetting: rejecting a forgotten task's pending promise is added here, where
+  the forced stop first needs it.
 - "Ready and blocked queues are quadratic above ~16K tasks": the head-indexed
   queue that constant-time cancel is built on.
 - "A listener re-entering the dispatch loop can lose a task": the rule that every
@@ -463,9 +464,10 @@ sweep would settle it a second time.
 
 When the grace period expires on a threaded pool and the attempt is still
 running, the pool **retires** that worker. Everything rests on one wrapper
-operation from the requeue known-issue fix, *release*: forget a task (drop its
-callback, so nothing the thread sends can settle it) and keep or reject its
-pending promise. The order:
+operation, *release*: forget a task, with the existing `forgetTask()` (drop its
+callback, so nothing the thread sends can settle it), and keep or reject its
+pending promise, which this plan adds. Rejecting needs `forgetTask()` to hand the
+promise's `reject` back rather than discard it. The order:
 
 1. **Mark the worker `terminated`**, so it accepts no new tasks and its
    unexpected-exit handler ignores the exit about to be caused. (Nothing sets

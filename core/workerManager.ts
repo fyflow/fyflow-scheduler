@@ -495,9 +495,20 @@ export class WorkerManager extends EventTarget {
 
     if (!failedWorker) return;
 
+    // Before any requeue is reported: the scheduler settles a requeue
+    // synchronously and runs its dispatch loop, which would otherwise hand the
+    // task straight back to this worker - its slot was just freed by forgetTask
+    // below. _markWorkerAsFailed sets this too, but only after the requeues.
+    (failedWorker as any).state = 'failed';
+
     // CRITICAL: Requeue any in-progress tasks (Worker failure ≠ Task failure)
     const runningTaskIds = failedWorker.getRunningTaskIds();
     runningTaskIds.forEach(taskId => {
+      // Before reporting anything: the run on this worker may still be going,
+      // and once the task is requeued and dispatched again, its late outcome
+      // would otherwise settle the new attempt
+      failedWorker.forgetTask(taskId);
+
       // Only requeue if both manager allows requeuing AND worker can be restarted
       if (this.requeueFailedTasks && canRestart !== false) {
         // Emit task.requeue_required event for FyflowScheduler to handle

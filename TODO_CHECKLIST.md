@@ -105,40 +105,79 @@ They exist today, independently of that work. All three plans depend on the
 first one, and cancellation (#1) also depends on the two marked as its
 prerequisites, so they ship first.
 
-#### 🔵 A requeued task can be settled by its abandoned run
+#### 🟡 A requeued task can be settled by its abandoned run
 When a worker fails, its other running tasks are requeued and dispatched again,
 but the old run keeps executing: an inline `run()` cannot be interrupted, and a
 threaded one keeps running through the 500 ms teardown handshake, because
-`terminate()` keeps `callbacks` until the end. When the old run finishes, its
-outcome settles the **new** attempt: `_settling` was cleared by the new
-dispatch, and the wrapper still lists the task. Reproduced on an inline pool
-with `maxConcurrentTasks: 2` and one task calling `terminateWithError`: the
-co-tenant was re-dispatched to a second instance, then completed `done` with the
-first instance's result while the second run was still in flight. Its real
-result was discarded, and its resources were released while still in use.
+`terminate()` keeps `callbacks` until the end. When the old run finished, its
+outcome settled the **new** attempt: `_settling` had been cleared by the new
+dispatch, and the wrapper still listed the task. The live attempt's real result
+was discarded, and its resources were released while still in use. On an inline
+pool, the old run's failure also reached the scheduler as a wrapper
+`task.failed` event and failed the live attempt; its progress and spawns were
+attributed to the live attempt too.
 
-The underlying assumption, that a task id runs at most once at a time, is false
-after a requeue. Fix:
-- `_dispatchTask` stamps a per-dispatch token on the task and captures it in the
-  `.then`/`.catch` closures; `_settleTask` ignores an outcome whose token is
-  stale.
-- The pool tells a failed worker's wrapper to *release* each task it requeues
-  off it: forget it (drop the callback or running id), so that worker's late
-  events are dropped, and reject its pending promise with an internal requeue
-  error that `_dispatchTask`'s `.catch` recognises, as it already recognises the
-  capacity-race error. Requeue then no longer depends on the
-  `task.requeue_required` event reaching the scheduler, which it does not during
-  a shutdown drain. Cancellation's forced stop uses the same operation.
+**Outcome**: the assumption that a task id runs at most once at a time is false
+after a requeue, so attempts are now told apart explicitly, in two places:
+- `_dispatchTask` stamps `task._dispatchToken` and captures it in the promise
+  handlers; `_settleTask` ignores an outcome whose token is stale, checked
+  before `_settling`.
+- Before reporting a requeue (or a failure), `_handleWorkerFailure` calls the
+  failed wrapper's new `forgetTask()`, so nothing that worker reports about the
+  task afterwards reaches the scheduler: result, failure, progress or spawn. This
+  covers the event path, which carries no token.
 
-The event-path outcomes (`task.requeue_required`, the pool's `task.failed`)
-carry no token, so their safety rests on the wrapper forgetting the task before
-it emits anything further. That makes "One worker failure is handled twice"
-below a dependency of this fix.
+Fixing it exposed an ordering bug that the old code hid. `_handleWorkerFailure`
+reported requeues before marking the worker failed, and the scheduler settles a
+requeue synchronously and runs its dispatch loop. The forgotten task no longer
+occupied the dying worker's slot, so it was re-dispatched straight back onto
+that worker. The worker is now marked failed first.
 
-Test with the reproduction above, on both pool types. Mutation check: remove the
-token comparison and the stale result must win again.
+Two smaller behaviour changes come with it. A threaded worker's progress and
+spawn messages for a task it is not running are dropped (previously
+dispatched unconditionally). And `InlineWrapper` no longer drives `runningTasks`
+negative when a run ends after `terminate()` cleared its tracking.
 
-**Status**: 🔵 Not Started - prerequisite for pass 1 #1, #2 and #4
+Not done here, and moved to the plans that need it: rejecting a forgotten task's
+pending promise with an internal requeue error, so that a requeue no longer
+depends on the `task.requeue_required` event. Cancellation's forced stop needs
+that, and so does the shutdown-drain issue below; on its own it would add a
+second requeue path to the scheduler with nothing yet using it.
+
+"One worker failure is handled twice" below is partly mitigated as a side
+effect: the second handling finds no running tasks left, so tasks are no longer
+requeued twice. The doubled restart count and replacement remain.
+
+Tests: three settlement tests on both pool types, with a worker failure injected
+after a second worker has been warmed up, and a test worker that ends the
+abandoned run 50 ms after its worker's teardown starts, so the timing is fixed
+rather than guessed. Each test refuses to pass if the re-dispatch did not happen
+before the abandoned run ended, or went to the same worker. Mutation checks:
+- token check removed: the old run's result, failure and spawn decide the outcome;
+- `forgetTask` call removed: the old run's failure and progress leak through;
+- worker not marked failed first: re-dispatch onto the dying worker, which also
+  breaks the existing "Unconstructable Worker Follows The Requeue Contract" test.
+
+Benchmark, run back to back against the previous commit from a worktree
+(`benchmark:quick --runs 3`), with the two scenarios that looked lower then
+rerun in reverse order, 5 runs each:
+- **1K inline**: bimodal on both commits (~1150 or ~1320 tasks/sec per run).
+  The −12% median in the first comparison was which mode each run landed in;
+  in reverse order the medians were 1317 (fix) and 1304 (base).
+- **200 tasks, 2 threads**: lower in both orders, about −7% by median (59.9 vs
+  64.7), but with a 50–67 spread and one 125 run on each commit. The only new
+  work on that path is one counter increment per dispatch and one integer
+  comparison per settle, about 400 operations a run against ~33 ms tasks, so it
+  cannot account for 7%. The other two threaded scenarios, on the same path,
+  measured −4.6% and +4.2%. Treated as noise.
+- The remaining scenarios moved +4% to +12% (all in the fix's favour) with CVs of
+  8–41%, as the process document warns.
+
+Browser tests: Chromium and WebKit pass. Firefox fails 6–9 tests per run on this
+machine, with or without this change, and the failing set differs between runs;
+the logs point at the Playwright Firefox driver (`juggler` errors).
+
+**Status**: 🟢 Completed - Deno 137/137, Node 22 137/137, `jsr:smoke`, lint
 
 #### 🔵 One worker failure is handled twice
 `_handleTerminationRequest` dispatches both `worker.failed` and
@@ -147,6 +186,9 @@ token comparison and the stale result must win again.
 `task.requeue_required` twice per task, schedules two replacements, and adds 2
 to `poolRestartCount`, so a pool reaches `worker.restart_limit_exceeded` twice as
 fast as `maxWorkerRestarts` says. Fix: handle each worker's failure once.
+Since the requeue fix above, the second handling finds no running tasks left,
+so the duplicate requeue is gone; the doubled restart count and replacement
+remain.
 
 **Status**: 🔵 Not Started
 

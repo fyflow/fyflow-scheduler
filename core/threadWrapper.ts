@@ -86,6 +86,17 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         return [...runningTasks, ...queuedTasks];
     }
 
+    // Dropping the callback is what silences the run: every message about a
+    // task is looked up through it, so a late result, failure, progress or
+    // spawn from this thread finds nothing and is discarded.
+    forgetTask(taskId: string): void {
+        const queued = this.taskQueue.findIndex(task => task.taskId === taskId);
+        if (queued !== -1) this.taskQueue.splice(queued, 1);
+        if (this.callbacks.delete(taskId)) this.runningTasks--;
+        this.taskStartTimes.delete(taskId);
+        this.runningTaskData.delete(taskId);
+    }
+
     // terminateWithError implementation - throws error for clean task completion
     private createTerminateWithError(): (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void {
         return (error: Error, metadata = {}) => {
@@ -312,7 +323,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
             return;
 
           case 'progress':
-            if (taskId) {
+            if (taskId && this.callbacks.has(taskId)) {
               this.dispatchEvent(new CustomEvent('task.progress', {
                 detail: {
                   taskId,
@@ -328,7 +339,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
             return;
 
           case 'spawn_task':
-            if (taskId) {
+            if (taskId && this.callbacks.has(taskId)) {
               this.dispatchEvent(new CustomEvent('task.spawn_request', {
                 detail: {
                   taskId,

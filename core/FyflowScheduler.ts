@@ -92,6 +92,13 @@ export class FyflowTask {
      * Cleared on every dispatch, so each attempt gets its own settle.
      */
     _settling?: boolean;
+    /**
+     * Incremented by every dispatch, and captured by that dispatch's promise
+     * handlers, so an outcome from an earlier attempt can be told apart from
+     * the live one. A task id is not enough: after a requeue the abandoned run
+     * keeps executing while the new attempt runs elsewhere.
+     */
+    _dispatchToken = 0;
 
     // Private fields for resource management
     _scheduler?: FyflowScheduler; // Reference to scheduler for descendant tracking
@@ -713,6 +720,7 @@ export class FyflowTask {
       task._resourcesPreAllocated = true;
       // A fresh attempt may be settled again
       task._settling = false;
+      const token = ++task._dispatchToken;
 
       // Update state and stats synchronously
       task.state = 'running';
@@ -723,7 +731,7 @@ export class FyflowTask {
       // Get/create thread and execute task
       pool.enqueueNoQueue(task.id, task.payload)
         .then((result: any) => {
-          this._onTaskComplete(task, result, pool);
+          this._onTaskComplete(task, result, pool, token);
         })
         .catch((error: any) => {
           // Handle race condition: thread filled up between check and dispatch
@@ -747,7 +755,7 @@ export class FyflowTask {
             // Retry dispatch (thread should be available soon)
             setTimeout(() => this._dispatchLoop(), 10);
           } else {
-            this._onTaskFailed(task, error, pool);
+            this._onTaskFailed(task, error, pool, token);
           }
         });
     }
@@ -812,8 +820,16 @@ export class FyflowTask {
     private _settleTask(
       task: FyflowTask,
       pool: any,
-      outcome: { ok: true; result: any } | { ok: false; error: any } | { requeue: true }
+      outcome: { ok: true; result: any } | { ok: false; error: any } | { requeue: true },
+      token?: number
     ): void {
+      // An outcome from an earlier attempt. Checked before _settling, which the
+      // new attempt's dispatch has already cleared: after a requeue the
+      // abandoned run keeps executing, and its result used to settle the live
+      // attempt. Outcomes arriving as pool events carry no token; those are
+      // kept off stale attempts by the failed worker forgetting the task.
+      if (token !== undefined && token !== task._dispatchToken) return;
+
       // One settle per attempt. Cleared in _dispatchTask, so a retried or
       // requeued task can settle again.
       if (task._settling) return;
@@ -917,12 +933,12 @@ export class FyflowTask {
       this._dispatchLoop();
     }
 
-    _onTaskComplete(task: FyflowTask, result: any, pool: any) {
-      this._settleTask(task, pool, { ok: true, result });
+    _onTaskComplete(task: FyflowTask, result: any, pool: any, token?: number) {
+      this._settleTask(task, pool, { ok: true, result }, token);
     }
 
-    _onTaskFailed(task: FyflowTask, error: any, pool: any) {
-      this._settleTask(task, pool, { ok: false, error });
+    _onTaskFailed(task: FyflowTask, error: any, pool: any, token?: number) {
+      this._settleTask(task, pool, { ok: false, error }, token);
     }
 
     _retryBlockedTasks() {

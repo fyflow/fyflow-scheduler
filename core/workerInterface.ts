@@ -173,6 +173,15 @@ export interface WorkerInstanceExtensions {
 
     // Essential for resource allocation behavior
     canAcceptTask(): boolean; // Must return false for failed workers
+
+    /**
+     * Stop tracking a task that has been requeued off this worker. Its run may
+     * still be executing - an inline run() cannot be interrupted, and a thread
+     * lives until its teardown is acknowledged - and anything it reports from
+     * now on (result, failure, progress, spawn) belongs to no live attempt, so
+     * it must be dropped here rather than reach the scheduler.
+     */
+    forgetTask(taskId: string): void;
 }
 
 // Worker Status for inspection APIs

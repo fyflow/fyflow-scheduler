@@ -115,14 +115,14 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Seven suites, 134 tests, all in the default `deno task test` run:
+Seven suites, 137 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
 | core | 23 | scheduling, groups, pooling, retention |
 | error-handling | 12 | worker failure, restart, requeue |
 | spawning | 12 | dynamic spawning, `onCompleteDescendants()` |
-| settlement | 17 | exactly-once settlement, counter cardinality |
+| settlement | 20 | exactly-once settlement, counter cardinality, requeue |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 23 | `resource.*` events, gauges, admission queue |
 | docs | 35 | **executes every snippet in README.md and AGENTS.md** |

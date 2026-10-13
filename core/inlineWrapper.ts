@@ -45,6 +45,15 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         return Array.from(this.runningTaskData.values());
     }
 
+    // The run itself cannot be stopped. Removing it from runningTaskIds is what
+    // runTask checks before reporting anything, so whatever it does from here on
+    // is discarded rather than attributed to the task's live attempt.
+    forgetTask(taskId: string): void {
+        if (!this.runningTaskIds.delete(taskId)) return;
+        this.runningTasks--;
+        this.runningTaskData.delete(taskId);
+    }
+
     // terminateWithError implementation - throws error for clean task completion
     private createTerminateWithError(): (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void {
         return (error: Error, metadata = {}) => {
@@ -303,6 +312,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 // Task-level context
                 taskId,
                 sendProgress: (progress: number, message?: string, details?: any) => {
+                    if (!this.runningTaskIds.has(taskId)) return;
                     this.dispatchEvent(new CustomEvent('task.progress', {
                         detail: {
                             taskId,
@@ -316,6 +326,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                     }));
                 },
                 spawnTask: (config: any) => {
+                    if (!this.runningTaskIds.has(taskId)) return;
                     this.dispatchEvent(new CustomEvent('task.spawn_request', {
                         detail: {
                             taskId,
@@ -329,6 +340,10 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             };
 
             const result = await workerInstance.run(payload, context);
+
+            // Forgotten while running: the task was requeued off this worker, and
+            // reporting this result would settle the attempt that replaced it
+            if (!this.runningTaskIds.has(taskId)) return result;
 
             // Calculate full execution time including all coordination overhead
             const fullExecutionTime = performance.now() - fullExecutionStart;
@@ -348,6 +363,9 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             return result;
             
         } catch (error) {
+            // Forgotten while running: as for a result above, nothing to report
+            if (!this.runningTaskIds.has(taskId)) throw error;
+
             const fullExecutionTime = 0//performance.now() - fullExecutionStart;
             // Calculate execution time even for failed tasks
 
@@ -370,9 +388,10 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             }
 
         } finally {
-            // Always cleanup task tracking
-            this.runningTasks--;
-            this.runningTaskIds.delete(taskId);
+            // A forgotten task was already untracked by forgetTask, and
+            // terminate() clears the tracking wholesale, so decrementing
+            // unconditionally drove runningTasks below zero
+            if (this.runningTaskIds.delete(taskId)) this.runningTasks--;
             this.runningTaskData.delete(taskId); // Also clean up task data
 
             // Update task stats
