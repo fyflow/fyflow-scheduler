@@ -48,6 +48,11 @@ export default class DocsWorker extends BaseWorker {
       }
     }
 
+    if (payload.taskTerminate) {
+      // Task-level context: this task fails, the others are requeued
+      context?.terminateWithError(new Error('DocsWorker task asked to stop'), { canRestart: true });
+    }
+
     if (payload.selfTerminate) {
       // Worker-level context, available via the constructor, not the task context
       this.workerContext?.terminateWithError(

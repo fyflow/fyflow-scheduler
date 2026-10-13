@@ -14,6 +14,10 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     config: any;
     id: string;
     initializing = false;
+    // One termination per worker: a second terminateWithError() call, or a
+    // thrown WorkerTerminationError after a call, must not report it again
+    private terminationRequested = false;
+    private terminationHandled = false;
 
     // WorkerInstanceState implementation
     state: 'initializing' | 'healthy' | 'busy' | 'failed' | 'terminated' = 'initializing';
@@ -54,16 +58,55 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         this.runningTaskData.delete(taskId);
     }
 
-    // terminateWithError implementation - throws error for clean task completion
-    private createTerminateWithError(): (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void {
+    /**
+     * `terminateWithError()` is a request, never a throw. It used to throw a
+     * WorkerTerminationError here, which only worked when called directly in
+     * run()'s own stack: from a timer, an interval or a worker-level callback
+     * the throw had nowhere to go and crashed the host process. A threaded
+     * worker posts a message instead, and this matches it.
+     *
+     * Called through a task's context (`taskId` given), that task fails with a
+     * WorkerTerminationError and the worker's other tasks are requeued. Called
+     * through the worker's own context, there is no task to blame, so every
+     * in-flight task is requeued.
+     */
+    private createTerminateWithError(taskId?: string): (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void {
         return (error: Error, metadata = {}) => {
-            // Throw special error to fail the task cleanly
-            throw new WorkerTerminationError(error.message, metadata);
+            // The calling task's outcome is decided now, and whatever its run
+            // goes on to return is discarded
+            const failing = taskId !== undefined && this.runningTaskIds.has(taskId) ? taskId : undefined;
+            if (failing !== undefined) this.forgetTask(failing);
+
+            if (this.terminationRequested) return;
+            this.terminationRequested = true;
+            // Accept nothing more, before anything is reported: the reports
+            // below free slots on this worker, and the scheduler dispatches into
+            // a free slot synchronously
+            this.state = 'failed';
+
+            // Deferred, so no scheduler or listener code runs inside the
+            // worker's own call - as on a thread, where this is a message
+            queueMicrotask(() => {
+                if (failing !== undefined) {
+                    this.dispatchEvent(new CustomEvent('task.failed', {
+                        detail: {
+                            taskId: failing, workerId: this.id, workerType: 'inline',
+                            error: new WorkerTerminationError(error.message, metadata),
+                            timestamp: Date.now(), executionTime: 0
+                        }
+                    }));
+                }
+                this._handleTerminationRequest(metadata);
+            });
         };
     }
 
     // Handle termination request after task completion
     private _handleTerminationRequest(metadata: any) {
+        if (this.terminationHandled) return;
+        this.terminationHandled = true;
+        this.terminationRequested = true;
+
         // Update worker state
         this.state = 'failed';
         this.lastError = {
@@ -208,6 +251,14 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
 
             this.workerInstance = instance;
             this.initializing = false;
+
+            // setup() asked for this worker to be torn down. The pool has
+            // already terminated it, but before this instance was stored, so
+            // that teardown found nothing - and whatever setup() acquired would
+            // leak. Tear it down here instead.
+            if (this.terminationRequested) {
+                await this._destroyWorkerInstance();
+            }
             return instance;
 
         } catch (error) {
@@ -302,13 +353,18 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         let fullExecutionStart
         try {
             const workerInstance = await this._createWorkerInstance();
+            // Requeued off this worker while it was being created - setup()
+            // asking for the worker to be torn down does that. The task now
+            // belongs to another worker, so it must not run here as well.
+            if (!this.runningTaskIds.has(taskId)) return undefined;
             fullExecutionStart = performance.now();
 
             // Create TaskWorkerContext with both worker and task capabilities
             const context: TaskWorkerContext = {
-                // Worker-level context (inherited from BaseWorkerContext)
+                // Worker-level context (inherited from BaseWorkerContext), except
+                // that terminating through it fails this task in particular
                 workerId: this.id,
-                terminateWithError: this.createTerminateWithError(),
+                terminateWithError: this.createTerminateWithError(taskId),
                 // Task-level context
                 taskId,
                 sendProgress: (progress: number, message?: string, details?: any) => {

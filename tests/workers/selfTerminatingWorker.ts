@@ -100,7 +100,7 @@ export default class SelfTerminatingWorker extends BaseWorker {
         if (payload.shouldTerminate) {
           context?.terminateWithError(
             new Error('Conditional termination triggered'),
-            { canRestart: payload.canRestart || false }
+            { canRestart: payload.canRestart || false, restartDelay: payload.restartDelay }
           );
         }
 
@@ -109,6 +109,16 @@ export default class SelfTerminatingWorker extends BaseWorker {
           result: 'Conditional task completed',
           processedAt: new Date().toISOString()
         };
+
+      case 'worker-level-terminate':
+        // Through the worker's own context, not the task's: there is no task
+        // to blame, so every in-flight task - this one included - is requeued
+        this.workerContext?.terminateWithError(
+          new Error('Worker-level termination requested'),
+          { canRestart: true, restartDelay: payload.restartDelay ?? 500 }
+        );
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return { result: 'Worker-level termination task returned' };
 
       case 'normal-task':
         // Normal task execution

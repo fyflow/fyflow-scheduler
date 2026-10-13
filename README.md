@@ -340,12 +340,16 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `shutdown()`: terminate the pool
 
 **Worker self-termination** — a worker can ask to be torn down, e.g. after
-detecting a bad connection. In-flight tasks are requeued when the pool's
-`requeueFailedTasks` allows it:
+detecting a bad connection. It is a request, never a throw, so it is safe from a
+timer. Called on the worker's context, every in-flight task is requeued when the
+pool's `requeueFailedTasks` allows it:
 
 ```typescript
 this.workerContext?.terminateWithError(new Error('connection lost'), { canRestart: true });
 ```
+
+Called on a task's `context` instead, that task fails with a
+`WorkerTerminationError` and only the others are requeued. See `AGENTS.md` §4.
 
 ### When Workers Fail
 

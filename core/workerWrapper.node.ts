@@ -18,31 +18,43 @@ function sendMessage(message: WorkerMessage) {
     parentPort?.postMessage(message);
 }
 
+// terminateWithError() is a request: it posts a message and returns, and never
+// throws, so it is safe from a timer or a callback. Sent with the task's id from
+// a task's context, that task fails and the worker's others are requeued; sent
+// from the worker's own context, there is no task to blame and every in-flight
+// task is requeued.
+function requestTermination(
+    taskId: string,
+    error: Error,
+    metadata?: { canRestart?: boolean; restartDelay?: number }
+) {
+    sendMessage({
+        type: 'error',
+        taskId,
+        data: {
+            message: error.message,
+            isWorkerTerminationRequest: true,
+            metadata
+        }
+    });
+}
+
 // Create BaseWorkerContext inside the worker thread
 function createBaseWorkerContext(): BaseWorkerContext {
     return {
         workerId: workerId!,
-        terminateWithError: (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => {
-            // Send termination request message (works both sync and async)
-            sendMessage({
-                type: 'error',
-                taskId: 'worker_termination_request',
-                data: {
-                    message: error.message,
-                    isWorkerTerminationRequest: true,
-                    metadata
-                }
-            });
-        }
+        terminateWithError: (error, metadata) =>
+            requestTermination('worker_termination_request', error, metadata)
     };
 }
 
 function createWorkerContext(taskId: string): TaskWorkerContext {
     const baseContext = createBaseWorkerContext();
     return {
-        // Worker-level context
+        // Worker-level context, except that terminating through it fails this
+        // task in particular
         workerId: baseContext.workerId,
-        terminateWithError: baseContext.terminateWithError,
+        terminateWithError: (error, metadata) => requestTermination(taskId, error, metadata),
         // Task-level context
         taskId,
         sendProgress: (progress: number, message?: string, details?: any) => {

@@ -13,7 +13,8 @@ import {
   FyflowTask,
   ConcurrentLimitGroup,
   RateLimitGroup,
-  KeyedRateLimitGroup
+  KeyedRateLimitGroup,
+  WorkerTerminationError
 } from '../../index.ts';
 import type { WorkerStatus } from '../../index.ts';
 
@@ -131,7 +132,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: updateWorkerConfig And Its Caveat', () => this.docUpdateWorkerConfig()));
     this.results.push(await this.runTest('Doc: task.started Fires On The Pool', () => this.docTaskStartedEvent()));
     this.results.push(await this.runTest('Doc: Teardown Failure Is Reported', () => this.docTeardownFailure()));
-    this.results.push(await this.runTest('Doc: Worker Self-Termination', () => this.docSelfTermination()));
+    this.results.push(await this.runTest('Doc: terminateWithError Depends On Its Context', () => this.docSelfTermination()));
     this.results.push(await this.runTest('Doc: Worker Lifecycle Events', () => this.docLifecycleEvents()));
     this.results.push(await this.runTest('Doc: Bounded Task Retention', () => this.docRetention()));
     this.results.push(await this.runTest('Doc: Waiting For The Whole Run', () => this.docSchedulerCompleted()));
@@ -667,23 +668,55 @@ class DocsTestSuite {
     }
   }
 
+  // AGENTS.md §4: terminateWithError() is a request, and which tasks it fails
+  // depends on the context it is called on
   private async docSelfTermination(): Promise<void> {
-    const pool = new WorkerManager(this.workerUrl, {
-      maxThreads: 1, maxConcurrentTasks: 1, inline: true
-    });
-    const scheduler = new FyflowScheduler({ DocsWorker: pool });
-    this.schedulers.push(scheduler);
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
 
-    let selfTerminated = false;
-    pool.addEventListener('worker.self_terminated', () => { selfTerminated = true; });
+      // Worker context: no task is blamed, so the running one is requeued
+      {
+        const pool = new WorkerManager(this.workerUrl, { maxThreads: 1, maxConcurrentTasks: 1, inline });
+        const scheduler = new FyflowScheduler({ DocsWorker: pool });
+        this.schedulers.push(scheduler);
+        let selfTerminated = false;
+        let requeued = false;
+        pool.addEventListener('worker.self_terminated', () => { selfTerminated = true; });
+        pool.addEventListener('task.requeue_required', (e: any) => {
+          if (e.detail.taskId === `doc-selfterm-${kind}`) requeued = true;
+        });
 
-    scheduler.addTask(new FyflowTask({
-      id: 'doc-selfterm',
-      workerType: 'DocsWorker',
-      payload: { id: 'doc-selfterm', value: 1, selfTerminate: true }
-    }));
+        scheduler.addTask(new FyflowTask({
+          id: `doc-selfterm-${kind}`, workerType: 'DocsWorker',
+          payload: { id: `doc-selfterm-${kind}`, value: 1, selfTerminate: true }
+        }));
 
-    await this.waitFor(() => selfTerminated, 3000, 'worker.self_terminated');
+        await this.waitFor(() => selfTerminated, 3000, `${kind}: worker.self_terminated`);
+        await this.waitFor(() => requeued, 1000, `${kind}: the running task requeued`);
+        await scheduler.shutdown();
+      }
+
+      // Task context: that task fails with a WorkerTerminationError
+      {
+        const pool = new WorkerManager(this.workerUrl, { maxThreads: 1, maxConcurrentTasks: 1, inline });
+        const scheduler = new FyflowScheduler({ DocsWorker: pool });
+        this.schedulers.push(scheduler);
+
+        let error: unknown;
+        try {
+          await scheduler.addTask(new FyflowTask({
+            id: `doc-taskterm-${kind}`, workerType: 'DocsWorker',
+            payload: { id: `doc-taskterm-${kind}`, value: 1, taskTerminate: true }
+          }), { createPromise: true });
+        } catch (caught) {
+          error = caught;
+        }
+        if (!(error instanceof WorkerTerminationError)) {
+          throw new Error(`${kind}: expected a WorkerTerminationError, got ${error}`);
+        }
+        await scheduler.shutdown();
+      }
+    }
   }
 
   private async docLifecycleEvents(): Promise<void> {

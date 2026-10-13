@@ -96,6 +96,9 @@ class SettlementTestSuite {
     this.results.push(await this.runTest('Requeue Does Not Also Count A Failure', () => this.testRequeueNotAlsoFailed()));
     this.results.push(await this.runTest('Self-Terminating Task Fails, Not Requeued', () => this.testSelfTerminatingTaskFails()));
     this.results.push(await this.runTest('One Worker Failure Is Handled Once', () => this.testOneFailureHandledOnce()));
+    this.results.push(await this.runTest('terminateWithError From A Task Fails That Task Only', () => this.testTaskContextTermination()));
+    this.results.push(await this.runTest('terminateWithError From A Timer Does Not Crash', () => this.testTaskContextTerminationFromTimer()));
+    this.results.push(await this.runTest('terminateWithError From The Worker Requeues Every Task', () => this.testWorkerContextTermination()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Result', () => this.testRequeueAbandonedResultIgnored()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Failure', () => this.testRequeueAbandonedFailureIgnored()));
     this.results.push(await this.runTest('Requeue Drops The Abandoned Run\'s Progress And Spawns', () => this.testRequeueAbandonedSideEffectsDropped()));
@@ -476,9 +479,11 @@ class SettlementTestSuite {
     let requeues = 0;
     pool.addEventListener('task.requeue_required', () => { requeues++; });
 
+    // Worker-level termination: it blames no task, so the running one is
+    // requeued. (Through the task's own context it would fail that task instead.)
     scheduler.addTask(new FyflowTask({
       id: 'requeue-acct', workerType: 'SelfTerminatingWorker',
-      payload: { action: 'self-terminate-delayed', delay: 30 }
+      payload: { action: 'worker-level-terminate', restartDelay: 1000 }
     }));
 
     const deadline = performance.now() + 6000;
@@ -562,6 +567,119 @@ class SettlementTestSuite {
       if (counts['task.failed'] !== 1) throw new Error(`${kind}: task.failed fired ${counts['task.failed'] ?? 0} times`);
       if (requeues !== 0) throw new Error(`${kind}: the terminating task was requeued ${requeues} times`);
       await scheduler.shutdown();
+    }
+  }
+
+  // --- terminateWithError(): a request, attributed by context ----------------
+  //
+  // It never throws. Through a task's context it fails that task with a
+  // WorkerTerminationError and requeues the worker's others; through the
+  // worker's own context it requeues every in-flight task. Inline it used to
+  // throw, which worked only in run()'s own stack and crashed the host from a
+  // timer; threaded it posted without a task, so the caller was requeued too.
+
+  /** A caller and a co-tenant on one worker; the caller asks for termination. */
+  private async terminationScenario(inline: boolean, callerPayload: any, restartDelay: number) {
+    const kind = inline ? 'inline' : 'threaded';
+    const pool = new WorkerManager(this.selfTerminatingWorkerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 2, inline, maxWorkerRestarts: 3
+    });
+    const scheduler = this.track(new FyflowScheduler({ SelfTerminatingWorker: pool }));
+
+    const runs: Record<string, number> = {};
+    scheduler.addEventListener('task.running', (e: any) => { runs[e.detail.id] = (runs[e.detail.id] ?? 0) + 1; });
+    const failedEvents: Record<string, number> = {};
+    scheduler.addEventListener('task.failed', (e: any) => { failedEvents[e.detail.id] = (failedEvents[e.detail.id] ?? 0) + 1; });
+    const requeued: Record<string, number> = {};
+    pool.addEventListener('task.requeue_required', (e: any) => {
+      requeued[e.detail.taskId] = (requeued[e.detail.taskId] ?? 0) + 1;
+    });
+    let workerFailures = 0;
+    pool.addEventListener('worker.failed', () => { workerFailures++; });
+
+    // A worker that is still being created accepts nothing, so without this the
+    // co-tenant would wait in the scheduler's queue instead of running beside
+    // the caller, and there would be nothing on the worker to requeue
+    await scheduler.addTask(new FyflowTask({
+      id: `warmup-${kind}`, workerType: 'SelfTerminatingWorker', payload: { action: 'normal-task' }
+    }), { createPromise: true });
+
+    const caller = new FyflowTask({
+      id: `caller-${kind}`, workerType: 'SelfTerminatingWorker',
+      payload: { restartDelay, ...callerPayload }
+    });
+    const cotenant = new FyflowTask({
+      id: `cotenant-${kind}`, workerType: 'SelfTerminatingWorker',
+      // Long enough to still be running when the caller asks
+      payload: { action: 'conditional-terminate', shouldTerminate: false, delay: 300 }
+    });
+    // The co-tenant first, so it is already running when the caller asks
+    const cotenantPromise = scheduler.addTask(cotenant, { createPromise: true }) as Promise<any>;
+    let callerError: unknown;
+    const callerPromise = (scheduler.addTask(caller, { createPromise: true }) as Promise<any>)
+      .then(() => 'resolved', error => { callerError = error; return 'rejected'; });
+
+    return {
+      kind, scheduler, caller, cotenant, runs, failedEvents, requeued,
+      callerPromise, cotenantPromise,
+      get callerError() { return callerError; },
+      get workerFailures() { return workerFailures; }
+    };
+  }
+
+  private async assertTaskContextTermination(callerPayload: any): Promise<void> {
+    for (const inline of [true, false]) {
+      const s = await this.terminationScenario(inline, callerPayload, 10);
+      const callerOutcome = await Promise.race([
+        s.callerPromise, new Promise(r => setTimeout(() => r('never settled'), 3000))
+      ]);
+      const cotenantOutcome = await this.settle(s.cotenantPromise, 5000);
+      await new Promise(r => setTimeout(r, 200));
+
+      if (callerOutcome !== 'rejected') throw new Error(`${s.kind}: caller ${callerOutcome}`);
+      if (!(s.callerError instanceof WorkerTerminationError)) {
+        throw new Error(`${s.kind}: caller rejected with ${s.callerError}, not a WorkerTerminationError`);
+      }
+      if (s.caller.state !== 'user_action') throw new Error(`${s.kind}: caller ended ${s.caller.state}`);
+      if (s.runs[s.caller.id] !== 1) throw new Error(`${s.kind}: caller ran ${s.runs[s.caller.id]} times`);
+      if (s.failedEvents[s.caller.id] !== 1) throw new Error(`${s.kind}: caller failed ${s.failedEvents[s.caller.id] ?? 0} times`);
+      if (s.requeued[s.caller.id]) throw new Error(`${s.kind}: the caller was requeued`);
+      if (s.requeued[s.cotenant.id] !== 1) throw new Error(`${s.kind}: co-tenant requeued ${s.requeued[s.cotenant.id] ?? 0} times`);
+      if (!cotenantOutcome.startsWith('resolved')) throw new Error(`${s.kind}: co-tenant ${cotenantOutcome}`);
+      if (s.workerFailures !== 1) throw new Error(`${s.kind}: worker.failed fired ${s.workerFailures} times`);
+      await s.scheduler.shutdown();
+    }
+  }
+
+  private async testTaskContextTermination(): Promise<void> {
+    // Called directly in run(), which then carries on and returns
+    await this.assertTaskContextTermination({ action: 'conditional-terminate', shouldTerminate: true, canRestart: true });
+  }
+
+  private async testTaskContextTerminationFromTimer(): Promise<void> {
+    // Called from a setTimeout inside run(). Inline, this used to throw where
+    // nothing could catch it: an uncaught exception that took the host down.
+    await this.assertTaskContextTermination({ action: 'self-terminate-delayed', delay: 30 });
+  }
+
+  private async testWorkerContextTermination(): Promise<void> {
+    for (const inline of [true, false]) {
+      // A long restart delay keeps the requeued tasks waiting, so the assertion
+      // sees the requeue itself rather than the reruns that follow it
+      const s = await this.terminationScenario(inline, { action: 'worker-level-terminate' }, 1500);
+      const deadline = performance.now() + 3000;
+      while (s.workerFailures === 0 && performance.now() < deadline) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      await new Promise(r => setTimeout(r, 200));
+
+      if (s.workerFailures !== 1) throw new Error(`${s.kind}: worker.failed fired ${s.workerFailures} times`);
+      for (const task of [s.caller, s.cotenant]) {
+        if (s.requeued[task.id] !== 1) throw new Error(`${s.kind}: ${task.id} requeued ${s.requeued[task.id] ?? 0} times`);
+        if (s.failedEvents[task.id]) throw new Error(`${s.kind}: ${task.id} failed`);
+        if (task.state !== 'pending') throw new Error(`${s.kind}: ${task.id} is ${task.state}, expected pending`);
+      }
+      await s.scheduler.shutdown();
     }
   }
 

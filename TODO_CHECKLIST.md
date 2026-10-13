@@ -259,18 +259,56 @@ in ~2 min. No local retries were added, so a real hang still fails the run.
 
 **Status**: 🟢 Completed - local browser runs are serial
 
-#### 🔵 `terminateWithError()` behaves differently inline and threaded
-Called through the task context, inline `terminateWithError()` throws a
-`WorkerTerminationError` synchronously, so the calling task fails and every
-other task is requeued. Threaded, it posts a message and returns: the run keeps
-going, and the pool requeues every running task **including the caller**, which
-then runs again. Inline, a call from outside the task's own stack - a timer, an
-interval, the worker-level `this.workerContext` - throws where nothing catches it,
-which is an uncaught exception in the host process. `tests/workers/
-selfTerminatingWorker.ts` does exactly this from `setInterval`, at a low
-probability. The two need one documented contract before either is changed.
+#### 🟢 `terminateWithError()` behaves differently inline and threaded
+Called through the task context, inline `terminateWithError()` threw a
+`WorkerTerminationError` synchronously, so the calling task failed and every
+other task was requeued. Threaded, it posted a message and returned: the run kept
+going, and the pool requeued every running task **including the caller**, which
+then ran again. Inline, a call from outside the task's own stack - a timer, an
+interval, the worker-level `this.workerContext` - threw where nothing caught it:
+an uncaught exception that crashed the host process (Node, Deno) or silently did
+nothing (browser). `tests/workers/selfTerminatingWorker.ts` does exactly this.
+The documentation disagreed with itself too: `AGENTS.md` said the task running
+at the time rejects, the `BaseWorkerContext` JSDoc said in-flight tasks are
+requeued.
 
-**Status**: 🔵 Not Started
+**Outcome**: one contract, chosen with the maintainer, documented in `AGENTS.md`
+§4, the README and the JSDoc:
+- It is a request and **never throws**, on both pool types and from any call
+  site. Code after it keeps running; the calling task's later result is
+  discarded.
+- **Attributed by context.** Called on a task's `context`, that task fails with a
+  `WorkerTerminationError` and the worker's others are requeued. Called on
+  `this.workerContext`, no task is blamed and every in-flight task is requeued.
+  Throwing a `WorkerTerminationError` out of `run()` behaves like the task-context
+  call. "Requeued" is subject to `requeueFailedTasks` and `canRestart`, as before.
+
+Inline, the request marks the worker failed at once (so nothing is dispatched to
+it) and reports in a microtask, so no scheduler or listener code runs inside the
+worker's own call - matching a thread, where it is a message. A request made in
+`setup()` used to throw and fail the setup; now setup completes and the worker is
+torn down, and the wrapper tears the instance down itself, because the pool's
+teardown runs before the instance is stored and found nothing (verified: without
+it, the instance is never torn down). Both wrappers handle a termination once.
+Threaded, the task context now sends its task id; `ThreadWrapper`'s throwing
+`createTerminateWithError` and `pendingTerminationRequest` were never called and
+are removed.
+
+Behaviour changes for consumers: inline code after a `terminateWithError()` call
+now runs; a task that terminates through its own context on a threaded pool now
+fails instead of being requeued; `worker.setup.completed` (not `.failed`) fires
+when `setup()` requests termination.
+
+Tests (both pool types): a task-context call fails only the caller and requeues
+the co-tenant; the same from a timer; a worker-context call requeues every task;
+the docs test covers both rows of the `AGENTS.md` table; the setup-termination
+test now requires the teardown. Two existing tests used a task-context call
+expecting a requeue and now use the worker-context one. Mutation checks: throwing
+again crashes the suite with `Uncaught WorkerTerminationError` from the timer
+test; a threaded task context without its task id leaves the caller unsettled;
+skipping the setup teardown fails the setup test.
+
+**Status**: 🟢 Completed - Deno and Node 22 143/143, browser 75/75, `jsr:smoke`
 
 #### 🟢 One worker failure is handled twice
 `_handleTerminationRequest` dispatches both `worker.failed` and

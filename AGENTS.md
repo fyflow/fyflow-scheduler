@@ -191,9 +191,21 @@ export default class MyWorker extends BaseWorker {
 - `config` comes from the pool's `config` option and is shared by every worker
   instance in that pool.
 - A worker can ask the pool to tear it down - e.g. after a connection goes bad -
-  with `this.workerContext?.terminateWithError(err, { canRestart: true })`. The
-  task running at the time rejects with a `WorkerTerminationError`, so catch that
-  to tell worker shutdown apart from an ordinary task failure:
+  with `terminateWithError(err, { canRestart: true })`. It is a request: it
+  returns at once and never throws, so it is safe from a timer or a callback,
+  and the code after it keeps running (whatever that task then returns is
+  discarded). What happens to the worker's tasks depends on which context you
+  call it on:
+
+  | Called on | The calling task | The worker's other tasks |
+  |---|---|---|
+  | the task's `context` (the second argument to `run()`) | fails with a `WorkerTerminationError` | requeued |
+  | `this.workerContext` (no task) | - | all requeued, including any running one |
+
+  "Requeued" holds when the pool's `requeueFailedTasks` allows it and
+  `canRestart` is not `false`; otherwise those tasks fail. Throwing a
+  `WorkerTerminationError` out of `run()` behaves like the task-context call.
+  Catch the error to tell worker shutdown apart from an ordinary task failure:
 
   ```typescript
   import { WorkerTerminationError } from 'fyflow-scheduler';
@@ -204,6 +216,10 @@ export default class MyWorker extends BaseWorker {
     if (error instanceof WorkerTerminationError) { /* the worker went away */ }
   }
   ```
+
+  Use the task context when this task is the problem, and the worker context
+  when the worker is: a task that calls the worker-level version is requeued and
+  runs again, and if it asks again every time, the pool spends its restarts on it.
 - One instance is created per worker, lazily, and reused across tasks. Instance
   state persists between tasks — do not assume a fresh object per task.
 - Throwing from `run()` fails that task. Throwing from `setup()` fails the

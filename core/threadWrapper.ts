@@ -2,7 +2,7 @@
 // Uncomment the line below when building for Node.js
 // import { Worker } from 'worker_threads';
 import getWorkerUrl from "./workerWrapperUrl.ts";
-import type { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext } from "./workerInterface.ts";
+import type { WorkerInstanceExtensions, WorkerInstanceState } from "./workerInterface.ts";
 import { WorkerTerminationError } from "./workerInterface.ts";
 
 // How long terminate() waits for the worker to acknowledge teardown before
@@ -45,12 +45,9 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     private initStartTime = 0;
     private teardownStartTime = 0;
 
-    // Pending termination request for post-task handling
-    private pendingTerminationRequest: {
-        error: Error;
-        metadata: any;
-        timestamp: number;
-    } | null = null;
+    // One termination per worker: a worker that calls terminateWithError()
+    // more than once must not report its failure more than once
+    private terminationHandled = false;
 
     //DENO SPECIFIC USE OF WORKER, node uses worker_threads
     constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}) {
@@ -97,28 +94,11 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         this.runningTaskData.delete(taskId);
     }
 
-    // terminateWithError implementation - throws error for clean task completion
-    private createTerminateWithError(): (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void {
-        return (error: Error, metadata = {}) => {
-            // Store termination request for post-task handling
-            this.pendingTerminationRequest = {
-                error,
-                metadata: {
-                    failureType: 'runtime',
-                    canRestart: metadata.canRestart,
-                    restartDelay: metadata.restartDelay,
-                    ...metadata
-                },
-                timestamp: Date.now()
-            };
-
-            // Throw special error to fail the task cleanly
-            throw new WorkerTerminationError(error.message, metadata);
-        };
-    }
-
     // Handle termination request after task completion
     private _handleTerminationRequest(metadata: any) {
+        if (this.terminationHandled) return;
+        this.terminationHandled = true;
+
         // Update worker state
         this.state = 'failed';
         this.lastError = {
@@ -220,14 +200,6 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         this.callbacks.clear();
         this.taskStartTimes.clear();
         this.runningTaskData.clear();
-    }
-
-    // Create BaseWorkerContext for worker constructor
-    private createBaseWorkerContext(): BaseWorkerContext {
-        return {
-            workerId: this.id,
-            terminateWithError: this.createTerminateWithError()
-        };
     }
 
     get idle(): boolean {

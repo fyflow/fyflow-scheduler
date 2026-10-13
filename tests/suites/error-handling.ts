@@ -217,6 +217,11 @@ class ErrorHandlingTestSuite {
         resolve(e.detail);
       });
     });
+    // setup() asks for termination before the instance is stored, so the pool's
+    // own teardown finds nothing; the wrapper has to tear the instance down
+    // itself once setup() returns, or whatever setup() acquired leaks
+    let tornDown = false;
+    workerManager.addEventListener('worker.teardown.completed', () => { tornDown = true; });
 
     const task = new FyflowTask({
       id: 'self-terminate-setup',
@@ -243,6 +248,12 @@ class ErrorHandlingTestSuite {
     await Promise.race([taskPromise, new Promise(resolve => setTimeout(resolve, 100))]);
 
     if (!workerFailedEmitted) throw new Error('worker.failed event not emitted for setup termination');
+
+    const teardownDeadline = performance.now() + 2000;
+    while (!tornDown && performance.now() < teardownDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    if (!tornDown) throw new Error('The worker that terminated in setup() was never torn down');
   }
 
   // Test worker runtime crash during task execution
@@ -472,7 +483,9 @@ class ErrorHandlingTestSuite {
       id: 'requeue-test',
       workerType: 'SelfTerminatingWorker',
       retryPolicy: { maxRetries: 1 },
-      payload: { action: 'self-terminate-delayed', delay: 50 }
+      // Worker-level termination blames no task, so the running one is
+      // requeued. Through the task's own context it would fail instead.
+      payload: { action: 'worker-level-terminate' }
     });
 
     scheduler.addEventListener('task.failed', (e: any) => {

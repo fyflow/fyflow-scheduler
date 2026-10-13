@@ -3,9 +3,10 @@
 
 // Special error class for worker termination requests
 /**
- * Thrown into the task that was running when a worker asked to terminate itself
- * via `context.terminateWithError()`. Catch it to distinguish worker shutdown
- * from an ordinary task failure.
+ * What a task's promise rejects with when that task asked for its worker to be
+ * torn down - by calling `context.terminateWithError()` with its own task
+ * context, or by throwing this error out of `run()`. Catch it to tell worker
+ * shutdown apart from an ordinary task failure.
  */
 export class WorkerTerminationError extends Error {
   public readonly metadata: { canRestart?: boolean; restartDelay?: number };
@@ -79,8 +80,14 @@ export interface BaseWorkerContext {
     workerId: string;
     /**
      * Ask the pool to tear this worker down, e.g. after detecting a corrupt
-     * connection. In-flight tasks are requeued when the pool's
-     * `requeueFailedTasks` allows it and `canRestart` is not false.
+     * connection. A request: it returns at once and never throws, so it is safe
+     * from a timer or a callback, and code after it keeps running.
+     *
+     * Called through this worker-level context, it blames no task: every
+     * in-flight task is requeued, when the pool's `requeueFailedTasks` allows it
+     * and `canRestart` is not false. Called through a task's context (the second
+     * argument to `run()`), that task fails with a {@link WorkerTerminationError}
+     * instead, and only the others are requeued.
      */
     terminateWithError: (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void;
 }
