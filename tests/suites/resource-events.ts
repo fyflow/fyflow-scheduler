@@ -282,6 +282,7 @@ class ResourceEventsTestSuite {
     this.results.push(await this.runTest('The Admission Queue Filters By Group', () => this.testAdmissionQueueFilter()));
     this.results.push(await this.runTest('A Busy Scheduler Still Wakes Its Blocked Tasks', () => this.testRetryHeartbeatSurvivesLoad()));
     this.results.push(await this.runTest('A Waiter Whose Pool Vanishes Fails, Not Vanishes', () => this.testOrphanedWaiterFails()));
+    this.results.push(await this.runTest('A Retried Waiter Whose Pool Vanishes Fails Too', () => this.testRetriedOrphanedWaiterFails()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -1367,6 +1368,65 @@ class ResourceEventsTestSuite {
    * is the point: the branch exists for a state that should be impossible, and
    * it used to be silent when it was not.
    */
+  // The same exit for a task that has already failed once and is waiting for
+  // its retry. A retry decision leaves `_settling` set until the next dispatch,
+  // and `_failOrphanedTask` returned early on it, so this waiter was shifted out
+  // of its queue and then dropped: the phantom the function exists to prevent.
+  private async testRetriedOrphanedWaiterFails(): Promise<void> {
+    const cpu = new ConcurrentLimitGroup(1, 'cpu');
+    const scheduler = this.track(new FyflowScheduler(
+      { A: this.pool({ maxConcurrentTasks: 2, groups: ['cpu'], idleTimeout: 5000 }) },
+      { cpu }
+    ));
+    let drained = false;
+    scheduler.addEventListener('scheduler.completed', () => { drained = true; });
+
+    // Its first attempt takes the cpu slot and fails, and its retry then queues
+    // behind the holder, which was waiting for that slot
+    const retried = scheduler.addTask(this.task('orph-retry', 'A', {
+      payload: { taskId: 'orph-retry', shouldThrow: true },
+      retryPolicy: { maxRetries: 1, backoffMs: 0 }
+    }), { createPromise: true }) as Promise<any>;
+    const holder = scheduler.addTask(new FyflowTask({
+      id: 'orph-holder', workerType: 'A', payload: { taskId: 'orph-holder', delay: 300 }
+    }), { createPromise: true }) as Promise<any>;
+
+    await this.waitFor(
+      () => scheduler.getAdmissionQueue().cpu?.some(w => w.holderId === 'orph-retry') ?? false,
+      2000,
+      'orph-retry to block on cpu for its retry'
+    );
+    const task = scheduler.tasks.get('orph-retry')!;
+    if (task.attempts !== 1) throw new Error(`Expected one retry used, got ${task.attempts}`);
+
+    const pool = (scheduler as any).workerPools.A;
+    delete (scheduler as any).workerPools.A;
+    await holder;
+
+    let rejection: Error | undefined;
+    let settled = false;
+    await Promise.race([
+      retried.then(
+        () => { settled = true; },
+        (error: Error) => { settled = true; rejection = error; }
+      ),
+      new Promise(resolve => setTimeout(resolve, 2000))
+    ]);
+    (scheduler as any).workerPools.A = pool;
+
+    if (!settled) {
+      throw new Error('The retried orphan never settled in 2s - it was dropped from its queue');
+    }
+    if (!rejection?.message.includes('no longer exists')) {
+      throw new Error(`Expected the orphan rejection, got ${rejection?.message ?? 'a resolution'}`);
+    }
+    if (task.state !== 'user_action') throw new Error(`Expected "user_action", got "${task.state}"`);
+    if (scheduler.stats.failed !== 1 || scheduler.stats.queued !== 0 || scheduler.stats.running !== 0) {
+      throw new Error(`Expected one failure and nothing outstanding, got ${JSON.stringify(scheduler.stats)}`);
+    }
+    await this.waitFor(() => drained, 1000, 'scheduler.completed after the retried orphan failed');
+  }
+
   private async testOrphanedWaiterFails(): Promise<void> {
     const cpu = new ConcurrentLimitGroup(1, 'cpu');
     const scheduler = this.track(new FyflowScheduler(

@@ -256,15 +256,22 @@ replacement. Mutation check: without the guard, the alarm fires.
 **Status**: 🟢 Completed - Deno and Node 22 139/139, `jsr:smoke`, lint;
 browser Chromium 24/24, WebKit 24/24 (one flaky run of three)
 
-#### 🔵 An orphaned task that was retried is dropped silently
-`_failOrphanedTask` returns early if `task._settling` is set. After a retry or
+#### 🟢 An orphaned task that was retried is dropped silently
+`_failOrphanedTask` returned early if `task._settling` was set. After a retry or
 requeue decision, `_settling` stays `true` until the next dispatch, so a retried
-task that is blocked when its pool disappears is shifted out of its queue and
-then dropped: no `task.failed`, no rejection. That is the phantom-task class the
-function exists to prevent. Guard on terminal state instead. Reachable only
-through the same "pool removed" path as the original issue.
+task that was blocked when its pool disappeared was shifted out of its queue and
+then dropped: no `task.failed`, no rejection, a promise that never settled. That
+is the phantom-task class the function exists to prevent. Reachable only through
+the same "pool removed" path as the original issue.
 
-**Status**: 🔵 Not Started
+**Outcome**: the guard is now "the task has already ended" (terminal state). An
+orphaned task is never in flight, so the per-attempt flag was the wrong
+question. Tested with a task whose first attempt fails and whose retry then
+blocks on a group before its pool is removed; it now fails terminally like any
+other orphan, and `scheduler.completed` fires. The test failed against the
+previous code with the task never settling.
+
+**Status**: 🟢 Completed - Deno and Node 22 140/140, lint
 
 #### 🔵 A listener re-entering the dispatch loop can lose a task
 `_dispatchLoop` peeks the head of a ready queue, calls the blocking checks, and

@@ -1121,7 +1121,12 @@ export class FyflowTask {
      * it was not, it was silent.
      */
     private _failOrphanedTask(task: FyflowTask, leftQueueId: string): void {
-      if (task._settling) return;
+      // Guarded on the task having ended, not on `_settling`. That flag is per
+      // attempt and stays set after a retry or requeue decision until the next
+      // dispatch, so a waiter that had already failed once returned here
+      // unsettled - shifted out of its queue and dropped, the phantom this
+      // function exists to prevent.
+      if (this._isTerminal(task.state)) return;
       task._settling = true;
 
       const error = new Error(
