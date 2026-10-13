@@ -749,53 +749,79 @@ When updating CLAUDE.md during completion:
 
 ## Mandatory Benchmarking Process
 
-**IMPORTANT**: After implementing any task, the following benchmarking process MUST be completed before considering the task done:
+**IMPORTANT**: After implementing any task that can affect performance, the
+following must be completed before considering the task done. A change confined
+to failure handling, docs or tests, which no benchmark scenario exercises, can say
+so instead.
 
-### 1. Performance Impact Assessment
+A benchmark result means something only next to another commit measured the same
+way, on the same machine, at the same time. There is deliberately no stored
+baseline: `benchmark-baseline-comprehensive.md` recorded absolute numbers from one
+machine on one day, and was retired once a single change (`e599930`) made them
+wrong by up to 10x. Git history keeps it.
+
+### 1. Compare the change against its base
+
+**Preferred: the `Benchmark` workflow** (`.github/workflows/benchmark.yml`,
+manual). It runs HEAD and a base ref back to back in one job on one runner, and
+writes the comparison to the job summary:
+
 ```bash
-# Run quick benchmark with multiple runs for variance analysis
-deno task benchmark:quick --runs 3
-
-# Compare results with previous baseline in benchmark-baseline-comprehensive.md
+gh workflow run benchmark.yml -f base=<commit before the change> -f category=quick -f runs=3
+gh run watch            # then read the job summary
 ```
 
-### 2. Performance Acceptance Criteria
+Both commits must be pushed. GitHub runners are shared VMs, so read the two
+columns against each other, never as absolute numbers; and their core count
+differs from most dev machines, so threading scenarios behave differently there.
+
+**Fallback: locally, back to back**, when the change is not pushed yet:
+
+```bash
+git worktree add --detach ../base <commit before the change>
+# run the same command in both trees, alternating: base, head, base, head
+deno task benchmark:variance        # = benchmark:quick --runs 3
+```
+
+Alternate the runs rather than running one commit then the other: a machine that
+warms up or gets busier then biases whichever ran second. Compare medians across
+all runs of each commit, and look at each side's spread before reading a
+difference in medians.
+
+### 2. Acceptance criteria, against the base column
 
 **✅ ACCEPTABLE**:
-- Throughput changes within ±10% of baseline
-- Scheduler overhead changes within ±20% of baseline
-- Variance coefficient of variation (CV) ≤ 10% for stable metrics
-- Memory usage growth ≤ 20% unless explicitly optimizing memory
+- Throughput within ±10% of the base
+- Scheduler overhead within ±20% of the base
+- Memory growth ≤ 20% unless explicitly optimising memory
 
 **⚠️ REQUIRES INVESTIGATION**:
-- Throughput regression > 10%
+- Throughput regression > 10% that holds in both run orders and outside the
+  spread of both commits
 - Scheduler overhead increase > 20%
-- High variance (CV > 10%) in previously stable metrics
-- Significant memory usage increases without clear justification
+- Memory increase without a clear justification
 
 **❌ UNACCEPTABLE**:
 - Throughput regression > 25%
 - Scheduler overhead increase > 50%
-- System crashes or hangs under benchmark load
+- Crashes or hangs under benchmark load
 - Memory leaks or excessive memory growth
 
-### 3. Baseline Update Process
+### 3. Recording the result
 
-Only after manual review and approval of benchmark results:
+Put the comparison in the task's entry in this file and in the commit message:
+the scenarios that moved, by median, with the spread where it matters, and any
+difference you judged to be noise along with why. A significant improvement
+belongs in the release notes too.
 
-1. **Review Results**: Analyze performance impact and variance
-2. **Document Changes**: Note any significant performance changes in commit
-3. **Update Baseline**: Replace `benchmark-baseline-comprehensive.md` with new results
-4. **Commit Changes**: Include both implementation and new baseline
-
-### 4. Available Benchmark Commands
+### 4. Available benchmark commands
 
 ```bash
 # Quick benchmarks (7 core scenarios: inline volume + threading)
 deno task benchmark:quick
 
 # Quick benchmarks with variance analysis
-deno task benchmark:quick --runs 3
+deno task benchmark:variance
 
 # Specific scenarios
 deno task benchmark --scenarios "Large Volume - 1K Independent Tasks"
@@ -811,22 +837,7 @@ deno task benchmark:quick --format markdown --output latest-results.md
 deno task benchmark:quick --format csv --output results.csv
 ```
 
-### 5. Confidence Ranges (Current Baseline)
-
-**Current Baseline**: See `benchmark-baseline-comprehensive.md` for current performance baseline covering:
-- **Volume Tests**: 10K and 50K independent tasks (with promises)
-- **Fire-and-Forget Mode**: 10K and 50K tasks (without promise creation)
-- **Threading Efficiency**: 200 tasks on 2 threads, 200 tasks on 4 threads
-- **High Contention**: 1K and 10K tasks with limited group slots
-
-**Optional Promise Feature Analysis**: See `benchmark-comparison-optional-promises.md` for detailed before/after comparison.
-
-Key performance characteristics (2026-08-27 baseline, Deno on Windows):
-- **Inline Workers (Promises)**: ~62,000 tasks/sec (10K), ~10,200 tasks/sec (50K)
-- **Fire-and-Forget Mode**: ~28,000 tasks/sec (10K), ~4,900 tasks/sec (50K)
-- **Threading Efficiency**: 2 threads 96.3%, 4 threads 96.9% (pre-warmed)
-- **High Contention**: 1K/4 slots 97.9%, 10K/4 slots 98.4%
-- **Worker Startup**: threads ~12-54ms each cold; inline instances ~85-325us
+### 5. Reading the numbers
 
 **Reading `Overall Efficiency`**: it is achieved average concurrency divided by
 the concurrency the scenario configured - "how much of the parallelism I asked
@@ -840,6 +851,11 @@ Scenarios pre-warm their workers, so startup is excluded from efficiency. The
 three `Worker Startup` scenarios carry that dimension instead - read their
 `Worker Startup` line, not their efficiency, which is low by construction.
 
+**`Large Volume - 1K Independent Tasks (Inline)` is bimodal.** Each run lands
+near either ~1150 or ~1300 tasks/sec, on any commit, and which mode a commit's
+runs land in varies between comparisons. A ±10% move in its median says nothing
+on its own; it never queues enough to reach most of the scheduler.
+
 ### 5a. Comparing runs - read this before calling something a regression
 
 **Scenario order matters more than most code changes.** Later scenarios in a
@@ -851,18 +867,9 @@ same commit:
 - `Threading Scalability - 200 Tasks, 2 Threads`: ~102-144 tasks/sec inside
   `benchmark:quick`, ~197-219 tasks/sec run on its own
 
-Only compare like with like: full-suite numbers against full-suite numbers, in
-the same category and the same order. To attribute a change to code rather than
-environment, run the same scenarios on both commits back to back (a
-`git worktree` at the older commit works well) instead of comparing against a
-stored baseline recorded on another day.
-
-### 6. Regression Detection
-
-Performance regressions are automatically flagged when:
-- Results fall outside confidence ranges above
-- High variance scenarios (CV > 10%) indicate instability
-- Memory usage increases significantly without justification
+Only compare like with like: the same category, the same order, the same machine,
+the same session. Both procedures in step 1 guarantee that; a number recorded on
+another day does not.
 
 ## Notes
 - **Follow the Task Lifecycle Process** for all tasks (Refinement → Implementation → Completion)

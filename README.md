@@ -475,7 +475,7 @@ deno task check
 npm run benchmark           # Full benchmark suite
 npm run benchmark:quick     # Quick performance test
 npm run benchmark:startup   # Worker startup cost, for comparing runtimes
-npm run benchmark:baseline  # The set behind benchmark-baseline-comprehensive.md
+npm run benchmark:baseline  # The comprehensive regression set
 ```
 
 ## Examples
