@@ -232,6 +232,27 @@ by accident. The restore is now in a `finally`, verified by forcing a type error
 
 **Status**: 🟢 Completed
 
+#### 🟢 Browser tests fail at random when run locally
+On a 20-core Windows machine `pnpm run test:browser` failed 6-9 Firefox tests
+per run, a different set each time, with or without code changes, and
+occasionally one WebKit test. Almost all were timeouts in `beforeEach` (the page
+load) or in context teardown, with Playwright's Firefox driver logging
+`cannot find session`; one was a timing assertion in "should handle resource
+contention performance" (`expected > 254`), failing under the same load.
+
+The cause was parallelism, not the library: Playwright's local default is half
+the cores, here 10 browsers each running scheduler threads. Run serially,
+Firefox passed 24/24 twice. CI was unaffected, because it already runs one
+worker.
+
+**Outcome**: local runs use 2 workers. Measured on the full suite: 1 failure in
+4 runs at ~1.5 min, against ~7 failures per run at 4.7 min before; 4 workers
+still failed once in three runs. The remaining failure is Firefox's first page
+load in a worker taking 25-33s against the 30s test timeout. No local retries
+were added, so a real hang still fails the run.
+
+**Status**: 🟢 Completed - residual Firefox cold-start slowness noted
+
 #### 🔵 `terminateWithError()` behaves differently inline and threaded
 Called through the task context, inline `terminateWithError()` throws a
 `WorkerTerminationError` synchronously, so the calling task fails and every
