@@ -28,7 +28,212 @@ part of it did survive, as `groups/resourceGroup.ts`.
 
 **Status**: 🟢 Closed - implemented and deliberately reverted
 
+### Requests from fyflow-app, pass 1 (2026-10-13)
+
+Arrived as a specification from fyflow-app, which drives the scheduler through
+fyflow-orchestration 0.7.0. Item numbers are theirs and stay stable, so replies
+cite them as "scheduler pass 1 #N". Plans go to `doc/design/`, contracts to
+`AGENTS.md`. None of the four was already on `main` at 0.5.2.
+
+Applies to every protocol change below: Deno and the browser run
+`core/workerWrapper.ts`, Node runs `core/workerWrapper.node.ts`. They stay
+separate files because of runtime differences in worker threads, so a new
+message has to be added to both. Each such feature therefore needs a test on a
+threaded pool (`inline: false`) in the shared suites, which exercises each
+wrapper on its own runtime, plus a browser spec.
+
+#### 🟡 Cancel a task, queued or running (#1, P1)
+`scheduler.cancel(taskId, options?)`, a terminal `task.cancelled` that is not a
+`task.failed`, and resource holdings released. Reaches all seven places a task
+can wait, including a new thread still initialising. Cooperative through an
+`AbortSignal` on the context; forced after a grace period on threaded pools
+only. `'cancelled'` on `ResourceUnblockReason` is a widening, so the release
+commit needs the reasoning, as for 0.3.0.
+
+Decided: the promise rejects with a new `CancelledError`, optional or not; while
+cancelling, `state` stays `'running'` with `task.cancellation` as the marker,
+and only the terminal `'cancelled'` is new; an inline worker ignoring the signal
+keeps the task cancelling until `run()` returns; cancel wins over a late outcome;
+`task.cancelling` then `task.cancelled` for dispatched tasks, with resources
+released at the second, and after a forced stop only once the thread is dead; an
+eagerly created `context.signal`; a forced stop does not count against
+`maxWorkerRestarts` and always requeues co-tenants; `cancelGraceMs` defaults to
+2000, with per-call `graceMs` that a repeat call can only shorten; `cancel()` is
+constant-time through tombstones in head-indexed queues and live counts, with no
+bulk API; every state and queue transition completes before its event, at four
+sites; a cancelling task whose worker fails settles only once its attempt has
+stopped; re-adding a cancelled task object throws. `descendants: true` and pause
+groundwork are deferred. Depends on the requeue, re-entrancy and queue known
+issues below. Includes the `scheduler.completed` fix below. Plan:
+`doc/design/task-cancellation.md`, no open questions.
+
+**Status**: 🟡 Refinement - plan open in `doc/design/task-cancellation.md`
+
+#### 🟡 A log channel from workers (#2, P1)
+Requested as `context.log(level, message, data?)` and `task.log`. Answered with
+a general worker-to-host event channel instead, with logging as one use of it,
+so the scheduler does not define log levels or formats: `context.emit()` to
+`task.message` on the scheduler, and `workerContext.emit()` to `worker.message`
+on the pool. Nothing is sent while nobody listens. The gate, buffers, cap,
+clone and flush live once, in a new runtime-neutral `core/messageChannel.ts`
+used by both worker wrappers and `InlineWrapper` (it needs its own line in the
+`deno.json` publish allowlist). Plan: `doc/design/task-messages.md`. Ships with
+or after #4, whose `task.attemptNumber` it carries, and after the requeue known
+issue below. Remaining open: default flush interval and cap (from a benchmark).
+
+`node:diagnostics_channel` was considered and rejected: it is per-thread, so it
+cannot carry worker output to the main thread, and the browser does not have it.
+
+**Status**: 🟡 Refinement - plan open in `doc/design/task-messages.md`
+
+#### 🟡 Start a task with attempts already spent (#4, P2)
+A config field so a resumed task does not get a fresh retry budget, and an event
+when a retry starts. Decided: `attemptsSpent` sets the starting `attempts`, and a
+task whose spent attempts already use up the budget runs once anyway; a new
+1-based `task.attemptNumber` (not `attempt`, which is one letter away from the
+0-based `attempts`); a requeue after worker death is not an attempt; a
+`task.retrying` event whose detail is the live task, like the other lifecycle
+transitions. Includes the backoff fix below. Depends on the requeue known issue
+below. Plan: `doc/design/attempt-accounting.md`, no open questions.
+
+**Status**: 🟡 Refinement - plan open in `doc/design/attempt-accounting.md`
+
 ## Known Issues / Follow-ups
+
+The first six below were found by the two review rounds of the pass 1 plans.
+They exist today, independently of that work. All three plans depend on the
+first one, and cancellation (#1) also depends on the two marked as its
+prerequisites, so they ship first.
+
+#### 🔵 A requeued task can be settled by its abandoned run
+When a worker fails, its other running tasks are requeued and dispatched again,
+but the old run keeps executing: an inline `run()` cannot be interrupted, and a
+threaded one keeps running through the 500 ms teardown handshake, because
+`terminate()` keeps `callbacks` until the end. When the old run finishes, its
+outcome settles the **new** attempt: `_settling` was cleared by the new
+dispatch, and the wrapper still lists the task. Reproduced on an inline pool
+with `maxConcurrentTasks: 2` and one task calling `terminateWithError`: the
+co-tenant was re-dispatched to a second instance, then completed `done` with the
+first instance's result while the second run was still in flight. Its real
+result was discarded, and its resources were released while still in use.
+
+The underlying assumption, that a task id runs at most once at a time, is false
+after a requeue. Fix:
+- `_dispatchTask` stamps a per-dispatch token on the task and captures it in the
+  `.then`/`.catch` closures; `_settleTask` ignores an outcome whose token is
+  stale.
+- The pool tells a failed worker's wrapper to *release* each task it requeues
+  off it: forget it (drop the callback or running id), so that worker's late
+  events are dropped, and reject its pending promise with an internal requeue
+  error that `_dispatchTask`'s `.catch` recognises, as it already recognises the
+  capacity-race error. Requeue then no longer depends on the
+  `task.requeue_required` event reaching the scheduler, which it does not during
+  a shutdown drain. Cancellation's forced stop uses the same operation.
+
+The event-path outcomes (`task.requeue_required`, the pool's `task.failed`)
+carry no token, so their safety rests on the wrapper forgetting the task before
+it emits anything further. That makes "One worker failure is handled twice"
+below a dependency of this fix.
+
+Test with the reproduction above, on both pool types. Mutation check: remove the
+token comparison and the stale result must win again.
+
+**Status**: 🔵 Not Started - prerequisite for pass 1 #1, #2 and #4
+
+#### 🔵 One worker failure is handled twice
+`_handleTerminationRequest` dispatches both `worker.failed` and
+`worker.termination_requested`, and both reach `_handleWorkerFailure`
+(`workerManager.ts` listeners for each). One self-termination therefore emits
+`task.requeue_required` twice per task, schedules two replacements, and adds 2
+to `poolRestartCount`, so a pool reaches `worker.restart_limit_exceeded` twice as
+fast as `maxWorkerRestarts` says. Fix: handle each worker's failure once.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 An orphaned task that was retried is dropped silently
+`_failOrphanedTask` returns early if `task._settling` is set. After a retry or
+requeue decision, `_settling` stays `true` until the next dispatch, so a retried
+task that is blocked when its pool disappears is shifted out of its queue and
+then dropped: no `task.failed`, no rejection. That is the phantom-task class the
+function exists to prevent. Guard on terminal state instead. Reachable only
+through the same "pool removed" path as the original issue.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 A listener re-entering the dispatch loop can lose a task
+`_dispatchLoop` peeks the head of a ready queue, calls the blocking checks, and
+only then `shift()`s. The blocking checks emit `resource.blocked`, and a listener
+that re-enters the scheduler (`addTask`, which runs the dispatch loop again)
+causes the inner loop to handle the same head task, so the outer `shift()`
+removes a different task. Reproduced on Deno 2.9.6 with a `resource.blocked`
+listener calling `addTask`: one live task ended up in no queue. It never ran,
+never settled, and was missing from `stats`. Fix: take the task out of the ready
+queue before anything can emit, and more generally finish every state and queue
+transition before dispatching an event. Cancellation (#1) needs the same rule at
+three more sites; see its plan.
+
+**Status**: 🔵 Not Started - prerequisite for pass 1 #1
+
+#### 🔵 Ready and blocked queues are quadratic above ~16K tasks
+Both are plain arrays consumed with `shift()` (and `unshift()`). V8 makes
+`shift()` effectively free on small arrays, but above roughly 16,000 elements it
+copies the array on every call. Measured on Deno 2.9.6, per `shift()`: 0.1 µs at
+15,000 elements, 79 µs at 17,000, 232 µs at 50,000. Every dispatch from a large
+ready queue pays it, so draining a 50,000-task queue spends seconds copying.
+This may account for part of the Fire-and-Forget 50K benchmark result. The two
+`!queue.includes(task)` guards before a blocked push are linear too. Fix: an
+internal queue with a head index (append at the tail, advance the head, trim
+when the head passes half the length), and replace the `includes()` guards with
+a recorded "which queue is this task in" field, since a task is in at most one
+blocked queue. Cancellation (#1) builds its constant-time `cancel()` on this
+queue. The class is a new published module (`core/taskQueue.ts`), so it needs
+its own line in the `deno.json` publish allowlist. Benchmark before and after.
+
+**Status**: 🔵 Not Started - prerequisite for pass 1 #1
+
+#### 🔵 `shutdown()` stops listening to its pools before draining them
+`shutdown()` calls `_removeAllListeners()` before its 5 s wait for running tasks.
+Settles during the wait still run the dispatch loop, so new tasks are dispatched
+into pools about to be torn down, and those tasks reach `task.completed` with no
+`task.running` before it. Requeues reported by pool events during the wait are
+lost entirely, leaving tasks counted as running until the wait gives up. Fix:
+remove listeners after the drain. Dispatching during the drain is intended, not
+part of the bug: `AGENTS.md` §7 promises that shutdown drains outstanding work so
+a workflow that can still finish does.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 Retry backoff is not enforced under load
+`_settleTask` pushes a retried task back onto the ready queue immediately and
+only schedules an extra `_dispatchLoop()` after `backoffMs`, so any dispatch in
+between starts the retry early. Confirmed on Deno 2.9.6 with `backoffMs: 1000`:
+gaps of ~1000 ms on an idle scheduler, but **1 ms** with 300 short tasks running
+alongside. Fixed as part of #4, which holds a retrying task outside the ready
+queue for its backoff. The test must run under load, since the idle case passes
+either way.
+
+**Status**: 🔵 Not Started - scheduled with #4
+
+#### 🔵 `scheduler.completed` never fires for a run with no successes
+`_checkCompletion` requires `stats.done > 0`, so a run in which every task
+fails, or (once #1 lands) every task is cancelled, never reports draining.
+Fixed as part of #1: the condition becomes "any task has reached a terminal
+state".
+
+**Status**: 🔵 Not Started - scheduled with #1
+
+#### 🔵 `doc/design/pause-resume.md` is stale
+Written against an older architecture: `readyQueue`, a `dispatched` state,
+`pool.workers` and `_processQueue` no longer exist. Its immediate mode fails
+tasks without going through `_settleTask`, which is the double-settle and
+resource-leak class fixed in 2026. It is neither current nor marked abandoned,
+which `CLAUDE.md` does not allow. Rewrite it as an open note once cancellation
+(#1) has shipped: interrupting a running attempt (signal, grace period, forced
+stop) is the hard part of an "interrupt" pause, and #1 builds it. #1
+deliberately does not add a requeue outcome for pause; that belongs to the
+rewrite.
+
+**Status**: 🔵 Not Started
 
 #### 🟢 A blocked task whose pool is missing was dropped silently
 `_retryBlockedTasksForGroup` shifted a task out of a blocked queue and then did
