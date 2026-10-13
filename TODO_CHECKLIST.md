@@ -354,19 +354,35 @@ previous code with the task never settling.
 
 **Status**: 🟢 Completed - Deno and Node 22 140/140, lint
 
-#### 🔵 A listener re-entering the dispatch loop can lose a task
-`_dispatchLoop` peeks the head of a ready queue, calls the blocking checks, and
-only then `shift()`s. The blocking checks emit `resource.blocked`, and a listener
-that re-enters the scheduler (`addTask`, which runs the dispatch loop again)
-causes the inner loop to handle the same head task, so the outer `shift()`
-removes a different task. Reproduced on Deno 2.9.6 with a `resource.blocked`
-listener calling `addTask`: one live task ended up in no queue. It never ran,
-never settled, and was missing from `stats`. Fix: take the task out of the ready
-queue before anything can emit, and more generally finish every state and queue
-transition before dispatching an event. Cancellation (#1) needs the same rule at
-three more sites; see its plan.
+#### 🟢 A listener re-entering the dispatch loop can lose a task
+`_dispatchLoop` peeked the head of a ready queue, called the blocking checks, and
+only then `shift()`ed. The blocking checks emit `resource.blocked`, and a listener
+that re-entered the scheduler (`addTask`, which runs the dispatch loop again) made
+the inner loop handle the same head task, so the outer `shift()` removed a
+different one. Traced on the previous commit: tasks `a`, `b`, `c` blocked behind a
+holder, a `resource.blocked` listener adding `late` - `c` ended up in no queue,
+never ran, never settled, and `stats` counted 4 done of 5.
 
-**Status**: 🔵 Not Started - prerequisite for pass 1 #1
+**Outcome**: the loop takes the task out of the ready queue before anything can
+emit, and the blocking checks move it out of `stats.queued` before they emit
+`resource.blocked`, so a listener sees consistent state. The common way out of
+the loop, a pool with no room, is checked first without touching the queue
+(`_poolHasRoom()`, the same condition under which `_canDispatchTask()` returns
+`false`); taking the head off and putting it back on every pass would copy a
+large ready queue twice per settle, given the known `shift()` cost above ~16K.
+Cancellation (#1) still needs the same rule at three more sites; see its plan.
+
+Tested with the traced scenario and the heartbeat disabled, so a lost task
+cannot be rescued by a periodic retry. Mutation check: restoring only the
+peek-then-shift order fails it.
+
+Benchmark, `benchmark:quick --runs 3` against the previous commit, alternated
+base/fix/base/fix (six runs each), medians: 50K +2.8%, 100K −2.2% - the
+large-queue scenarios the early capacity check exists for. 10K −15%, but its
+runs span 38k-76k (base) and 31k-84k (fix); 1K is bimodal as before and moved
++12.7%; threaded −2% to −5%, within their spread. No regression read.
+
+**Status**: 🟢 Completed - Deno and Node 22 144/144
 
 #### 🔵 Ready and blocked queues are quadratic above ~16K tasks
 Both are plain arrays consumed with `shift()` (and `unshift()`). V8 makes

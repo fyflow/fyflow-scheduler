@@ -313,6 +313,9 @@ export class FyflowTask {
       const queueId = this._blockedQueueId(short.id);
       if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, []);
       const queue = this.blockedQueues.get(queueId)!;
+      // It has left the ready queue: count it out of `queued` before
+      // resource.blocked fires, so a listener sees consistent stats
+      this.stats.queued = Math.max(0, this.stats.queued - 1);
       if (!queue.includes(task)) {
         queue.push(task);
         if (this._resourceObserved) {
@@ -560,20 +563,32 @@ export class FyflowTask {
 
         // Process multiple tasks for this worker type until we hit limits
         while (queue.length > 0 && tasksProcessed < maxTasksPerLoop) {
-          const task = queue[0]; // Peek at first task (don't remove yet)
+          // A full pool is the common way out of this loop, so it is checked
+          // without touching the queue: taking the head off and putting it back
+          // would copy a large ready queue twice on every pass.
+          if (!this._poolHasRoom(pool)) {
+            // Threads may become available when other tasks complete or idle
+            // timeout creates capacity
+            this._schedulePeriodicRetry();
+            break;
+          }
+
+          // Taken out of the ready queue BEFORE the checks below, which can
+          // emit resource.blocked. It used to be peeked and shifted afterwards,
+          // so a listener re-entering the scheduler (addTask runs this loop
+          // again) left the outer shift() removing a different task - one that
+          // then ran nowhere and never settled.
+          const task = queue.shift()!;
 
           // Check if we can dispatch this task
           const canDispatchResult = this._canDispatchTask(task, pool);
           if (canDispatchResult === true) {
-            queue.shift(); // Remove from queue
             // Dispatch the task (synchronous dispatch, async execution)
             this._dispatchTask(task, pool);
             tasksProcessed++;
           } else if (canDispatchResult === 'blocked' || canDispatchResult === 'blocked-keyed') {
-            // Task was moved to blocked queue - remove from ready queue
-            queue.shift();
-            // Decrement queued count since task is now blocked (not in ready queue)
-            this.stats.queued = Math.max(0, this.stats.queued - 1);
+            // Moved to a blocked queue; the blocking check has already taken it
+            // out of stats.queued, before telling anyone
 
             if (canDispatchResult === 'blocked-keyed' && keyedSkips < maxTasksPerLoop) {
               // Only this task's key is exhausted. Keep scanning: the next task
@@ -586,9 +601,11 @@ export class FyflowTask {
             // Stop processing this worker type for now
             break;
           } else {
-            // canDispatchResult === false: No threads available
-            // Keep task in ready queue and schedule retry
-            // (threads may become available when other tasks complete or idle timeout creates capacity)
+            // canDispatchResult === false: no room after all. Unreachable while
+            // _poolHasRoom() mirrors _canDispatchTask(); kept so a divergence
+            // between them delays the task instead of losing it. Safe to put
+            // back, as this path emits nothing.
+            queue.unshift(task);
             this._schedulePeriodicRetry();
             break;
           }
@@ -630,6 +647,9 @@ export class FyflowTask {
             this.blockedQueues.set(queueId, []);
           }
           const blockedQueue = this.blockedQueues.get(queueId)!;
+          // It has left the ready queue: count it out of `queued` before
+          // resource.blocked fires, so a listener sees consistent stats
+          this.stats.queued = Math.max(0, this.stats.queued - 1);
           // Only a push is an event. Re-reaching a queue the task is already in
           // changes no membership, and emitting there would leave the fold one
           // blocked ahead of its unblocked permanently.
@@ -654,6 +674,18 @@ export class FyflowTask {
         }
       }
       return true; // Resources available
+    }
+
+    /**
+     * Whether the pool could take a task now: an existing worker with a free
+     * slot, or room to create one. Exactly the condition under which
+     * {@link _canDispatchTask} does not return `false`, checked without
+     * touching a queue or emitting anything.
+     */
+    private _poolHasRoom(pool: any): boolean {
+      if (pool.threads.some((t: any) => t.canAcceptTask && t.canAcceptTask())) return true;
+      const initializingCount = pool.initializingThreads ? pool.initializingThreads.size : 0;
+      return (pool.threads.length + initializingCount) < pool.maxThreads;
     }
 
     // NEW: Non-optimistic mode helper methods

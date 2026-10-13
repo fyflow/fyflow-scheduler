@@ -115,7 +115,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Seven suites, 143 tests, all in the default `deno task test` run:
+Seven suites, 144 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -124,7 +124,7 @@ Seven suites, 143 tests, all in the default `deno task test` run:
 | spawning | 12 | dynamic spawning, `onCompleteDescendants()` |
 | settlement | 25 | exactly-once settlement, counter cardinality, requeue, self-termination |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
-| resource-events | 24 | `resource.*` events, gauges, admission queue |
+| resource-events | 25 | `resource.*` events, gauges, admission queue |
 | docs | 35 | **executes every snippet in README.md and AGENTS.md** |
 
 `deno task test:scripts` is separate and not included in `deno task test` — it

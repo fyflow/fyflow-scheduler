@@ -283,6 +283,7 @@ class ResourceEventsTestSuite {
     this.results.push(await this.runTest('A Busy Scheduler Still Wakes Its Blocked Tasks', () => this.testRetryHeartbeatSurvivesLoad()));
     this.results.push(await this.runTest('A Waiter Whose Pool Vanishes Fails, Not Vanishes', () => this.testOrphanedWaiterFails()));
     this.results.push(await this.runTest('A Retried Waiter Whose Pool Vanishes Fails Too', () => this.testRetriedOrphanedWaiterFails()));
+    this.results.push(await this.runTest('A Blocked Listener Re-entering Dispatch Loses No Task', () => this.testBlockedListenerReentryLosesNothing()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -1368,6 +1369,51 @@ class ResourceEventsTestSuite {
    * is the point: the branch exists for a state that should be impossible, and
    * it used to be silent when it was not.
    */
+  // A resource.blocked listener runs while the dispatch loop is moving a task
+  // from a ready queue to a blocked one. The loop used to peek at the head, run
+  // the blocking check (which emits), and only then shift() - so a listener
+  // that re-entered the loop, here through addTask, made the outer shift()
+  // remove a different task, which then ran nowhere and never settled.
+  private async testBlockedListenerReentryLosesNothing(): Promise<void> {
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const scheduler = this.track(new FyflowScheduler(
+      { A: this.pool({ maxConcurrentTasks: 100, groups: ['g'], idleTimeout: 5000 }) },
+      { g },
+      // No heartbeat during the test: every admission is a direct release, so a
+      // lost task cannot be rescued by a periodic retry and hidden
+      { periodicRetryIntervalMs: 60_000 }
+    ));
+    const completed: string[] = [];
+    scheduler.addEventListener('task.completed', (e: any) => completed.push(e.detail.id));
+
+    const holder = scheduler.addTask(new FyflowTask({
+      id: 'reentry-holder', workerType: 'A', payload: { taskId: 'reentry-holder', delay: 200 }
+    }), { createPromise: true }) as Promise<any>;
+    await this.waitFor(() => scheduler.stats.running === 1, 1000, 'the holder to start');
+
+    let reentered = false;
+    scheduler.addEventListener('resource.blocked', () => {
+      if (reentered) return;
+      reentered = true;
+      scheduler.addTask(this.task('reentry-late', 'A'));
+    });
+
+    const ids = ['reentry-a', 'reentry-b', 'reentry-c'];
+    scheduler.addTasks(ids.map(id => this.task(id, 'A')));
+    await holder;
+
+    const expected = ['reentry-holder', ...ids, 'reentry-late'];
+    await this.waitFor(
+      () => expected.every(id => completed.includes(id)),
+      3000,
+      `every task to complete - completed ${JSON.stringify(completed)}`
+    );
+    const s = scheduler.stats;
+    if (s.done !== expected.length || s.queued !== 0 || s.running !== 0) {
+      throw new Error(`Expected ${expected.length} done and nothing outstanding, got ${JSON.stringify(s)}`);
+    }
+  }
+
   // The same exit for a task that has already failed once and is waiting for
   // its retry. A retry decision leaves `_settling` set until the next dispatch,
   // and `_failOrphanedTask` returned early on it, so this waiter was shifted out
