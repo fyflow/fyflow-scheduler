@@ -251,6 +251,63 @@ test.describe('FyFlow Web Worker Functionality', () => {
     expect(result.secondTaskState).toBe('done');
   });
 
+  // The browser build bundles the worker bootstrap, and this test worker, each
+  // with its own copy of WorkerTerminationError. A worker's termination request
+  // used to be recognised with instanceof, which fails across copies, so here
+  // it became an ordinary task failure and the worker was never torn down.
+  test('should tear down a self-terminating worker and fail its task', async ({ page }) => {
+    const results = await page.evaluate(async () => {
+      const { FyflowScheduler, FyflowTask, WorkerManager, WorkerTerminationError } =
+        await import('/dev-dist/browser/index.js');
+
+      const outcomes: any[] = [];
+      for (const inline of [true, false]) {
+        const pool = new WorkerManager('/dev-dist/browser/tests/workers/selfTerminatingWorker.js', {
+          maxThreads: 1, maxConcurrentTasks: 1, inline, maxWorkerRestarts: 3
+        });
+        const scheduler = new FyflowScheduler({ W: pool }, {});
+        let workerFailed = 0;
+        let runs = 0;
+        pool.addEventListener('worker.failed', () => { workerFailed++; });
+        scheduler.addEventListener('task.running', () => { runs++; });
+
+        const task = new FyflowTask({
+          id: `terminating-${inline}`, workerType: 'W',
+          payload: { action: 'self-terminate', canRestart: true, restartDelay: 10 }
+        });
+        let rejection: any;
+        const settled = await Promise.race([
+          (scheduler.addTask(task, { createPromise: true }) as Promise<any>)
+            .then(() => 'resolved', (error: any) => { rejection = error; return 'rejected'; }),
+          new Promise(resolve => setTimeout(() => resolve('never settled'), 5000))
+        ]);
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        outcomes.push({
+          inline,
+          settled,
+          isTerminationError: rejection instanceof WorkerTerminationError,
+          state: task.state,
+          workerFailed,
+          runs
+        });
+        await scheduler.shutdown();
+      }
+      return outcomes;
+    });
+
+    for (const outcome of results) {
+      expect(outcome, `inline: ${outcome.inline}`).toEqual({
+        inline: outcome.inline,
+        settled: 'rejected',
+        isTerminationError: true,
+        state: 'user_action',
+        workerFailed: 1,
+        runs: 1
+      });
+    }
+  });
+
   test('should handle mixed inline and Web Worker execution', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {

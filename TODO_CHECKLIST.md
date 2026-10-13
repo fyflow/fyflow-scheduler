@@ -206,13 +206,19 @@ as a running task, and only then handle the termination. The threaded pool
 rejects with a `WorkerTerminationError`. A new internal
 `isWorkerTerminationError()` matches by name as well as identity, and
 `InlineWrapper` re-creates a foreign copy from its own class, so a caller's
-`instanceof` holds. The browser case follows from the same change but has no
-browser test of its own.
+`instanceof` holds.
 
 Tested on both pool types (task fails once, ran once, never requeued, rejects
 with `WorkerTerminationError`). Mutation checks: handling the termination before
 failing the task leaves it `pending`; not forgetting it on inline reports it
 requeued. Before the name check, the test failed on Node only.
+
+The browser case got its own Playwright spec afterwards, "should tear down a
+self-terminating worker and fail its task", on both pool types in all three
+browsers. With matching by identity only, it fails in the browser on both pool
+types - the worker is never torn down and the caller does not receive a
+`WorkerTerminationError` - confirming that the browser build was affected, not
+just this repository's Node test build.
 
 **Status**: 🟢 Completed - Deno and Node 22 138/138
 
