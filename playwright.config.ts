@@ -19,17 +19,16 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
 
   // Opt out of parallel tests on CI
-  // Capped locally, not left to Playwright's default of half the cores. Each
-  // worker is a browser running scheduler threads of its own, and on a 20-core
-  // Windows machine the default (10) failed 6-9 Firefox tests per run - page
-  // loads and context teardown timing out - with a different set each time,
-  // and occasionally one WebKit test. Measured on the full suite: 2 workers
-  // failed 1 test in 4 runs, in ~1.5 min - faster than the failing default run
-  // (4.7 min); 4 workers failed once in three runs. The remaining failure is
-  // Firefox's first page load in a worker taking 25-33s against the 30s test
-  // timeout, with Playwright's Firefox driver logging lost sessions.
-  // Deliberately no local retries: a retried hang is still a hang.
-  workers: process.env.CI ? 1 : 2,
+  // One worker, locally as in CI, not Playwright's default of half the cores.
+  // Each worker is a browser running scheduler threads of its own, and on a
+  // 20-core Windows machine the default (10) failed 6-9 Firefox tests per run -
+  // page loads in beforeEach and context teardown timing out, a different set
+  // each time - with Playwright's Firefox driver logging lost sessions. Two
+  // workers looked enough (1 failure in 4 runs) and then failed 6 Firefox tests
+  // in one run. Serial has not failed here: Firefox 25/25 three times, the full
+  // suite 72/72 in ~2 min. Deliberately no local retries: a retried hang is
+  // still a hang.
+  workers: 1,
 
   // Reporter to use
   reporter: [

@@ -251,13 +251,13 @@ the cores, here 10 browsers each running scheduler threads. Run serially,
 Firefox passed 24/24 twice. CI was unaffected, because it already runs one
 worker.
 
-**Outcome**: local runs use 2 workers. Measured on the full suite: 1 failure in
-4 runs at ~1.5 min, against ~7 failures per run at 4.7 min before; 4 workers
-still failed once in three runs. The remaining failure is Firefox's first page
-load in a worker taking 25-33s against the 30s test timeout. No local retries
-were added, so a real hang still fails the run.
+**Outcome**: local runs use one worker, as CI does. A first fix capped them at 2:
+1 failure in 4 full runs at ~1.5 min, against ~7 per run at 4.7 min before, but
+a later run at 2 failed 6 Firefox tests, the same page-load timeouts. Serial has
+not failed on this machine: Firefox alone 25/25 three times, the full suite 72/72
+in ~2 min. No local retries were added, so a real hang still fails the run.
 
-**Status**: 🟢 Completed - residual Firefox cold-start slowness noted
+**Status**: 🟢 Completed - local browser runs are serial
 
 #### 🔵 `terminateWithError()` behaves differently inline and threaded
 Called through the task context, inline `terminateWithError()` throws a
