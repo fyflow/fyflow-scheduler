@@ -140,6 +140,12 @@ export class WorkerManager extends EventTarget {
   // Set for the duration of shutdown, so worker failures during teardown are not
   // mistaken for crashes worth restarting
   private shuttingDown = false;
+  // Workers whose failure has been handled. One failure can be reported more
+  // than once - a self-terminating worker emits both worker.failed and
+  // worker.termination_requested - and handling each spent two restarts and
+  // terminated the worker twice. Keyed by the wrapper, which a failed worker
+  // never outlives: it is replaced, not revived.
+  private failureHandled = new WeakSet<WorkerInstance>();
 
   // Track ALL event listeners for cleanup
   private allListeners = new Map<any, {event: string; listener: Function}[]>();
@@ -494,6 +500,8 @@ export class WorkerManager extends EventTarget {
     const failedWorker = this.threads.find(w => w.id === workerId);
 
     if (!failedWorker) return;
+    if (this.failureHandled.has(failedWorker)) return;
+    this.failureHandled.add(failedWorker);
 
     // Before any requeue is reported: the scheduler settles a requeue
     // synchronously and runs its dispatch loop, which would otherwise hand the

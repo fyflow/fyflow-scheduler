@@ -229,18 +229,32 @@ probability. The two need one documented contract before either is changed.
 
 **Status**: 🔵 Not Started
 
-#### 🔵 One worker failure is handled twice
+#### 🟢 One worker failure is handled twice
 `_handleTerminationRequest` dispatches both `worker.failed` and
-`worker.termination_requested`, and both reach `_handleWorkerFailure`
-(`workerManager.ts` listeners for each). One self-termination therefore emits
-`task.requeue_required` twice per task, schedules two replacements, and adds 2
-to `poolRestartCount`, so a pool reaches `worker.restart_limit_exceeded` twice as
-fast as `maxWorkerRestarts` says. Fix: handle each worker's failure once.
-Since the requeue fix above, the second handling finds no running tasks left,
-so the duplicate requeue is gone; the doubled restart count and replacement
-remain.
+`worker.termination_requested`, and both reached `_handleWorkerFailure`. One
+self-termination therefore:
+- added 2 to `poolRestartCount`, so with `maxWorkerRestarts: 1` a single
+  self-termination raised `worker.restart_limit_exceeded`, the event `AGENTS.md`
+  calls "intervention needed";
+- terminated the worker twice, so `worker.teardown.started` fired twice for one
+  worker, breaking the documented rule that lifecycle events are always paired;
+- emitted `task.requeue_required` twice per task, until the requeue fix above
+  made the second handling find no running tasks;
+- scheduled two replacements, the second a no-op.
 
-**Status**: 🔵 Not Started
+**Outcome**: `_handleWorkerFailure` handles each worker once, tracked in a
+`WeakSet` keyed by the wrapper. A failed worker is replaced, never revived, so
+one failure per wrapper object is the right unit, and the set needs no cleanup.
+Both events are still dispatched: `worker.failed` is public, and the guard
+makes the redundant route harmless rather than removing a path some failure
+might be the only report of.
+
+Tested on both pool types: one self-termination with `maxWorkerRestarts: 1`
+raises no alarm, tears the worker down once, and the next task completes on a
+replacement. Mutation check: without the guard, the alarm fires.
+
+**Status**: 🟢 Completed - Deno and Node 22 139/139, `jsr:smoke`, lint;
+browser Chromium 24/24, WebKit 24/24 (one flaky run of three)
 
 #### 🔵 An orphaned task that was retried is dropped silently
 `_failOrphanedTask` returns early if `task._settling` is set. After a retry or

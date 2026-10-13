@@ -95,6 +95,7 @@ class SettlementTestSuite {
     this.results.push(await this.runTest('Stats Account For Each Task Once', () => this.testStatsAccountEachTaskOnce()));
     this.results.push(await this.runTest('Requeue Does Not Also Count A Failure', () => this.testRequeueNotAlsoFailed()));
     this.results.push(await this.runTest('Self-Terminating Task Fails, Not Requeued', () => this.testSelfTerminatingTaskFails()));
+    this.results.push(await this.runTest('One Worker Failure Is Handled Once', () => this.testOneFailureHandledOnce()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Result', () => this.testRequeueAbandonedResultIgnored()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Failure', () => this.testRequeueAbandonedFailureIgnored()));
     this.results.push(await this.runTest('Requeue Drops The Abandoned Run\'s Progress And Spawns', () => this.testRequeueAbandonedSideEffectsDropped()));
@@ -560,6 +561,53 @@ class SettlementTestSuite {
       if (counts['task.running'] !== 1) throw new Error(`${kind}: ran ${counts['task.running']} times`);
       if (counts['task.failed'] !== 1) throw new Error(`${kind}: task.failed fired ${counts['task.failed'] ?? 0} times`);
       if (requeues !== 0) throw new Error(`${kind}: the terminating task was requeued ${requeues} times`);
+      await scheduler.shutdown();
+    }
+  }
+
+  // A self-terminating worker reports its failure twice - `worker.failed` and
+  // `worker.termination_requested` - and the pool used to handle both: one
+  // failure spent two restarts, and the worker was terminated twice.
+  private async testOneFailureHandledOnce(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(this.selfTerminatingWorkerUrl, {
+        maxThreads: 1, maxConcurrentTasks: 1, inline, maxWorkerRestarts: 1
+      });
+      const scheduler = this.track(new FyflowScheduler({ SelfTerminatingWorker: pool }));
+
+      let alarms = 0;
+      pool.addEventListener('worker.restart_limit_exceeded', () => { alarms++; });
+      const teardowns = new Map<string, number>();
+      pool.addEventListener('worker.teardown.started', (e: any) => {
+        teardowns.set(e.detail.workerId, (teardowns.get(e.detail.workerId) ?? 0) + 1);
+      });
+      let failedWorkerId = '';
+      pool.addEventListener('worker.failed', (e: any) => { failedWorkerId ||= e.detail.workerId; });
+
+      const dying = scheduler.addTask(new FyflowTask({
+        id: `once-dying-${kind}`, workerType: 'SelfTerminatingWorker',
+        payload: { action: 'self-terminate', canRestart: true, restartDelay: 10 }
+      }), { createPromise: true });
+      await this.settle(dying as Promise<any>);
+
+      // The pool still has a restart left, so the next task gets a new worker
+      const next = await this.settle(scheduler.addTask(new FyflowTask({
+        id: `once-next-${kind}`, workerType: 'SelfTerminatingWorker', payload: { action: 'normal-task' }
+      }), { createPromise: true }), 5000);
+      // Long enough for a second teardown of the failed worker to show
+      await new Promise(r => setTimeout(r, 300));
+
+      if (!failedWorkerId) throw new Error(`${kind}: the worker never failed`);
+      if (alarms !== 0) {
+        throw new Error(`${kind}: one failure with maxWorkerRestarts 1 raised worker.restart_limit_exceeded`);
+      }
+      if (teardowns.get(failedWorkerId) !== 1) {
+        throw new Error(`${kind}: the failed worker's teardown started ${teardowns.get(failedWorkerId) ?? 0} times`);
+      }
+      if (!next.startsWith('resolved')) {
+        throw new Error(`${kind}: the next task did not complete on a replacement worker (${next})`);
+      }
       await scheduler.shutdown();
     }
   }
