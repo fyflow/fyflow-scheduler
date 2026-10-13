@@ -203,52 +203,12 @@ if (buildType === 'library') {
     console.log("🔨 Generating TypeScript declarations...");
 
     const typesDir = "./dist/types";
-    const coreTypesDir = path.join(typesDir, "core");
 
-    // Ensure directories exist
-    fs.mkdirSync(typesDir, { recursive: true });
-    fs.mkdirSync(coreTypesDir, { recursive: true });
-
-    // Generate the ThreadWrapper declaration. Hand-written rather than derived
-    // from the source, because the Worker types do not survive the round trip.
-    const threadWrapperDeclaration = `import { WorkerInstanceExtensions, WorkerInstanceState } from "./workerInterface.js";
-
-/**
- * ThreadWrapper - Worker thread wrapper for concurrent task execution
- *
- * Automatically generated declaration for Node.js Worker compatibility
- */
-export declare class ThreadWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
-    worker: Worker | null;
-    runningTasks: number;
-    maxConcurrentTasks: number;
-    idleTimeout: number;
-    callbacks: Map<string, {resolve: Function, reject: Function}>;
-    taskStartTimes: Map<string, number>;
-    runningTaskData: Map<string, {id: string, payload: any}>;
-    taskQueue: Array<{taskId: string, payload: any, resolve: Function, reject: Function}>;
-    idleTimer: NodeJS.Timeout | null;
-    config: any;
-    id: string;
-    initialized: boolean;
-    originalScriptUrl: string;
-    initializing: boolean;
-
-    constructor(scriptUrl: string, maxConcurrentTasks: number, idleTimeout: number, config?: any);
-    initialize(): Promise<void>;
-    runTask(taskId: string, payload: any): Promise<any>;
-    terminate(): Promise<void>;
-    isIdle(): boolean;
-    canAcceptTask(): boolean;
-    getStatus(): any;
-    updateActivity(): void;
-    private _ensureInitialized(): Promise<void>;
-    private _processTaskQueue(): void;
-    private _resetIdleTimer(): void;
-}`;
-
-    fs.writeFileSync(path.join(coreTypesDir, "threadWrapper.d.ts"), threadWrapperDeclaration);
-    console.log("✓ ThreadWrapper declaration created");
+    // Every declaration, ThreadWrapper's included, comes from tsc. A
+    // hand-written threadWrapper.d.ts used to be written here first, but tsc
+    // overwrote it on every build, so it never shipped - and it had drifted
+    // from the class (constructor arguments in the wrong order, missing
+    // methods) for anyone reading this file to trust.
 
     // Create a TypeScript-friendly version of workerWrapperUrl temporarily
     const originalWorkerUrl = fs.readFileSync("./core/workerWrapperUrl.ts", 'utf-8');
@@ -260,34 +220,18 @@ export default async function getWorkerUrl(): Promise<string> {
     fs.writeFileSync("./core/workerWrapperUrl.ts", tempWorkerUrl);
     console.log("✓ Temporary workerWrapperUrl stub created");
 
-    // Generate remaining declarations (excluding problematic files)
-    execSync("npx tsc --project tsconfig.json", { stdio: "inherit" });
-    console.log("✓ Main declarations generated");
-
-    // Restore original workerWrapperUrl.ts
-    fs.writeFileSync("./core/workerWrapperUrl.ts", originalWorkerUrl);
-    console.log("✓ Original workerWrapperUrl.ts restored");
+    try {
+      execSync("npx tsc --project tsconfig.json", { stdio: "inherit" });
+      console.log("✓ Declarations generated");
+    } finally {
+      // Restored even when tsc fails: the catch below exits the process, and a
+      // source file left as the stub is easy to commit by accident
+      fs.writeFileSync("./core/workerWrapperUrl.ts", originalWorkerUrl);
+      console.log("✓ Original workerWrapperUrl.ts restored");
+    }
 
     // Fix file extensions in all .d.ts files (change .ts to .js)
     fixFileExtensions(typesDir);
-
-    // Add ThreadWrapper export to main index.d.ts
-    const indexDtsPath = path.join(typesDir, "index.d.ts");
-    if (fs.existsSync(indexDtsPath)) {
-      let indexContent = fs.readFileSync(indexDtsPath, 'utf-8');
-      // Add the ThreadWrapper export only if not already present
-      if (!indexContent.includes('export { ThreadWrapper }')) {
-        indexContent = indexContent.replace(
-          'export { InlineWrapper } from "./core/inlineWrapper.js";',
-          'export { ThreadWrapper } from "./core/threadWrapper.js";\nexport { InlineWrapper } from "./core/inlineWrapper.js";'
-        );
-        fs.writeFileSync(indexDtsPath, indexContent);
-        console.log("✓ ThreadWrapper export added to index.d.ts");
-      } else {
-        console.log("✓ ThreadWrapper export already present in index.d.ts");
-      }
-    }
-
     console.log("✓ File extensions fixed in declaration files");
 
   } catch (error) {

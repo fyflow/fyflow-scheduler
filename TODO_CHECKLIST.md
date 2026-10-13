@@ -216,6 +216,22 @@ requeued. Before the name check, the test failed on Node only.
 
 **Status**: 🟢 Completed - Deno and Node 22 138/138
 
+#### 🟢 A stale hand-written `ThreadWrapper` declaration in the build script
+`esbuild.config.js` wrote a hand-written `dist/types/core/threadWrapper.d.ts`
+("the Worker types do not survive the round trip"), then ran `tsc`, which
+overwrote it on every build. It never shipped, but it had drifted from the
+class - constructor arguments in the wrong order, missing methods - and read as
+the source of truth. A second block patched a `ThreadWrapper` export into
+`index.d.ts` that `tsc` already emits, and logged "already present" every time.
+
+**Outcome**: both removed; all 28 declaration files are byte-identical before
+and after. The same block overwrote the source file `core/workerWrapperUrl.ts`
+with a stub for `tsc` and restored it afterwards, but a failing `tsc` exited the
+build without restoring it, leaving the stub in the working tree to be committed
+by accident. The restore is now in a `finally`, verified by forcing a type error.
+
+**Status**: 🟢 Completed
+
 #### 🔵 `terminateWithError()` behaves differently inline and threaded
 Called through the task context, inline `terminateWithError()` throws a
 `WorkerTerminationError` synchronously, so the calling task fails and every
