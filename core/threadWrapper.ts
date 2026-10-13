@@ -356,17 +356,32 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
           case 'error':{
             // Check if this is a worker termination request (either explicit or during task execution)
             if (data.isWorkerTerminationRequest) {
-              // Handle worker termination request
-              this._handleTerminationRequest(data.metadata);
-
-              // If this was during task execution, still need to handle the task callback
+              // A task that threw the request fails, as on an inline pool and as
+              // AGENTS.md documents, and it does so BEFORE the termination is
+              // handled. Handling it first made the pool requeue this task along
+              // with the worker's others, so it ran again and terminated every
+              // replacement worker in turn until the pool gave up.
               if (taskId !== 'worker_termination_request') {
                 const cb = this.callbacks.get(taskId);
                 if (cb) {
+                  const error = new WorkerTerminationError(data.message, data.metadata ?? {});
+                  const startTime = this.taskStartTimes.get(taskId);
                   this.callbacks.delete(taskId);
-                  cb.reject(new Error(data.message));
+                  this.taskStartTimes.delete(taskId);
+                  this.runningTaskData.delete(taskId);
+                  this.runningTasks--;
+                  this.tasksCompleted++;
+                  this.dispatchEvent(new CustomEvent('task.failed', {
+                    detail: {
+                      taskId, workerId: this.id, workerType: 'thread', error, timestamp: Date.now(),
+                      executionTime: startTime ? performance.now() - startTime : 0
+                    }
+                  }));
+                  cb.reject(error);
                 }
               }
+
+              this._handleTerminationRequest(data.metadata);
               return;
             }
 

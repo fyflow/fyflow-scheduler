@@ -179,6 +179,56 @@ the logs point at the Playwright Firefox driver (`juggler` errors).
 
 **Status**: 🟢 Completed - Deno 137/137, Node 22 137/137, `jsr:smoke`, lint
 
+#### 🟢 A threaded self-terminating task was requeued instead of failed
+Found while fixing the next issue. `AGENTS.md` §4 says that when a worker
+self-terminates, the task running at the time rejects with a
+`WorkerTerminationError`, and inline pools did that. A threaded pool handled the
+termination request **before** failing the task that threw it, so the pool
+requeued that task with the worker's others. It then ran again on the
+replacement worker, terminated that one too, and so on until the pool gave up,
+leaving the task `pending` forever. When it did reject, it rejected with a plain
+`Error`, so the documented `instanceof WorkerTerminationError` check failed.
+
+The inline pool also reported the failed task as requeued on the pool
+(`task.requeue_required`), which the scheduler ignored but a pool listener saw.
+
+A third problem surfaced on Node: `InlineWrapper` and `workerWrapper.ts`
+recognised a termination with `instanceof`. A worker bundled separately from the
+scheduler has its own copy of the class, so its error failed the check and the
+termination became an ordinary task failure; the worker was never torn down.
+This repository's Node test build bundles workers that way, and so does the
+browser build, which inlines the worker bootstrap with its own copy of
+`workerInterface.ts`. `workerWrapper.node.ts` already matched by name, with a
+comment explaining why.
+
+**Outcome**: both pool types now fail the calling task first, stop counting it
+as a running task, and only then handle the termination. The threaded pool
+rejects with a `WorkerTerminationError`. A new internal
+`isWorkerTerminationError()` matches by name as well as identity, and
+`InlineWrapper` re-creates a foreign copy from its own class, so a caller's
+`instanceof` holds. The browser case follows from the same change but has no
+browser test of its own.
+
+Tested on both pool types (task fails once, ran once, never requeued, rejects
+with `WorkerTerminationError`). Mutation checks: handling the termination before
+failing the task leaves it `pending`; not forgetting it on inline reports it
+requeued. Before the name check, the test failed on Node only.
+
+**Status**: 🟢 Completed - Deno and Node 22 138/138
+
+#### 🔵 `terminateWithError()` behaves differently inline and threaded
+Called through the task context, inline `terminateWithError()` throws a
+`WorkerTerminationError` synchronously, so the calling task fails and every
+other task is requeued. Threaded, it posts a message and returns: the run keeps
+going, and the pool requeues every running task **including the caller**, which
+then runs again. Inline, a call from outside the task's own stack - a timer, an
+interval, the worker-level `this.workerContext` - throws where nothing catches it,
+which is an uncaught exception in the host process. `tests/workers/
+selfTerminatingWorker.ts` does exactly this from `setInterval`, at a low
+probability. The two need one documented contract before either is changed.
+
+**Status**: 🔵 Not Started
+
 #### 🔵 One worker failure is handled twice
 `_handleTerminationRequest` dispatches both `worker.failed` and
 `worker.termination_requested`, and both reach `_handleWorkerFailure`

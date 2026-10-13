@@ -2,7 +2,7 @@
 // Handles message protocol and dynamically imports the actual worker class
 
 import type { WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext } from './workerInterface.ts';
-import { WorkerTerminationError } from './workerInterface.ts';
+import { isWorkerTerminationError } from './workerInterface.ts';
 
 let WorkerClass: any = null;
 let workerInstance: any = null;
@@ -125,7 +125,9 @@ self.onmessage = async (e) => {
         }
     } catch (error: any) {
         // Check if this is a worker termination request
-        if (error instanceof WorkerTerminationError) {
+        // By name as well as identity: in the browser build this file is bundled
+        // with its own copy of the class, so a worker's error fails instanceof
+        if (isWorkerTerminationError(error)) {
             // Send special termination error message
             sendMessage({
                 type: 'error',

@@ -1,5 +1,5 @@
 import type { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, TaskWorkerContext } from "./workerInterface.ts";
-import { WorkerTerminationError } from "./workerInterface.ts";
+import { WorkerTerminationError, isWorkerTerminationError } from "./workerInterface.ts";
 
 export class InlineWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
     runningTasks = 0;
@@ -370,15 +370,30 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // Calculate execution time even for failed tasks
 
             // Check if this is a worker termination error
-            if (error instanceof WorkerTerminationError) {
+            if (isWorkerTerminationError(error)) {
+                // Re-created from this module's class when the worker's copy
+                // differs, so a caller's documented `instanceof
+                // WorkerTerminationError` check holds for the error it receives
+                // The type guard cannot express "same name, other class", so the
+                // foreign copy is typed by hand
+                const foreign = error as Error & { metadata?: WorkerTerminationError['metadata'] };
+                const termination = error instanceof WorkerTerminationError
+                    ? error
+                    : new WorkerTerminationError(foreign.message, foreign.metadata ?? {});
+
                 // First emit task failed event
                 this.dispatchEvent(new CustomEvent('task.failed', {
-                    detail: { taskId, workerId: this.id, workerType: 'inline', error, timestamp: Date.now(), executionTime: fullExecutionTime }
+                    detail: { taskId, workerId: this.id, workerType: 'inline', error: termination, timestamp: Date.now(), executionTime: fullExecutionTime }
                 }));
 
+                // This task has failed, so it is no longer one of this worker's
+                // running tasks: without this the pool also reported it as
+                // requeued, which it never is
+                this.forgetTask(taskId);
+
                 // Then handle worker termination request
-                this._handleTerminationRequest(error.metadata);
-                throw error;
+                this._handleTerminationRequest(termination.metadata);
+                throw termination;
             } else {
                 // Regular task error - just emit task failed event
                 this.dispatchEvent(new CustomEvent('task.failed', {

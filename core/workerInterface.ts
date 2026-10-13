@@ -17,6 +17,21 @@ export class WorkerTerminationError extends Error {
   }
 }
 
+/**
+ * True for a {@link WorkerTerminationError} from any copy of this module.
+ *
+ * `instanceof` alone is not enough. A worker can be bundled separately from the
+ * scheduler - this repository's own Node test build does it, and so does the
+ * browser build, which inlines the worker bootstrap with a copy of this module -
+ * and its error is then an instance of a different class with the same name.
+ * Missing the check silently turned a termination request into an ordinary task
+ * failure: the worker was never torn down.
+ */
+export function isWorkerTerminationError(error: unknown): error is WorkerTerminationError {
+  return error instanceof WorkerTerminationError ||
+    (error instanceof Error && error.name === 'WorkerTerminationError');
+}
+
 export interface WorkerConfig {
     [key: string]: any;
 }

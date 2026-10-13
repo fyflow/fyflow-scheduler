@@ -10,7 +10,7 @@
 // Neither path can simply be removed: each is the ONLY settle path in some
 // scenario, which these tests pin down.
 
-import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup } from '../../index.ts';
+import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, WorkerTerminationError } from '../../index.ts';
 
 // Node.js process declaration for cross-platform compatibility
 declare const process: any;
@@ -94,6 +94,7 @@ class SettlementTestSuite {
     this.results.push(await this.runTest('Unstartable Pool Raises The Alarm', () => this.testUnstartablePoolAlarms()));
     this.results.push(await this.runTest('Stats Account For Each Task Once', () => this.testStatsAccountEachTaskOnce()));
     this.results.push(await this.runTest('Requeue Does Not Also Count A Failure', () => this.testRequeueNotAlsoFailed()));
+    this.results.push(await this.runTest('Self-Terminating Task Fails, Not Requeued', () => this.testSelfTerminatingTaskFails()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Result', () => this.testRequeueAbandonedResultIgnored()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Failure', () => this.testRequeueAbandonedFailureIgnored()));
     this.results.push(await this.runTest('Requeue Drops The Abandoned Run\'s Progress And Spawns', () => this.testRequeueAbandonedSideEffectsDropped()));
@@ -518,6 +519,48 @@ class SettlementTestSuite {
     }
     if (scheduler.stats.failed !== 6) {
       throw new Error(`Expected stats.failed 6 for 6 failing tasks, got ${scheduler.stats.failed}`);
+    }
+  }
+
+  // AGENTS.md §4: "The task running at the time rejects with a
+  // WorkerTerminationError". A threaded worker handled the termination request
+  // before rejecting that task, so the pool requeued it instead, and the task
+  // terminated every replacement worker in turn until the pool gave up.
+  private async testSelfTerminatingTaskFails(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(this.selfTerminatingWorkerUrl, {
+        maxThreads: 1, maxConcurrentTasks: 1, inline, maxWorkerRestarts: 3
+      });
+      const scheduler = this.track(new FyflowScheduler({ SelfTerminatingWorker: pool }));
+      const counts = this.counted(scheduler);
+      let requeues = 0;
+      pool.addEventListener('task.requeue_required', (e: any) => {
+        if (e.detail.taskId === `terminating-${kind}`) requeues++;
+      });
+
+      const task = new FyflowTask({
+        id: `terminating-${kind}`, workerType: 'SelfTerminatingWorker',
+        payload: { action: 'self-terminate', canRestart: true, restartDelay: 10 }
+      });
+      let rejection: unknown;
+      const promise = (scheduler.addTask(task, { createPromise: true }) as Promise<any>)
+        .catch(error => { rejection = error; });
+      const outcome = await Promise.race([
+        promise.then(() => 'settled'),
+        new Promise(r => setTimeout(() => r('NEVER SETTLED'), 3000))
+      ]);
+      await new Promise(r => setTimeout(r, 200));
+
+      if (outcome !== 'settled') throw new Error(`${kind}: the task never settled (state ${task.state})`);
+      if (!(rejection instanceof WorkerTerminationError)) {
+        throw new Error(`${kind}: expected a WorkerTerminationError, got ${rejection}`);
+      }
+      if (task.state !== 'user_action') throw new Error(`${kind}: expected user_action, got ${task.state}`);
+      if (counts['task.running'] !== 1) throw new Error(`${kind}: ran ${counts['task.running']} times`);
+      if (counts['task.failed'] !== 1) throw new Error(`${kind}: task.failed fired ${counts['task.failed'] ?? 0} times`);
+      if (requeues !== 0) throw new Error(`${kind}: the terminating task was requeued ${requeues} times`);
+      await scheduler.shutdown();
     }
   }
 
