@@ -1,11 +1,33 @@
 import { ThreadWrapper } from "./threadWrapper.ts";
 import { InlineWrapper } from "./inlineWrapper.ts";
 import type { TaskMessageDetail, WorkerStatus } from "./workerInterface.ts";
-import { CancelledError } from "./workerInterface.ts";
+import { AttemptStoppedError, CancelledError } from "./workerInterface.ts";
 import { resolveMessageOptions } from "./messageChannel.ts";
 import type { ChannelEvent, MessageOptions } from "./messageChannel.ts";
 
 type WorkerInstance = ThreadWrapper | InlineWrapper;
+
+/**
+ * The longest delay `setTimeout` honours. Above it, `Infinity` included, it
+ * fires after about 1 ms - so "never force" would mean "force at once". Grace
+ * periods longer than this arm no timer at all.
+ */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** A cancelled attempt's grace period. No `timer` when it is too long to arm one. */
+interface GraceEntry {
+  token?: number;
+  deadline: number;
+  timer?: ReturnType<typeof setTimeout>;
+  fired: boolean;
+}
+
+/** The rule for `cancelGraceMs` and for `cancel()`'s `graceMs`. Returns it unchanged. */
+export function validateGraceMs(value: unknown, name: string): number {
+  if (typeof value !== 'number') throw new TypeError(`${name} must be a number, got ${typeof value}`);
+  if (Number.isNaN(value) || value < 0) throw new RangeError(`${name} must be zero or more, got ${value}`);
+  return value;
+}
 
 /**
  * A resident holding taken or returned by a pool.
@@ -108,6 +130,22 @@ export interface WorkerManagerOptions {
   /** Restarts allowed before the pool gives up and emits `worker.restart_limit_exceeded`. Default 3. */
   maxWorkerRestarts?: number;
   /**
+   * Ms a threaded worker gets to stop a cancelled task by itself, through
+   * `context.signal`, before the pool forces it: the worker is terminated, and
+   * any other task it was running is requeued. Default 2000. `0` forces at
+   * once; `Infinity` never forces. `scheduler.cancel()`'s `graceMs` overrides
+   * it per call. Inline pools accept it and ignore it - an inline `run()`
+   * cannot be stopped.
+   *
+   * A forced stop does not count against `maxWorkerRestarts`. It still costs
+   * the worker: a pool that loads something expensive in `setup()` should
+   * make its workers honour the signal, or raise this.
+   *
+   * @throws TypeError at construction for a non-number, RangeError for a
+   *   negative value or NaN.
+   */
+  cancelGraceMs?: number;
+  /**
    * Bounds on what each worker can send with `emit()`. Default
    * `{ flushIntervalMs: 20, maxBuffered: 100 }`: events are batched for up to
    * 20 ms, and each buffer - one per running attempt, one for the worker -
@@ -162,6 +200,8 @@ export class WorkerManager extends EventTarget {
   groups: string[];
   requeueFailedTasks: boolean;
   maxWorkerRestarts: number;
+  /** See {@link WorkerManagerOptions.cancelGraceMs}. */
+  readonly cancelGraceMs: number;
   /** Resolved `messages` option, passed to every worker this pool creates. */
   readonly messages: Required<MessageOptions>;
 
@@ -196,6 +236,22 @@ export class WorkerManager extends EventTarget {
    * here is recorded, and the task never reaches the wrapper.
    */
   private enqueuing = new Map<string, { cancelled: boolean; reason?: unknown }>();
+
+  /**
+   * Threaded pools: one entry per task being cancelled, from the cancel until
+   * the scheduler settles it. Doubles as the record of which tasks on a worker
+   * are being cancelled, which a forced stop must not requeue. `token` is the
+   * attempt's: a timer belongs to an attempt, not to a task id, which a later
+   * task may reuse.
+   */
+  private graceTimers = new Map<string, GraceEntry>();
+
+  /**
+   * Workers being retired by a forced stop, until they are dead and gone.
+   * They accept nothing, are skipped by failure handling, the idle sweep and
+   * `shutdown()`, which waits for these instead of terminating them again.
+   */
+  private retiring = new Map<WorkerInstance, Promise<void>>();
 
   /** Group id -> units one worker of this pool holds while it exists. */
   residentGroups: Record<string, number>;
@@ -358,6 +414,7 @@ export class WorkerManager extends EventTarget {
     this.residentGroups = WorkerManager._normalizeResidentGroups(options.residentGroups);
     this.requeueFailedTasks = options.requeueFailedTasks ?? true; // Default to requeue as specified
     this.maxWorkerRestarts = options.maxWorkerRestarts ?? 3; // Default: 3 restarts per worker
+    this.cancelGraceMs = validateGraceMs(options.cancelGraceMs ?? 2000, 'cancelGraceMs');
     this.messages = resolveMessageOptions(options.messages);
 
     // Set up worker failure handling
@@ -431,9 +488,22 @@ export class WorkerManager extends EventTarget {
    * Called by the scheduler for a task it has dispatched to this pool and
    * accepted a cancel for. Finds where the attempt is - on its way to a worker,
    * or on one - and asks it to stop. Settles nothing: the attempt's promise
-   * does, once it has stopped. `token` and `graceMs` are for the forced stop.
+   * does, once it has stopped.
+   *
+   * On a threaded pool it also starts the grace period: `graceMs`, or the
+   * pool's `cancelGraceMs`, after which a worker still running the attempt is
+   * forced. `token` identifies the attempt; the scheduler clears the period
+   * with {@link _clearCancelGrace} when the task settles.
    */
-  _cancelTask(taskId: string, _token?: number, options: { reason?: unknown; graceMs?: number } = {}): void {
+  _cancelTask(taskId: string, token?: number, options: { reason?: unknown; graceMs?: number } = {}): void {
+    // Not during shutdown, which terminates every worker anyway
+    if (!this.inline && !this.shuttingDown) {
+      const graceMs = options.graceMs ?? this.cancelGraceMs;
+      const entry: GraceEntry = { token, deadline: Date.now() + graceMs, fired: false };
+      this.graceTimers.set(taskId, entry);
+      this._armGraceTimer(taskId, entry, graceMs);
+    }
+
     const enqueuing = this.enqueuing.get(taskId);
     if (enqueuing) {
       enqueuing.cancelled = true;
@@ -449,6 +519,109 @@ export class WorkerManager extends EventTarget {
         return;
       }
     }
+  }
+
+  /**
+   * A repeat `cancel()` with a `graceMs`: shortens the wait if that ends
+   * sooner than what is left, and never lengthens it.
+   */
+  _shortenCancelGrace(taskId: string, token: number | undefined, graceMs: number): void {
+    const entry = this.graceTimers.get(taskId);
+    if (!entry || entry.token !== token || entry.fired) return;
+    const deadline = Date.now() + graceMs;
+    if (deadline >= entry.deadline) return;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    entry.timer = undefined;
+    entry.deadline = deadline;
+    this._armGraceTimer(taskId, entry, graceMs);
+  }
+
+  /** Called by the scheduler when a task it cancelled has settled. */
+  _clearCancelGrace(taskId: string, token?: number): void {
+    const entry = this.graceTimers.get(taskId);
+    if (!entry || entry.token !== token) return;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    this.graceTimers.delete(taskId);
+  }
+
+  private _armGraceTimer(taskId: string, entry: GraceEntry, graceMs: number): void {
+    // Infinity, or so long that setTimeout would fire it at once instead
+    if (graceMs > MAX_TIMER_MS) return;
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      entry.fired = true;
+      // Cleared, or replaced by a later attempt's cancel
+      if (this.graceTimers.get(taskId) !== entry) return;
+      // Only an attempt that is still on a worker: one still on its way to a
+      // new thread never reaches it, and one in a thread's start-up queue was
+      // rejected at the cancel
+      const worker = this.threads.find(w => w.hasTask(taskId));
+      if (worker instanceof ThreadWrapper) this._retireWorker(worker);
+    }, graceMs);
+  }
+
+  /**
+   * The forced stop: retire a worker that is still running a cancelled task
+   * after its grace period. Not a failure - no `worker.failed`, no restart
+   * counted, no replacement; the next dispatch creates a worker on demand.
+   *
+   * Every attempt on it settles only by its promise, and the cancelled ones
+   * only once the thread is dead: their resources must not be released while
+   * a stuck thread still runs with them.
+   */
+  private _retireWorker(worker: ThreadWrapper): Promise<void> {
+    const inProgress = this.retiring.get(worker);
+    if (inProgress) return inProgress;
+    // Gone already, or failing: its own teardown settles what it held
+    if (worker.state === 'failed' || worker.state === 'terminated' || !this.threads.includes(worker)) {
+      return Promise.resolve();
+    }
+
+    // 1. It accepts nothing more, and the exit about to be caused is not
+    // mistaken for a crash
+    worker.state = 'terminated';
+
+    // 2. Detach every attempt now, before anything else can arrive: a result
+    // posted during the teardown handshake would otherwise settle the cancelled
+    // task early, with its thread still alive. terminate() clears the
+    // callbacks itself, so afterwards there would be nothing left to detach.
+    const cancelled: ((reason?: any) => void)[] = [];
+    const requeued: [string, (reason?: any) => void][] = [];
+    for (const taskId of worker.getRunningTaskIds()) {
+      const reject = worker.forgetTask(taskId);
+      if (!reject) continue;
+      if (this.graceTimers.has(taskId)) cancelled.push(() => reject(new AttemptStoppedError(taskId, 'forced')));
+      else requeued.push([taskId, reject]);
+    }
+
+    // 3. Its co-tenants go back in the queue at once. They hold nothing the
+    // thread can still use: their run is abandoned, and a late result from it
+    // finds no callback.
+    for (const [taskId, reject] of requeued) reject(new AttemptStoppedError(taskId, 'requeue'));
+
+    const retired = (async () => {
+      // 4. Teardown, up to its acknowledgement timeout, then the thread is
+      // killed. A worker stuck in a synchronous loop never acknowledges.
+      try {
+        await worker.terminate();
+      } catch {
+        // Terminated either way
+      }
+
+      // 6, before 5: settling the cancelled tasks runs the scheduler's dispatch
+      // loop, which can use this worker's slot and resident units only once
+      // they are free
+      const index = this.threads.indexOf(worker);
+      if (index !== -1) this.threads.splice(index, 1);
+      this._releaseResidentFor(worker.id);
+      if (this.threads.length === 0) this.stopIdleTimer();
+      this.retiring.delete(worker);
+
+      // 5. Only now, with the thread dead, the cancelled tasks settle
+      for (const settle of cancelled) settle();
+    })();
+    this.retiring.set(worker, retired);
+    return retired;
   }
 
   /** Every worker is created here, so each one gets the message options and the current gate. */
@@ -637,6 +810,9 @@ export class WorkerManager extends EventTarget {
     const failedWorker = this.threads.find(w => w.id === workerId);
 
     if (!failedWorker) return;
+    // Being retired by a forced stop, which settles everything it held. A
+    // termination request it sends meanwhile is not a failure to restart from.
+    if (this.retiring.has(failedWorker)) return;
     if (this.failureHandled.has(failedWorker)) return;
     this.failureHandled.add(failedWorker);
 
@@ -878,7 +1054,9 @@ export class WorkerManager extends EventTarget {
     const workersToTerminate: WorkerInstance[] = [];
 
     for (const worker of this.threads) {
-      // Skip persistent workers (idleTimeout: 0)
+      // Skip persistent workers (idleTimeout: 0), and one a forced stop is
+      // already terminating - it is idle because its tasks were detached
+      if (this.retiring.has(worker)) continue;
       if (worker.idleTimeout > 0 && worker.idle && (now - worker.lastActivityTime) > worker.idleTimeout) {
         workersToTerminate.push(worker);
       }
@@ -923,12 +1101,21 @@ export class WorkerManager extends EventTarget {
     // Stop the centralized idle timer
     this.stopIdleTimer();
 
+    // No forced stop starts now: every worker is about to be terminated anyway
+    for (const entry of this.graceTimers.values()) {
+      if (entry.timer !== undefined) clearTimeout(entry.timer);
+    }
+    this.graceTimers.clear();
+
     // Listeners stay attached through termination so worker.teardown.* events
     // are observable on the shutdown path - they are dropped at the end instead.
     // The shuttingDown flag stops failure handling from restarting workers here.
 
-    // Terminate all worker threads
-    const shutdownPromises = this.threads.map(async (worker) => {
+    // Terminate all worker threads. One a forced stop is already retiring is
+    // waited for instead: terminating it a second time would run a second
+    // teardown handshake, and report it failed.
+    const retiring = [...this.retiring.values()];
+    const shutdownPromises = this.threads.filter(w => !this.retiring.has(w)).map(async (worker) => {
       try {
         return new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -954,7 +1141,7 @@ export class WorkerManager extends EventTarget {
       }
     });
 
-    await Promise.all(shutdownPromises);
+    await Promise.all([...shutdownPromises, ...retiring]);
     this.threads = [];
     this._releaseAllResident();
 

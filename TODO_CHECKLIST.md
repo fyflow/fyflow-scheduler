@@ -89,15 +89,24 @@ into `main` once all four are done:
    Not covered: a cancelling task that itself calls `terminateWithError()` on a
    thread settles at the request, while its run may go on until the worker is
    torn down - as any task failing itself that way does today.
-3. 🔵 Forced stop on threaded pools: `cancelGraceMs`, the grace timer, retiring
-   the worker without counting a restart, requeueing co-tenants.
+3. 🟢 Forced stop on threaded pools: `cancelGraceMs` (default 2000, validated
+   at construction), a grace timer per cancelled attempt, cleared at settle and
+   by `pool.shutdown()`, with a repeat `cancel()` only shortening it; `Infinity`
+   and anything over 2^31-1 arm none. Retiring the worker detaches every
+   attempt before teardown, requeues co-tenants at once whatever
+   `requeueFailedTasks` says, and settles the cancelled ones `forced: true`
+   only once the thread is dead. No `worker.failed`, no restart counted;
+   `shutdown()` waits for a retire in progress instead of terminating the
+   worker twice. 7 new tests, among them a worker spinning synchronously and
+   results posted during the teardown handshake; 18 mutations caught on Deno,
+   the timing-dependent ones on Node too.
 4. 🔵 `AGENTS.md` and `README.md`, docs tests, scale tests (50K cancels), browser
    spec, `jsr:smoke`, benchmark against `main`, delete the plan.
 
 Until stage 4, the docs test "AGENTS.md Covers Every Export" fails on the
 branch: `CancelledError` and `CancelOptions` are exported but not documented.
 
-**Status**: 🟡 Implementation - stages 1 and 2 of 4 done on `task-cancellation`
+**Status**: 🟡 Implementation - stages 1 to 3 of 4 done on `task-cancellation`
 
 #### 🟢 A log channel from workers (#2, P1)
 Requested as `context.log(level, message, data?)` and `task.log`. Answered with

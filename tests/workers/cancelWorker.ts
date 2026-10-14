@@ -10,12 +10,27 @@
 // - 'ignore': waits `delay`, never looking at the signal, then returns a result
 // - 'throw': waits `delay`, never looking at the signal, then throws
 // - 'terminate': calls terminateWithError() after `delay`, failing its worker
+// - 'spin': a synchronous loop for `delay`, never yielding - the cancel message
+//   cannot even be read, so only a forced stop ends it. Threaded pools only.
+//
+// config.teardownMs makes teardown() take that long, so a run can still post
+// its result during the teardown handshake.
 
 import type { TaskWorkerContext } from '../../core/workerInterface.ts';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export default class CancelWorker {
+  private teardownMs: number;
+
+  constructor(config: any = {}) {
+    this.teardownMs = config.teardownMs ?? 0;
+  }
+
+  async teardown() {
+    if (this.teardownMs > 0) await sleep(this.teardownMs);
+  }
+
   async run(payload: any, context: TaskWorkerContext) {
     const { mode = 'honour', delay = 5000 } = payload;
     context.sendProgress(0, 'entered');
@@ -23,6 +38,12 @@ export default class CancelWorker {
     if (mode === 'ignore') {
       await sleep(delay);
       return { ignored: true };
+    }
+
+    if (mode === 'spin') {
+      const end = Date.now() + delay;
+      while (Date.now() < end) { /* never yields */ }
+      return { spun: true };
     }
 
     if (mode === 'throw') {

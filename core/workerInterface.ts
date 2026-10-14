@@ -40,6 +40,25 @@ export class CancelledError extends Error {
 }
 
 /**
+ * Internal, not exported from the package: what a pool rejects an attempt with
+ * when it retired the worker running it - the forced stop of a task being
+ * cancelled. `'forced'` is the cancelled task itself, which settles cancelled
+ * with `forced: true`. `'requeue'` is a co-tenant, which did nothing wrong and
+ * goes back in the queue whatever `requeueFailedTasks` says.
+ */
+export class AttemptStoppedError extends Error {
+  readonly outcome: 'forced' | 'requeue';
+
+  constructor(taskId: string, outcome: 'forced' | 'requeue') {
+    super(outcome === 'forced'
+      ? `Task ${taskId} was force-stopped`
+      : `Task ${taskId} was stopped by a forced stop of its worker, and is requeued`);
+    this.name = 'AttemptStoppedError';
+    this.outcome = outcome;
+  }
+}
+
+/**
  * True for a {@link WorkerTerminationError} from any copy of this module.
  *
  * `instanceof` alone is not enough. A worker can be bundled separately from the

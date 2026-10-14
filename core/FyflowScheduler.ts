@@ -8,7 +8,8 @@ import type {
 } from './resourceEvents.ts';
 import { TaskQueue } from './taskQueue.ts';
 import type { TaskMessageDetail } from './workerInterface.ts';
-import { CancelledError } from './workerInterface.ts';
+import { AttemptStoppedError, CancelledError } from './workerInterface.ts';
+import { validateGraceMs } from './workerManager.ts';
 
 /**
  * Delimiter between a group id and a key in a blocked-queue id.
@@ -909,6 +910,14 @@ export class FyflowTask {
           this._onTaskComplete(task, result, pool, token);
         })
         .catch((error: any) => {
+          // A co-tenant of a task whose worker was force-stopped. It did nothing
+          // wrong, so it is requeued whatever requeueFailedTasks says. Being
+          // cancelled itself, it settles cancelled, as forced, below.
+          if (error instanceof AttemptStoppedError && error.outcome === 'requeue' && !task.cancellation) {
+            this._settleTask(task, pool, { requeue: true }, token);
+            return;
+          }
+
           // Handle race condition: thread filled up between check and dispatch
           if (error.message === 'Worker at maximum concurrent task capacity') {
             // Being cancelled: it ends here rather than going back in the queue
@@ -1028,6 +1037,11 @@ export class FyflowTask {
       // no requeue. Checked after the release rather than before it, because
       // the release can reach a listener that cancels this very task.
       if (task.cancellation) {
+        // Stopped by terminating its worker, rather than by itself
+        if ('error' in outcome && outcome.error instanceof AttemptStoppedError) {
+          task.cancellation.forced = true;
+        }
+        pool?._clearCancelGrace?.(task.id, task._dispatchToken);
         this._settleCancelled(task);
         return;
       }
@@ -1204,10 +1218,7 @@ export class FyflowTask {
     cancel(taskId: string, options: CancelOptions = {}): Promise<boolean> {
       // Not async: a bad argument throws here, rather than becoming a rejection
       const { reason, graceMs } = options;
-      if (graceMs !== undefined) {
-        if (typeof graceMs !== 'number') throw new TypeError(`graceMs must be a number, got ${typeof graceMs}`);
-        if (Number.isNaN(graceMs) || graceMs < 0) throw new RangeError(`graceMs must be zero or more, got ${graceMs}`);
-      }
+      if (graceMs !== undefined) validateGraceMs(graceMs, 'graceMs');
 
       const task = this.tasks.get(taskId);
       if (!task) return Promise.resolve(false);
@@ -1218,7 +1229,7 @@ export class FyflowTask {
         const pool = this.workerPools[task.workerType];
         if (task._cancelPending) {
           // Pressing Cancel again can only escalate
-          if (graceMs !== undefined) pool?._cancelTask?.(task.id, task._dispatchToken, { reason, graceMs });
+          if (graceMs !== undefined) pool?._shortenCancelGrace?.(task.id, task._dispatchToken, graceMs);
           return task._cancelPending.promise;
         }
         let resolve!: (cancelled: boolean) => void;

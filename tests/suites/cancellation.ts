@@ -86,6 +86,13 @@ class CancellationTestSuite {
     this.results.push(await this.runTest('A Stale Outcome Does Not Settle A Cancelling Attempt', () => this.testCheckOrder()));
     this.results.push(await this.runTest('Capacity Race: A Cancelling Task Is Not Requeued', () => this.testCapacityRace()));
     this.results.push(await this.runTest('Shutdown Resolves A Pending Inline Cancel', () => this.testShutdownInline()));
+    this.results.push(await this.runTest('Forced Stop: A Spinning Worker', () => this.testForcedStop()));
+    this.results.push(await this.runTest('Forced Stop: Results Posted During Teardown Settle Nothing', () => this.testForcedLateResult()));
+    this.results.push(await this.runTest('Forced Stop: Two Cancelling Tasks On One Worker', () => this.testForcedTwo()));
+    this.results.push(await this.runTest('Forced Stop: A Stale Grace Timer', () => this.testStaleGraceTimer()));
+    this.results.push(await this.runTest('Forced Stop: During Shutdown', () => this.testForcedDuringShutdown()));
+    this.results.push(await this.runTest('Shutdown Forces A Pending Threaded Cancel', () => this.testShutdownThreaded()));
+    this.results.push(await this.runTest('Grace Period: Edge Cases', () => this.testGraceEdges()));
 
     const totalDuration = performance.now() - this.startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -181,6 +188,27 @@ class CancellationTestSuite {
       promise,
       sleep(ms).then((): never => { throw new Error(`${what}: not settled within ${ms} ms`); })
     ]);
+  }
+
+  /** When the first teardown of a worker of this pool ended, and how many began. */
+  private teardownOf(pool: WorkerManager) {
+    const seen = { endedAt: 0, started: 0 };
+    pool.addEventListener('worker.teardown.started', () => { seen.started++; });
+    for (const ev of ['worker.teardown.completed', 'worker.teardown.failed']) {
+      pool.addEventListener(ev, () => { seen.endedAt ||= performance.now(); });
+    }
+    return seen;
+  }
+
+  /** Every time a task's run() began, by task id. */
+  private entries(scheduler: FyflowScheduler) {
+    const at = new Map<string, number[]>();
+    scheduler.addEventListener('task.progress', (e: any) => {
+      if (e.detail.message !== 'entered') return;
+      if (!at.has(e.detail.id)) at.set(e.detail.id, []);
+      at.get(e.detail.id)!.push(performance.now());
+    });
+    return at;
   }
 
   private async until(predicate: () => boolean, ms = 3000) {
@@ -652,7 +680,8 @@ class CancellationTestSuite {
       scheduler.addTask(task);
       await this.until(() => progress.includes(`${id}:entered`));
 
-      const cancelled = scheduler.cancel(id, { graceMs: Infinity });
+      // Inline: even a grace period of 0 cannot force it. Threaded: never forced
+      const cancelled = scheduler.cancel(id, { graceMs: inline ? 0 : Infinity });
       await sleep(300);
       if (task.state !== 'running' || !task.cancellation) throw new Error(`${kind}: ${task.state} while its run was still going`);
       if (group.running !== 1) throw new Error(`${kind}: resources released while its run was still going`);
@@ -807,6 +836,272 @@ class CancellationTestSuite {
     const before = log.length;
     await sleep(1200);
     if (log.length !== before) throw new Error(`Emitted after shutdown: ${log.slice(before)}`);
+  }
+
+  // --- the forced stop ----------------------------------------------------------
+
+  // A worker spinning synchronously never reads its cancel message. After the
+  // grace period its worker is retired: the task ends cancelled, forced, with
+  // its resources released only once the thread is gone. Its co-tenant is
+  // requeued - with requeueFailedTasks false, too - and completes on a new
+  // worker. Not a failure: no worker.failed, and no restart counted.
+  private async testForcedStop(): Promise<void> {
+    const group = new ConcurrentLimitGroup(2);
+    const { pool, scheduler } = this.make(
+      { inline: false, maxConcurrentTasks: 2, requeueFailedTasks: false, groups: ['g'] }, { g: group }, this.cancelWorkerUrl
+    );
+    const log = this.events(scheduler);
+    const entered = this.entries(scheduler);
+    const cancelledAt = this.cancelledAt(scheduler);
+    const teardown = this.teardownOf(pool);
+    let workerFailed = 0;
+    pool.addEventListener('worker.failed', () => workerFailed++);
+    let releasedAt = 0;
+    scheduler.addEventListener('resource.released', (e: any) => {
+      if (e.detail.holderId === 'spinner') releasedAt = performance.now();
+    });
+
+    // The co-tenant first: once the spinner spins, nothing else on that thread runs
+    const cotenant = this.task('cotenant', { mode: 'ignore', delay: 300 });
+    const cotenantDone = scheduler.addTask(cotenant, { createPromise: true });
+    await this.until(() => entered.has('cotenant'));
+    const firstWorker = pool.getWorkerIds()[0];
+    const spinner = this.task('spinner', { mode: 'spin', delay: 8000 });
+    scheduler.addTask(spinner);
+    await this.until(() => entered.has('spinner'));
+
+    const start = performance.now();
+    const cancelled = scheduler.cancel('spinner', { graceMs: 100 });
+    if (await this.within(cancelled, 4000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    const took = performance.now() - start;
+    if (took < 100) throw new Error(`Settled ${took.toFixed(0)} ms after the cancel, inside the grace period`);
+    if (spinner.state !== 'cancelled' || spinner.cancellation?.forced !== true) {
+      throw new Error(`Ended ${spinner.state}, forced ${spinner.cancellation?.forced}`);
+    }
+    if (!teardown.endedAt || cancelledAt.get('spinner')! < teardown.endedAt) throw new Error('Settled before its thread was torn down');
+    if (!releasedAt || releasedAt < teardown.endedAt) throw new Error('Released its resources before its thread was torn down');
+    const spinnerEvents = log.filter(e => e.endsWith(':spinner')).join(' ');
+    if (spinnerEvents !== 'running:spinner cancelling:spinner cancelled:spinner') throw new Error(spinnerEvents);
+
+    await this.within(cotenantDone!, 4000, 'the co-tenant');
+    const ended = (): string => cotenant.state;
+    if (ended() !== 'done') throw new Error(`The co-tenant ended ${ended()}`);
+    if (entered.get('cotenant')!.length !== 2) throw new Error(`The co-tenant ran ${entered.get('cotenant')!.length} times`);
+    if (log.some(e => e.startsWith('failed:'))) throw new Error(`Events: ${log}`);
+    const workers = pool.getWorkerIds();
+    if (workers.length !== 1 || workers[0] === firstWorker) throw new Error(`Workers: ${workers}, first ${firstWorker}`);
+    if (workerFailed !== 0) throw new Error(`worker.failed fired ${workerFailed} times`);
+    if ((pool as any).poolRestartCount !== 0) throw new Error(`Restart count ${(pool as any).poolRestartCount}`);
+    if (group.running !== 0) throw new Error(`Group holds ${group.running}`);
+    this.assertAccounted(scheduler, 2, 'end');
+  }
+
+  // The worker ignores its signal, and both runs on it post their results
+  // while its teardown() is still running. Detached first, neither settles
+  // anything: the cancelled task ends forced once the thread is dead, and the
+  // co-tenant completes from its second run
+  private async testForcedLateResult(): Promise<void> {
+    const { pool, scheduler } = this.make(
+      { inline: false, maxConcurrentTasks: 2, config: { teardownMs: 400 } }, {}, this.cancelWorkerUrl
+    );
+    const entered = this.entries(scheduler);
+    const cancelledAt = this.cancelledAt(scheduler);
+    const teardown = this.teardownOf(pool);
+    let completedAt = 0;
+    scheduler.addEventListener('task.completed', (e: any) => {
+      if (e.detail.id === 'cotenant') completedAt = performance.now();
+    });
+
+    const cotenant = this.task('cotenant', { mode: 'ignore', delay: 250 });
+    const cotenantDone = scheduler.addTask(cotenant, { createPromise: true });
+    const late = this.task('late', { mode: 'ignore', delay: 200 });
+    scheduler.addTask(late);
+    await this.until(() => entered.has('cotenant') && entered.has('late'));
+
+    const cancelled = scheduler.cancel('late', { graceMs: 50 });
+    if (await this.within(cancelled, 4000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    if (late.state !== 'cancelled' || late.cancellation?.forced !== true) {
+      throw new Error(`Ended ${late.state}, forced ${late.cancellation?.forced} - settled by its own result`);
+    }
+    if (!teardown.endedAt || cancelledAt.get('late')! < teardown.endedAt) throw new Error('Settled before its thread was torn down');
+
+    await this.within(cotenantDone!, 4000, 'the co-tenant');
+    const runs = entered.get('cotenant')!;
+    if (runs.length !== 2) throw new Error(`The co-tenant ran ${runs.length} times - completed by its abandoned run`);
+    if (completedAt - runs[1] < 200) throw new Error(`Completed ${(completedAt - runs[1]).toFixed(0)} ms into its second run`);
+    this.assertAccounted(scheduler, 2, 'end');
+  }
+
+  // Two tasks on one worker, both being cancelled. Neither is a co-tenant to
+  // requeue: both settle cancelled, forced, once the thread is dead
+  private async testForcedTwo(): Promise<void> {
+    const { pool, scheduler } = this.make({ inline: false, maxConcurrentTasks: 2 }, {}, this.cancelWorkerUrl);
+    const log = this.events(scheduler);
+    const entered = this.entries(scheduler);
+    const cancelledAt = this.cancelledAt(scheduler);
+    const teardown = this.teardownOf(pool);
+    const tasks = ['a', 'b'].map(id => this.task(id, { mode: 'ignore', delay: 4000 }));
+    for (const task of tasks) scheduler.addTask(task);
+    await this.until(() => entered.has('a') && entered.has('b'));
+
+    // b with the longer grace period: the forced stop of a takes it too
+    const results = await this.within(Promise.all([
+      scheduler.cancel('a', { graceMs: 100 }),
+      scheduler.cancel('b', { graceMs: 60_000 })
+    ]), 4000, 'cancel()');
+    if (results.some(r => r !== true)) throw new Error(`cancel() resolved ${results}`);
+    for (const task of tasks) {
+      if (task.state !== 'cancelled' || task.cancellation?.forced !== true) {
+        throw new Error(`${task.id} ended ${task.state}, forced ${task.cancellation?.forced}`);
+      }
+      if (!teardown.endedAt || cancelledAt.get(task.id)! < teardown.endedAt) throw new Error(`${task.id} settled before its thread was torn down`);
+      const events = log.filter(e => e.endsWith(`:${task.id}`)).join(' ');
+      if (events !== `running:${task.id} cancelling:${task.id} cancelled:${task.id}`) throw new Error(events);
+    }
+    if ((pool as any).poolRestartCount !== 0) throw new Error(`Restart count ${(pool as any).poolRestartCount}`);
+    this.assertAccounted(scheduler, 2, 'end');
+  }
+
+  // A timer belongs to its attempt. The first task stops by itself inside its
+  // grace period; a new task reusing its id then runs on the same worker past
+  // the moment that timer was due, and is not forced
+  private async testStaleGraceTimer(): Promise<void> {
+    const { pool, scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+    const entered = this.entries(scheduler);
+    const first = this.task('reused', { mode: 'ignore', delay: 100 });
+    scheduler.addTask(first);
+    await this.until(() => entered.has('reused'));
+    const worker = pool.getWorkerIds()[0];
+
+    if (await this.within(scheduler.cancel('reused', { graceMs: 400 }), 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    if (first.cancellation?.forced !== false) throw new Error('The first task was forced');
+
+    const second = this.task('reused', { mode: 'ignore', delay: 700 });
+    const done = scheduler.addTask(second, { createPromise: true });
+    await this.within(done!, 3000, 'the second task');
+    const ended = (): string => second.state;
+    if (ended() !== 'done') throw new Error(`The second task ended ${ended()}`);
+    if (pool.getWorkerIds().join() !== worker) throw new Error(`Its worker was replaced: ${pool.getWorkerIds()}`);
+    this.assertAccounted(scheduler, 2, 'end');
+  }
+
+  // A forced stop during shutdown()'s drain: the cancelled task and the
+  // requeued co-tenant both settle inside it. Then a pool shut down while it is
+  // retiring a worker waits for that, rather than tearing it down twice.
+  private async testForcedDuringShutdown(): Promise<void> {
+    {
+      const { scheduler } = this.make({ inline: false, maxConcurrentTasks: 2 }, {}, this.cancelWorkerUrl);
+      const entered = this.entries(scheduler);
+      const cotenant = this.task('cotenant', { mode: 'ignore', delay: 300 });
+      const cotenantDone = scheduler.addTask(cotenant, { createPromise: true });
+      await this.until(() => entered.has('cotenant'));
+      const spinner = this.task('spinner', { mode: 'spin', delay: 8000 });
+      scheduler.addTask(spinner);
+      await this.until(() => entered.has('spinner'));
+
+      const cancelled = scheduler.cancel('spinner', { graceMs: 100 });
+      const start = performance.now();
+      await scheduler.shutdown();
+      const took = performance.now() - start;
+      // The drain gives up after 5 s; settling inside it is the point
+      if (took > 4000) throw new Error(`shutdown() took ${took.toFixed(0)} ms`);
+      if (await this.within(cancelled, 500, 'cancel()') !== true) throw new Error('cancel() resolved false');
+      if (spinner.state !== 'cancelled' || spinner.cancellation?.forced !== true) throw new Error(`Spinner ended ${spinner.state}`);
+      await this.within(cotenantDone!, 500, 'the co-tenant');
+      if (entered.get('cotenant')!.length !== 2) throw new Error('The co-tenant was not requeued');
+    }
+    {
+      const { pool, scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+      const entered = this.entries(scheduler);
+      const teardown = this.teardownOf(pool);
+      const spinner = this.task('spinner', { mode: 'spin', delay: 8000 });
+      scheduler.addTask(spinner);
+      await this.until(() => entered.has('spinner'));
+      const cancelled = scheduler.cancel('spinner', { graceMs: 50 });
+      // Retiring: its teardown has begun, and waits out the acknowledgement
+      // timeout, since the thread cannot answer
+      await this.until(() => teardown.started === 1);
+      await pool.shutdown();
+      if (teardown.started !== 1) throw new Error(`Torn down ${teardown.started} times`);
+      if (await this.within(cancelled, 2000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+      if (spinner.cancellation?.forced !== true) throw new Error('Not forced');
+    }
+  }
+
+  // Never forced, the task is still cancelling when shutdown() terminates its
+  // worker. Its run has stopped then, so it ends cancelled, forced
+  private async testShutdownThreaded(): Promise<void> {
+    const { scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+    const entered = this.entries(scheduler);
+    const task = this.task('stubborn', { mode: 'ignore', delay: 8000 });
+    scheduler.addTask(task);
+    await this.until(() => entered.has('stubborn'));
+    const cancelled = scheduler.cancel('stubborn', { graceMs: Infinity });
+    await scheduler.shutdown();
+    if (await this.within(cancelled, 500, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    if (task.state !== 'cancelled' || task.cancellation?.forced !== true) throw new Error(`Ended ${task.state}, forced ${task.cancellation?.forced}`);
+  }
+
+  private async testGraceEdges(): Promise<void> {
+    // Beyond what setTimeout honours: never forced. Armed anyway, the timer
+    // would fire at once
+    for (const graceMs of [Infinity, 2 ** 31]) {
+      const { scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+      const entered = this.entries(scheduler);
+      const cancelledAt = this.cancelledAt(scheduler);
+      const task = this.task('patient', { mode: 'ignore', delay: 400 });
+      scheduler.addTask(task);
+      await this.until(() => entered.has('patient'));
+      await this.within(scheduler.cancel('patient', { graceMs }), 3000, `graceMs ${graceMs}`);
+      if (task.cancellation?.forced !== false) throw new Error(`graceMs ${graceMs}: forced`);
+      const ranFor = cancelledAt.get('patient')! - entered.get('patient')![0];
+      if (ranFor < 350) throw new Error(`graceMs ${graceMs}: settled ${ranFor.toFixed(0)} ms in`);
+    }
+
+    // A repeat call shortens the wait, and never lengthens it
+    for (const [first, second] of [[60_000, 100], [100, 60_000]]) {
+      const { scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+      const entered = this.entries(scheduler);
+      const task = this.task('pressed', { mode: 'ignore', delay: 8000 });
+      scheduler.addTask(task);
+      await this.until(() => entered.has('pressed'));
+      const once = scheduler.cancel('pressed', { graceMs: first });
+      await sleep(30);
+      const twice = scheduler.cancel('pressed', { graceMs: second });
+      if (once !== twice) throw new Error('A repeat call returned a different promise');
+      await this.within(twice, 2000, `${first} then ${second}`);
+      if (task.cancellation?.forced !== true) throw new Error(`${first} then ${second}: not forced`);
+    }
+
+    // The pool's cancelGraceMs, when a call gives none
+    {
+      const { scheduler } = this.make({ inline: false, cancelGraceMs: 100 }, {}, this.cancelWorkerUrl);
+      const entered = this.entries(scheduler);
+      const task = this.task('pooled', { mode: 'ignore', delay: 8000 });
+      scheduler.addTask(task);
+      await this.until(() => entered.has('pooled'));
+      await this.within(scheduler.cancel('pooled'), 2000, 'cancelGraceMs');
+      if (task.cancellation?.forced !== true) throw new Error('cancelGraceMs: not forced');
+    }
+
+    // pool.shutdown() leaves no timer behind to hold the process open
+    {
+      const { pool, scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+      const entered = this.entries(scheduler);
+      scheduler.addTask(this.task('left', { mode: 'ignore', delay: 8000 }));
+      await this.until(() => entered.has('left'));
+      scheduler.cancel('left', { graceMs: 60_000 });
+      await pool.shutdown();
+      if ((pool as any).graceTimers.size !== 0) throw new Error('A grace timer outlived pool.shutdown()');
+    }
+
+    // Validated at construction, by the same rules as graceMs
+    if (new WorkerManager(this.cancelWorkerUrl).cancelGraceMs !== 2000) throw new Error('Default is not 2000');
+    for (const [bad, kind] of [['5', TypeError], [-1, RangeError], [NaN, RangeError]] as const) {
+      let thrown: unknown;
+      try { new WorkerManager(this.cancelWorkerUrl, { cancelGraceMs: bad as any }); } catch (error) { thrown = error; }
+      if (!(thrown instanceof kind)) throw new Error(`cancelGraceMs ${String(bad)}: threw ${thrown}`);
+    }
   }
 }
 
