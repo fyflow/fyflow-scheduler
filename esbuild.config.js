@@ -132,6 +132,7 @@ if (buildType === 'development') {
       "tests/suites/resident-groups.ts",
       "tests/suites/resource-events.ts",
       "tests/suites/messages.ts",
+      "tests/suites/cancellation.ts",
       "tests/performance/contention-scaling.ts",
       "benchmark/runBenchmarks.ts"
     ],

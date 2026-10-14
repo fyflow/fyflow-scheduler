@@ -14,6 +14,12 @@
  * large blocked queue one task at a time quadratic too. The ready queues never
  * ask, so they do not pay for the set.
  *
+ * An item can be **tombstoned** in place, in O(1): a cancelled task is left
+ * where it is rather than spliced out, which would make cancelling every task
+ * of a large queue quadratic. A tombstone is invisible to every reader -
+ * `length`, `shift()`, iteration, `includes()` - and costs nothing until the
+ * head reaches it.
+ *
  * Internal: not exported from the package. Keeps the array-like surface the
  * scheduler and `examples/test-deadlock.ts` read (`length`, iteration).
  */
@@ -21,18 +27,31 @@ export class TaskQueue<T> implements Iterable<T> {
   private items: (T | undefined)[] = [];
   private head = 0;
   private readonly members?: Set<T>;
+  /** Items tombstoned but not yet passed by the head. Created on first use. */
+  private dead?: Set<T>;
 
   constructor(options: { trackMembership?: boolean } = {}) {
     if (options.trackMembership) this.members = new Set<T>();
   }
 
+  /** Live items: tombstones are not counted. */
   get length(): number {
-    return this.items.length - this.head;
+    return this.items.length - this.head - (this.dead?.size ?? 0);
   }
 
-  /** The item at `index` from the head, without removing it. */
+  /** The live item at `index` from the head, without removing it. Linear when tombstones are present. */
   at(index: number): T | undefined {
-    return index < 0 || index >= this.length ? undefined : this.items[this.head + index];
+    if (index < 0) return undefined;
+    if (!this.dead?.size) {
+      return index >= this.length ? undefined : this.items[this.head + index];
+    }
+    let live = 0;
+    for (let i = this.head; i < this.items.length; i++) {
+      const item = this.items[i] as T;
+      if (this.dead.has(item)) continue;
+      if (live++ === index) return item;
+    }
+    return undefined;
   }
 
   push(item: T): void {
@@ -41,13 +60,20 @@ export class TaskQueue<T> implements Iterable<T> {
   }
 
   shift(): T | undefined {
-    if (this.head >= this.items.length) return undefined;
-    const item = this.items[this.head] as T;
-    // Released so a consumed task can be collected before the next compaction
-    this.items[this.head] = undefined;
-    this.head++;
-    this.members?.delete(item);
+    while (this.head < this.items.length) {
+      const item = this.items[this.head] as T;
+      // Released so a consumed task can be collected before the next compaction
+      this.items[this.head] = undefined;
+      this.head++;
+      this._compact();
+      if (this.dead?.delete(item)) continue;
+      this.members?.delete(item);
+      return item;
+    }
+    return undefined;
+  }
 
+  private _compact(): void {
     if (this.head === this.items.length) {
       this.items = [];
       this.head = 0;
@@ -55,7 +81,6 @@ export class TaskQueue<T> implements Iterable<T> {
       this.items = this.items.slice(this.head);
       this.head = 0;
     }
-    return item;
   }
 
   /** Puts items back at the head, in the order given. */
@@ -73,40 +98,63 @@ export class TaskQueue<T> implements Iterable<T> {
     if (this.members) for (const item of items) this.members.add(item);
   }
 
+  /**
+   * Mark `item`, which the caller knows is in this queue, as gone. O(1): it
+   * stays in place and is skipped when the head reaches it. Tombstoning an item
+   * twice, or one not in the queue, corrupts `length`, so the caller must know
+   * where the item is rather than ask.
+   */
+  tombstone(item: T): void {
+    (this.dead ??= new Set<T>()).add(item);
+    this.members?.delete(item);
+  }
+
   /** O(1) with membership tracking, otherwise a linear scan. */
   includes(item: T): boolean {
     if (this.members) return this.members.has(item);
     return this.indexOf(item) !== -1;
   }
 
-  /** Position from the head, or -1. Linear. */
+  /** Position among live items from the head, or -1. Linear. */
   indexOf(item: T): number {
+    if (this.dead?.has(item)) return -1;
+    let live = 0;
     for (let i = this.head; i < this.items.length; i++) {
-      if (this.items[i] === item) return i - this.head;
+      const current = this.items[i] as T;
+      if (current === item) return live;
+      if (!this.dead?.has(current)) live++;
     }
     return -1;
   }
 
-  /** Removes the first occurrence of `item`. Linear; for rare exits only. */
+  /** Removes the first live occurrence of `item`. Linear; for rare exits only. */
   remove(item: T): boolean {
-    const index = this.indexOf(item);
-    if (index === -1) return false;
-    this.items.splice(this.head + index, 1);
-    this.members?.delete(item);
-    return true;
+    if (this.dead?.has(item)) return false;
+    for (let i = this.head; i < this.items.length; i++) {
+      if (this.items[i] !== item) continue;
+      this.items.splice(i, 1);
+      this.members?.delete(item);
+      return true;
+    }
+    return false;
   }
 
   clear(): void {
     this.items = [];
     this.head = 0;
     this.members?.clear();
+    this.dead?.clear();
   }
 
   toArray(): T[] {
-    return this.items.slice(this.head) as T[];
+    return [...this];
   }
 
   *[Symbol.iterator](): Iterator<T> {
-    for (let i = this.head; i < this.items.length; i++) yield this.items[i] as T;
+    for (let i = this.head; i < this.items.length; i++) {
+      const item = this.items[i] as T;
+      if (this.dead?.has(item)) continue;
+      yield item;
+    }
   }
 }

@@ -58,6 +58,8 @@ export type ResourceUnblockReason =
    * happen silently.
    */
   | 'orphaned'
+  /** The task was cancelled while it waited. `task.cancelled` follows. */
+  | 'cancelled'
   /** The scheduler is tearing down and discarded every waiter. */
   | 'shutdown';
 

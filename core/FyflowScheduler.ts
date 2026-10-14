@@ -8,6 +8,7 @@ import type {
 } from './resourceEvents.ts';
 import { TaskQueue } from './taskQueue.ts';
 import type { TaskMessageDetail } from './workerInterface.ts';
+import { CancelledError } from './workerInterface.ts';
 
 /**
  * Delimiter between a group id and a key in a blocked-queue id.
@@ -64,9 +65,17 @@ export class FyflowTask {
      * `pending` -> `running` -> `done` | `failed`.
      *
      * A non-optional task that fails with no retries left ends in `user_action`,
-     * signalling that something outside the scheduler has to intervene.
+     * signalling that something outside the scheduler has to intervene. A task
+     * cancelled with `scheduler.cancel()` ends in `cancelled`; while a running
+     * one is being cancelled its state stays `running` and `cancellation` is set.
      */
     state: string = "pending";
+    /**
+     * Set when a cancel is accepted, otherwise undefined. `forced` is decided at
+     * settle: true when the worker had to be stopped. While this is set and
+     * `state` is `running`, the task is being cancelled.
+     */
+    cancellation?: { reason?: unknown; requestedAt: number; forced: boolean };
     result?: any;
     /**
      * Error message of the most recent failed attempt. Set on every failure,
@@ -122,6 +131,16 @@ export class FyflowTask {
      * keeps executing while the new attempt runs elsewhere.
      */
     _dispatchToken = 0;
+    /**
+     * Where this task is waiting, kept current at every move, so `cancel()`
+     * goes straight to it instead of searching every queue. Undefined while it
+     * is in none: dispatched, settled, or in transit between two queues.
+     */
+    _queuedIn?: 'ready' | 'blocked' | 'backoff';
+    /** Which blocked queue, while `_queuedIn` is `blocked`. */
+    _blockedQueueId?: string;
+    /** The pending `cancel()` of a dispatched task, resolved when it settles. */
+    _cancelPending?: { promise: Promise<boolean>; resolve: (cancelled: boolean) => void };
 
     // Private fields for resource management
     _scheduler?: FyflowScheduler; // Reference to scheduler for descendant tracking
@@ -176,6 +195,14 @@ export class FyflowTask {
       return new Promise((resolve, reject) => {
         this.resolve = resolve;
         this.reject = reject;
+        // Already over - for example cancelled by a listener before addTask()
+        // got as far as creating this promise. Settle it now, or it never will.
+        switch (this.state) {
+          case 'done': resolve(this.result); break;
+          case 'failed': resolve(null); break;
+          case 'user_action': reject(new Error(this.error ?? `Task ${this.id} failed`)); break;
+          case 'cancelled': reject(new CancelledError(this.id, this.cancellation?.reason)); break;
+        }
       });
     }
 
@@ -222,6 +249,18 @@ export class FyflowTask {
     maxCompletedTasks?: number;
   }
 
+  /** Options for {@link FyflowScheduler.cancel}. */
+  export interface CancelOptions {
+    /** Kept on `task.cancellation` and the `CancelledError`, and sent to the worker. */
+    reason?: unknown;
+    /**
+     * Threaded pools: ms to wait for the worker to stop before forcing it.
+     * Default: the pool's `cancelGraceMs`. `0` forces at once; `Infinity` never
+     * forces. Ignored by inline pools, which cannot be forced.
+     */
+    graceMs?: number;
+  }
+
   export interface AddTaskOptions {
     createPromise?: boolean; // Default: false (fire-and-forget, no promise created)
   }
@@ -249,8 +288,9 @@ export class FyflowTask {
    * ```
    *
    * Emits: `task.running`, `task.retrying`, `task.completed`, `task.failed`,
-   * `task.progress`, `task.message`, `task.user_action`, `task.spawn_request`,
-   * `task.spawn_failed` and `scheduler.completed`.
+   * `task.cancelling`, `task.cancelled`, `task.progress`, `task.message`,
+   * `task.user_action`, `task.spawn_request`, `task.spawn_failed` and
+   * `scheduler.completed`.
    */
   export class FyflowScheduler extends EventTarget {
     tasks: Map<string, FyflowTask> = new Map<string, FyflowTask>();
@@ -261,7 +301,13 @@ export class FyflowTask {
     blockedQueues: Map<string, TaskQueue<FyflowTask>> = new Map<string, TaskQueue<FyflowTask>>(); // Grouped by blocking group IDs for faster lookup
     workerPools: any;
     groups: Record<string, any>;
-    stats = {queued:0, running:0, done:0, failed:0};
+    stats = {queued:0, running:0, done:0, failed:0, cancelled:0};
+    /**
+     * Set once `shutdown()` has finished. An outcome arriving afterwards - an
+     * inline run that a cancel could not stop, returning at last - is ignored
+     * rather than settling a task nobody is waiting for any more.
+     */
+    private shutDown = false;
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
     /**
      * Tasks sitting out a retry backoff, by id. Held outside every queue, so no
@@ -372,6 +418,8 @@ export class FyflowTask {
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
       this.stats.queued = Math.max(0, this.stats.queued - 1);
+      task._queuedIn = 'blocked';
+      task._blockedQueueId = queueId;
       if (!queue.includes(task)) {
         queue.push(task);
         if (this._resourceObserved) {
@@ -459,7 +507,10 @@ export class FyflowTask {
     _checkCompletion() {
       const hasBlockedTasks = this._hasBlockedTasks();
 
-      if (this.stats.queued === 0 && this.stats.running === 0 && !hasBlockedTasks && this.stats.done > 0) {
+      // Any task having ended counts, not only a success: a run whose tasks all
+      // failed, or were all cancelled, never reported draining
+      const ended = this.stats.done + this.stats.failed + this.stats.cancelled;
+      if (this.stats.queued === 0 && this.stats.running === 0 && !hasBlockedTasks && ended > 0) {
         this._clearPeriodicRetry(); // Stop retries when all tasks are done
         // Copied, not `this.stats` itself: this fires on every drain, so a
         // consumer keeping two of them would otherwise hold one live object
@@ -502,6 +553,7 @@ export class FyflowTask {
       if (!workerQueue) {
         throw new Error(`Unknown worker type: ${task.workerType}`);
       }
+      FyflowScheduler._assertNotCancelled(task);
       // Throws on a keyed group with no derivable key, before anything is registered
       this._resolveResourceKeys(task, this.workerPools[task.workerType]);
 
@@ -509,6 +561,7 @@ export class FyflowTask {
       task._scheduler = this;
       this.tasks.set(task.id, task);
       workerQueue.push(task);
+      task._queuedIn = 'ready';
 
       this.stats.queued++;
       this._dispatchLoop();
@@ -526,6 +579,18 @@ export class FyflowTask {
         }
 
         return promise;
+      }
+    }
+
+    /**
+     * A cancelled task object cannot be queued again: it may still sit in a
+     * queue as a tombstone, where re-queueing the same object would either be
+     * skipped or revive the stale entry. Re-running cancelled work means a new
+     * `FyflowTask`.
+     */
+    private static _assertNotCancelled(task: FyflowTask) {
+      if (task.state === 'cancelled') {
+        throw new Error(`Task "${task.id}" was cancelled - create a new FyflowTask to run it again`);
       }
     }
 
@@ -558,6 +623,7 @@ export class FyflowTask {
         if (!this.readyQueuesByWorker.has(task.workerType)) {
           throw new Error(`Unknown worker type: ${task.workerType}`);
         }
+        FyflowScheduler._assertNotCancelled(task);
         this._resolveResourceKeys(task, this.workerPools[task.workerType]);
       }
 
@@ -571,6 +637,7 @@ export class FyflowTask {
 
         // Queue task immediately (no dependency tracking)
         this.readyQueuesByWorker.get(task.workerType)!.push(task);
+        task._queuedIn = 'ready';
         this.stats.queued++;
 
         // Only create promise if explicitly requested
@@ -635,6 +702,7 @@ export class FyflowTask {
           // again) left the outer shift() removing a different task - one that
           // then ran nowhere and never settled.
           const task = queue.shift()!;
+          task._queuedIn = undefined;
 
           // Check if we can dispatch this task
           const canDispatchResult = this._canDispatchTask(task, pool);
@@ -662,6 +730,7 @@ export class FyflowTask {
             // between them delays the task instead of losing it. Safe to put
             // back, as this path emits nothing.
             queue.unshift(task);
+            task._queuedIn = 'ready';
             this._schedulePeriodicRetry();
             break;
           }
@@ -709,6 +778,8 @@ export class FyflowTask {
           // Only a push is an event. Re-reaching a queue the task is already in
           // changes no membership, and emitting there would leave the fold one
           // blocked ahead of its unblocked permanently.
+          task._queuedIn = 'blocked';
+          task._blockedQueueId = queueId;
           if (!blockedQueue.includes(task)) {
             blockedQueue.push(task);
             if (this._resourceObserved) {
@@ -784,10 +855,29 @@ export class FyflowTask {
     }
 
     _dispatchTask(task: FyflowTask, pool: any) {
+      // Every transition first, then any event. resource.acquired below can
+      // reach a listener that calls cancel(), which must find the task where it
+      // really is: running, counted in `running`, out of every queue. It used to
+      // fire while the task was still `pending` and counted in `queued`, where a
+      // cancel had no correct outcome.
+      task._queuedIn = undefined;
+      // A fresh attempt may be settled again
+      task._settling = false;
+      const token = ++task._dispatchToken;
+      // A requeue repeats the number, because it leaves `attempts` alone
+      task.attemptNumber = task.attempts + 1;
+      // The previous attempt's failure is not this one's
+      task.error = undefined;
+      task.state = 'running';
+      task.startTime = Date.now();
+      this.stats.queued = Math.max(0, this.stats.queued - 1);
+      this.stats.running++;
+
       // Acquire resources immediately (thread will be created if needed)
       const entries = this._groupsForTask(task, pool);
       const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
       task._resourceKeys = keys;
+      task._resourcesPreAllocated = true;
 
       entries.forEach(({ id, group }) => {
         const key = group.keyed ? keys[id] : undefined;
@@ -805,20 +895,13 @@ export class FyflowTask {
           });
         }
       });
-      task._resourcesPreAllocated = true;
-      // A fresh attempt may be settled again
-      task._settling = false;
-      const token = ++task._dispatchToken;
-      // A requeue repeats the number, because it leaves `attempts` alone
-      task.attemptNumber = task.attempts + 1;
-      // The previous attempt's failure is not this one's
-      task.error = undefined;
 
-      // Update state and stats synchronously
-      task.state = 'running';
-      task.startTime = Date.now();
-      this.stats.queued = Math.max(0, this.stats.queued - 1);
-      this.stats.running++;
+      // Cancelled by a resource.acquired listener: it never reaches the pool,
+      // and settles as cancelled, releasing what it just acquired
+      if (task.cancellation) {
+        this._settleTask(task, pool, { ok: false, error: new CancelledError(task.id) }, token);
+        return;
+      }
 
       // Get/create thread and execute task
       pool.enqueueNoQueue(task.id, task.payload)
@@ -828,6 +911,12 @@ export class FyflowTask {
         .catch((error: any) => {
           // Handle race condition: thread filled up between check and dispatch
           if (error.message === 'Worker at maximum concurrent task capacity') {
+            // Being cancelled: it ends here rather than going back in the queue
+            if (task.cancellation) {
+              this._onTaskFailed(task, error, pool, token);
+              return;
+            }
+
             // Revert state and stats changes
             task.state = 'pending';
             task.startTime = undefined;
@@ -835,14 +924,16 @@ export class FyflowTask {
             this.stats.running = Math.max(0, this.stats.running - 1);
             this.stats.queued++;
 
-            // Release pre-allocated resources
-            this._releaseResourcesForTask(task, pool);
-
-            // Put task back in ready queue
+            // Back in the ready queue BEFORE the release, which can reach a
+            // listener: a cancel from there must find it queued, not in transit
             const workerQueue = this.readyQueuesByWorker.get(task.workerType);
             if (workerQueue) {
               workerQueue.push(task);
+              task._queuedIn = 'ready';
             }
+
+            // Release pre-allocated resources
+            this._releaseResourcesForTask(task, pool);
 
             // Retry dispatch (thread should be available soon)
             setTimeout(() => this._dispatchLoop(), 10);
@@ -921,6 +1012,8 @@ export class FyflowTask {
       // attempt. Outcomes arriving as pool events carry no token; those are
       // kept off stale attempts by the failed worker forgetting the task.
       if (token !== undefined && token !== task._dispatchToken) return;
+      // After shutdown() has finished, nobody is waiting any more
+      if (this.shutDown) return;
 
       // One settle per attempt. Cleared in _dispatchTask, so a retried or
       // requeued task can settle again.
@@ -929,6 +1022,15 @@ export class FyflowTask {
 
       // Released here and nowhere else, so every path returns its slots exactly once
       this._releaseResourcesForTask(task, pool);
+
+      // Cancel wins: once accepted, whatever the attempt produced - a result,
+      // an error, a worker death - the task ends cancelled, with no retry and
+      // no requeue. Checked after the release rather than before it, because
+      // the release can reach a listener that cancels this very task.
+      if (task.cancellation) {
+        this._settleCancelled(task);
+        return;
+      }
 
       // A worker died under this task and the pool wants it retried on another.
       // Handled here rather than in its own listener so it competes with the
@@ -945,7 +1047,10 @@ export class FyflowTask {
         this.stats.queued++;
 
         const requeueTarget = this.readyQueuesByWorker.get(task.workerType);
-        if (requeueTarget) requeueTarget.push(task);
+        if (requeueTarget) {
+          requeueTarget.push(task);
+          task._queuedIn = 'ready';
+        }
 
         // _settling stays set until the next dispatch clears it, so a late
         // outcome from the abandoned attempt cannot settle the new one
@@ -994,6 +1099,7 @@ export class FyflowTask {
         // In the map before the event, so a listener sees where it is.
         const waiting: { task: FyflowTask; timer?: ReturnType<typeof setTimeout> } = { task };
         this.retryWaiting.set(task.id, waiting);
+        task._queuedIn = 'backoff';
         task.timestamp = Date.now();
         this.dispatchEvent(new CustomEvent('task.retrying', { detail: task }));
 
@@ -1003,6 +1109,7 @@ export class FyflowTask {
             if (this.retryWaiting.get(task.id) !== waiting) return;
             this.retryWaiting.delete(task.id);
             this.readyQueuesByWorker.get(task.workerType)?.push(task);
+            task._queuedIn = 'ready';
             this._dispatchLoop();
           }, task.retryPolicy?.backoffMs || 0);
         }
@@ -1042,6 +1149,156 @@ export class FyflowTask {
 
       // Resources are free again
       this._dispatchLoop();
+    }
+
+    /**
+     * End a dispatched task as cancelled. Reached from `_settleTask` only, so the
+     * attempt's resources have been released exactly once already.
+     */
+    private _settleCancelled(task: FyflowTask) {
+      task.state = 'cancelled';
+      task.endTime = Date.now();
+      // A failure earlier in this task's life is not how it ended
+      task.error = undefined;
+      this.stats.running = Math.max(0, this.stats.running - 1);
+      this.stats.cancelled++;
+      this._finishCancelled(task);
+      this._checkCompletion();
+      // Resources are free again
+      this._dispatchLoop();
+    }
+
+    /** What every cancelled task gets, dispatched or not, once its counters have moved. */
+    private _finishCancelled(task: FyflowTask) {
+      task.reject?.(new CancelledError(task.id, task.cancellation?.reason));
+      task.timestamp = Date.now();
+      this.dispatchEvent(new CustomEvent('task.cancelled', { detail: task }));
+      const pending = task._cancelPending;
+      task._cancelPending = undefined;
+      pending?.resolve(true);
+      this._settleDescendantTrackers(task.id);
+      this._recordTerminalTask(task.id);
+    }
+
+    /**
+     * Cancel a task.
+     *
+     * A task still waiting - queued, blocked on a resource group, or sitting out
+     * a retry backoff - is removed at once and never dispatches. A running one is
+     * signalled through `context.signal`, `task.cancelling` fires, and it ends
+     * when its attempt stops: on a threaded pool the worker is forced after
+     * `graceMs` if it has not; an inline run cannot be forced, and is waited for.
+     * Either way it ends in `cancelled` and `task.cancelled`, whatever the
+     * attempt produced, its promise rejects with a `CancelledError`, and it is
+     * not retried or requeued.
+     *
+     * Resolves `true` once the task is cancelled, including when it already
+     * was; `false` if the id is unknown or the task finished first. Never
+     * rejects because of a task's state, so cancelling every task of a run in a
+     * loop needs no guards. A repeat call returns the same promise, and a
+     * shorter `graceMs` on it shortens the wait.
+     *
+     * @throws TypeError if `graceMs` is not a number, RangeError if it is
+     *   negative or NaN - synchronously, as for any other programming error.
+     */
+    cancel(taskId: string, options: CancelOptions = {}): Promise<boolean> {
+      // Not async: a bad argument throws here, rather than becoming a rejection
+      const { reason, graceMs } = options;
+      if (graceMs !== undefined) {
+        if (typeof graceMs !== 'number') throw new TypeError(`graceMs must be a number, got ${typeof graceMs}`);
+        if (Number.isNaN(graceMs) || graceMs < 0) throw new RangeError(`graceMs must be zero or more, got ${graceMs}`);
+      }
+
+      const task = this.tasks.get(taskId);
+      if (!task) return Promise.resolve(false);
+      if (task.state === 'cancelled') return Promise.resolve(true);
+      if (this._isTerminal(task.state)) return Promise.resolve(false);
+
+      if (task.state === 'running') {
+        const pool = this.workerPools[task.workerType];
+        if (task._cancelPending) {
+          // Pressing Cancel again can only escalate
+          if (graceMs !== undefined) pool?._cancelTask?.(task.id, task._dispatchToken, { reason, graceMs });
+          return task._cancelPending.promise;
+        }
+        let resolve!: (cancelled: boolean) => void;
+        const promise = new Promise<boolean>(r => { resolve = r; });
+        task._cancelPending = { promise, resolve };
+        task.cancellation = { reason, requestedAt: Date.now(), forced: false };
+        task.error = undefined;
+        task.timestamp = Date.now();
+        this.dispatchEvent(new CustomEvent('task.cancelling', { detail: task }));
+        // A listener may have let it settle already (cancel from resource.acquired)
+        if (task.state === 'running') {
+          pool?._cancelTask?.(task.id, task._dispatchToken, { reason, graceMs });
+        }
+        return promise;
+      }
+
+      this._cancelUndispatched(task, reason);
+      return Promise.resolve(true);
+    }
+
+    /**
+     * Places 1-3: a task that was never dispatched, or is waiting to be again.
+     * It holds no resources, so nothing is handed on: unlike a settle, this does
+     * not run the dispatch loop or retry blocked tasks. That keeps a loop of
+     * cancels over a large queue linear.
+     */
+    private _cancelUndispatched(task: FyflowTask, reason: unknown) {
+      // Out of where it waits, and out of the counter it is in, first
+      switch (task._queuedIn) {
+        case 'ready':
+          this.readyQueuesByWorker.get(task.workerType)?.tombstone(task);
+          this.stats.queued = Math.max(0, this.stats.queued - 1);
+          break;
+        case 'backoff': {
+          const waiting = this.retryWaiting.get(task.id);
+          if (waiting?.timer) clearTimeout(waiting.timer);
+          this.retryWaiting.delete(task.id);
+          this.stats.queued = Math.max(0, this.stats.queued - 1);
+          break;
+        }
+        case 'blocked':
+          // Blocked tasks are counted in no stats key
+          this.blockedQueues.get(task._blockedQueueId!)?.tombstone(task);
+          break;
+        // undefined: in transit between queues, counted nowhere; whoever is
+        // moving it sees the terminal state and leaves it
+      }
+      const leftQueue = task._queuedIn === 'blocked' ? task._blockedQueueId : undefined;
+      task._queuedIn = undefined;
+      task._blockedQueueId = undefined;
+
+      task.state = 'cancelled';
+      task.cancellation = { reason, requestedAt: Date.now(), forced: false };
+      task.endTime = Date.now();
+      task.error = undefined;
+      this.stats.cancelled++;
+
+      if (leftQueue !== undefined && this._resourceObserved) {
+        const { groupId, key } = this._splitQueueId(leftQueue);
+        this._emitResource('resource.unblocked', this.groups[groupId], {
+          groupId,
+          ...this._blockedHoldingFor(task, this.workerPools[task.workerType], groupId),
+          holderKind: 'task',
+          holderId: task.id,
+          workerType: task.workerType,
+          key,
+          reason: 'cancelled'
+        });
+      }
+
+      this._finishCancelled(task);
+
+      // Only the drained check: the full _checkCompletion can sweep every group
+      // and key, which per cancel would make cancelling a run quadratic
+      if (this.stats.queued === 0 && this.stats.running === 0 && !this._hasBlockedTasks()) {
+        this._clearPeriodicRetry();
+        this.dispatchEvent(new CustomEvent('scheduler.completed', {
+          detail: { ...this.stats, timestamp: Date.now() }
+        }));
+      }
     }
 
     _onTaskComplete(task: FyflowTask, result: any, pool: any, token?: number) {
@@ -1104,6 +1361,8 @@ export class FyflowTask {
 
       while (blockedTasks.length > 0 && group.canRun(key)) {
         const task = blockedTasks.shift()!;
+        // In transit until it lands somewhere below
+        task._queuedIn = undefined;
 
         const pool = this.workerPools[task.workerType];
         if (!pool) {
@@ -1122,6 +1381,7 @@ export class FyflowTask {
         // 20-unit worker out of a 24-unit group forever.
         if (this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false) {
           blockedTasks.unshift(task);
+          task._queuedIn = 'blocked';
           break;
         }
 
@@ -1166,14 +1426,21 @@ export class FyflowTask {
       }
 
       // Preserve arrival order for anything that could not run yet
-      if (stillBlocked.length > 0) blockedTasks.unshift(...stillBlocked);
+      if (stillBlocked.length > 0) {
+        blockedTasks.unshift(...stillBlocked);
+        for (const task of stillBlocked) task._queuedIn = 'blocked';
+      }
 
       // Add tasks back to ready queue and dispatch
       if (tasksToRetry.length > 0) {
         for (const task of tasksToRetry) {
+          // Cancelled by a listener on an earlier task's 'admitted', while
+          // this one was in transit: it is settled, and goes nowhere
+          if (task.state === 'cancelled') continue;
           const workerQueue = this.readyQueuesByWorker.get(task.workerType);
           if (workerQueue) {
             workerQueue.unshift(task);
+            task._queuedIn = 'ready';
             // Increment queued count since task is back in ready queue
             this.stats.queued++;
 
@@ -1611,6 +1878,21 @@ export class FyflowTask {
         // Handle spawn task requests from workers
         const taskSpawnListener = (e: any) => {
           const task = this.tasks.get(e.detail.taskId);
+          if (task && (task.cancellation || task.state === 'cancelled')) {
+            // Refused from a task being cancelled, or that was: the caller asked
+            // for this work to stop, and that includes work it would start
+            this.dispatchEvent(new CustomEvent('task.spawn_failed', {
+              detail: {
+                parentTask: task,
+                spawnConfig: e.detail.spawnConfig,
+                error: new CancelledError(task.id, task.cancellation?.reason),
+                workerId: e.detail.workerId,
+                workerType: e.detail.workerType,
+                timestamp: Date.now()
+              }
+            }));
+            return;
+          }
           if (task) {
             // Forward spawn request event with parent task info
             const eventDetail = {
@@ -1666,6 +1948,11 @@ export class FyflowTask {
         const taskRequeueListener = (e: any) => {
           const task = this.tasks.get(e.detail.taskId);
           if (!task || task.state !== 'running') return;
+          // Being cancelled: a requeue would contradict cancel wins, and settling
+          // now would release its resources while its run may still execute.
+          // It settles, as cancelled, when its attempt has actually stopped -
+          // the pool rejects its promise once the failed worker is gone.
+          if (task.cancellation) return;
           this._settleTask(task, this.workerPools[task.workerType], { requeue: true });
         };
         this._addInternalListener(pool, 'task.requeue_required', taskRequeueListener);
@@ -1692,6 +1979,9 @@ export class FyflowTask {
         const taskFailedListener = (e: any) => {
           const task = this.tasks.get(e.detail.taskId);
           if (!task) return;
+          // Being cancelled: as for a requeue, it settles when its attempt has
+          // stopped, through the promise path
+          if (task.cancellation) return;
           // Same settle routine the promise path uses. For a worker that dies
           // with requeueFailedTasks off this is the only notification the
           // scheduler gets, so it cannot be skipped - and _settleTask makes it
@@ -1706,7 +1996,7 @@ export class FyflowTask {
     // Descendants are tasks created at runtime via context.spawnTask(). This is
     // lineage only: it never influences dispatch order or readiness.
 
-    private static readonly TERMINAL_STATES = new Set(['done', 'failed', 'user_action']);
+    private static readonly TERMINAL_STATES = new Set(['done', 'failed', 'user_action', 'cancelled']);
 
     private _isTerminal(state: string): boolean {
       return FyflowScheduler.TERMINAL_STATES.has(state);
@@ -1801,6 +2091,11 @@ export class FyflowTask {
       // but the tracked task failing rejects, matching onCompletePromise()
       if (rootTask.state === 'failed' || rootTask.state === 'user_action') {
         tracker.reject(new Error(rootTask.error || `Task ${tracker.rootId} failed`));
+        return;
+      }
+      // Cancelling the root is the caller's own act, reported as such
+      if (rootTask.state === 'cancelled') {
+        tracker.reject(new CancelledError(tracker.rootId, rootTask.cancellation?.reason));
         return;
       }
 
@@ -1982,6 +2277,7 @@ export class FyflowTask {
         }
       }
       this.blockedQueues.clear();
+      for (const task of this.tasks.values()) task._queuedIn = undefined;
 
       // 4. Shutdown all WorkerManager instances
       const workerManagerPromises = Object.values(this.workerPools).map(async (pool: any) => {
@@ -2003,6 +2299,27 @@ export class FyflowTask {
       // await Promise.all(workerManagerPromises);
 
 
+      // A task still being cancelled. On a threaded pool its worker has just been
+      // terminated, so it has really stopped: it ends cancelled, forced. An
+      // inline run cannot be stopped and may yet end, so its cancel() resolves
+      // false rather than leaving the caller waiting forever.
+      for (const task of this.tasks.values()) {
+        if (!task._cancelPending || task.state !== 'running') continue;
+        const pool = this.workerPools[task.workerType];
+        if (pool && !pool.inline) {
+          task._settling = true;
+          task.cancellation!.forced = true;
+          this._releaseResourcesForTask(task, pool);
+          this._settleCancelled(task);
+        } else {
+          const pending = task._cancelPending;
+          task._cancelPending = undefined;
+          pending.resolve(false);
+        }
+      }
+      // Nothing settles from here on
+      this.shutDown = true;
+
       // 5. Reject outstanding descendant waits - clearing them silently would
       // leave callers awaiting a promise that can never settle
       for (const tracker of this.descendantTrackers.values()) {
@@ -2014,7 +2331,7 @@ export class FyflowTask {
       this.descendantTrackers.clear();
       this.spawnedChildren.clear();
       this.completedTaskIds.clear();
-      this.stats = {queued: 0, running: 0, done: 0, failed: 0};
+      this.stats = {queued: 0, running: 0, done: 0, failed: 0, cancelled: 0};
 
     }
   }

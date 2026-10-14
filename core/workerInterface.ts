@@ -19,6 +19,27 @@ export class WorkerTerminationError extends Error {
 }
 
 /**
+ * What a cancelled task's promise rejects with - `scheduler.cancel()` was
+ * called for it. Not a failure: it is not retried, and an `optional` task
+ * rejects with it too. Also what an `onCompleteDescendants()` wait on a
+ * cancelled task rejects with, and what a spawn from a cancelled task reports.
+ */
+export class CancelledError extends Error {
+  readonly taskId: string;
+  /** As passed to `cancel()`, if anything was. */
+  readonly reason?: unknown;
+
+  // Assigned in the body, not as parameter properties: Node's type stripping
+  // rejects those, and this file is published as source
+  constructor(taskId: string, reason?: unknown) {
+    super(`Task ${taskId} was cancelled`);
+    this.name = 'CancelledError';
+    this.taskId = taskId;
+    this.reason = reason;
+  }
+}
+
+/**
  * True for a {@link WorkerTerminationError} from any copy of this module.
  *
  * `instanceof` alone is not enough. A worker can be bundled separately from the

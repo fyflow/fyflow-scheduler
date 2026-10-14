@@ -3,7 +3,7 @@
 
 // Core scheduler and task management
 export { FyflowScheduler, FyflowTask } from "./core/FyflowScheduler.ts";
-export type { FyflowSchedulerOptions, AddTaskOptions } from "./core/FyflowScheduler.ts";
+export type { FyflowSchedulerOptions, AddTaskOptions, CancelOptions } from "./core/FyflowScheduler.ts";
 
 // Resource management - use ConcurrentLimitGroup for CPU constraints
 // GlobalCPUManager removed in favor of group-based approach
@@ -59,5 +59,5 @@ export type {
   WorkerMessageDetail
 } from "./core/workerInterface.ts";
 export type { MessageOptions } from "./core/messageChannel.ts";
-export { BaseWorker, WorkerTerminationError } from "./core/workerInterface.ts";
+export { BaseWorker, WorkerTerminationError, CancelledError } from "./core/workerInterface.ts";
 

@@ -84,6 +84,8 @@ class TestRunner {
       // Run resource event tests
       await this.runSuite('Resource Events', `./suites/resource-events${ext}`);
 
+      // Run task cancellation tests
+      await this.runSuite('Cancellation', `./suites/cancellation${ext}`);
 
       // Run worker -> host message tests
       await this.runSuite('Worker Messages', `./suites/messages${ext}`);
@@ -114,6 +116,7 @@ class TestRunner {
       'events': `./suites/resource-events${ext}`,
       'resource-events': `./suites/resource-events${ext}`,
       'messages': `./suites/messages${ext}`,
+      'cancellation': `./suites/cancellation${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
 
@@ -152,6 +155,7 @@ async function main() {
     console.log('  resident     - Resident (worker-lifetime) resource groups');
     console.log('  events       - resource.* events, gauges and the admission queue');
     console.log('  messages     - Worker -> host messages via emit()');
+    console.log('  cancellation - scheduler.cancel()');
     console.log('  docs         - Executable documentation examples');
     console.log('  performance  - Performance tests');
     console.log('');

@@ -59,6 +59,7 @@
       "test:resident": "deno run --allow-read --allow-net tests/runner.ts resident",
       "test:events": "deno run --allow-read --allow-net tests/runner.ts events",
       "test:messages": "deno run --allow-read --allow-net tests/runner.ts messages",
+      "test:cancellation": "deno run --allow-read --allow-net tests/runner.ts cancellation",
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
       "test:scripts": "deno test scripts/",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",
