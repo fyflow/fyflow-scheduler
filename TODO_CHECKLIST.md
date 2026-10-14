@@ -14,11 +14,12 @@ No feature work is open. fyflow-app's pass 1 requests are answered: #1
 (attempts already spent) are built, and #3 (`meta` on tasks) was declined in the
 reply. Their summaries are in the archive below.
 
-### Unreleased: notes for the next release
+### 0.6.0: release notes
 
-Everything on `main` since `v0.5.2`. A minor release (0.6.0) by the 0.3.0
-precedent: the source-breaking items below are narrow, and the release commit
-should give the reasoning for each.
+Everything on `main` since `v0.5.2`. The manifests are at 0.6.0; it ships when
+`v0.6.0` is tagged and pushed. A minor release by the 0.3.0 precedent: the
+source-breaking items below are narrow, and the release commit gives the
+reasoning for each.
 
 **New**
 - `scheduler.cancel(taskId, options?)`, `CancelOptions`, `CancelledError`,
