@@ -67,7 +67,27 @@ groundwork are deferred. Depends on the requeue, re-entrancy and queue known
 issues below. Includes the `scheduler.completed` fix below. Plan:
 `doc/design/task-cancellation.md`, no open questions.
 
-**Status**: 🟡 Refinement - plan open in `doc/design/task-cancellation.md`
+Built in four stages on branch `task-cancellation`, each committed there, merged
+into `main` once all four are done:
+1. 🟢 Undispatched tasks (ready, blocked, backoff) and scheduler-side settlement
+   of a running one: `cancel()`, `CancelledError`, `task.cancelling` /
+   `task.cancelled`, `stats.cancelled`, queue tombstones, transitions before
+   events in `_dispatchTask`, cancel wins in `_settleTask` (`fdf8cdf`). The new
+   `cancellation` suite has 16 tests; all 12 mutations of the stage are caught.
+2. 🔵 Cooperative cancel: `context.signal`, routing through the pool and wrapper
+   to the attempt, the three dispatched-but-not-running places (enqueue in
+   flight, `ThreadWrapper.taskQueue`, inline before `run()`), and rejecting a
+   forgotten threaded promise once its worker is dead, so a cancelling task
+   whose worker fails cannot hang.
+3. 🔵 Forced stop on threaded pools: `cancelGraceMs`, the grace timer, retiring
+   the worker without counting a restart, requeueing co-tenants.
+4. 🔵 `AGENTS.md` and `README.md`, docs tests, scale tests (50K cancels), browser
+   spec, `jsr:smoke`, benchmark against `main`, delete the plan.
+
+Until stage 4, the docs test "AGENTS.md Covers Every Export" fails on the
+branch: `CancelledError` and `CancelOptions` are exported but not documented.
+
+**Status**: 🟡 Implementation - stage 1 of 4 done on `task-cancellation`
 
 #### 🟢 A log channel from workers (#2, P1)
 Requested as `context.log(level, message, data?)` and `task.log`. Answered with
@@ -202,7 +222,7 @@ They exist today, independently of that work. All three plans depend on the
 first one, and cancellation (#1) also depends on the two marked as its
 prerequisites, so they ship first.
 
-#### 🟡 A requeued task can be settled by its abandoned run
+#### 🟢 A requeued task can be settled by its abandoned run
 When a worker fails, its other running tasks are requeued and dispatched again,
 but the old run keeps executing: an inline `run()` cannot be interrupted, and a
 threaded one keeps running through the 500 ms teardown handshake, because
@@ -239,7 +259,8 @@ Not done here, and moved to the plans that need it: rejecting a forgotten task's
 pending promise with an internal requeue error, so that a requeue no longer
 depends on the `task.requeue_required` event. Cancellation's forced stop needs
 that, and so does the shutdown-drain issue below; on its own it would add a
-second requeue path to the scheduler with nothing yet using it.
+second requeue path to the scheduler with nothing yet using it. It is now part
+of #1 stage 2.
 
 "One worker failure is handled twice" below is partly mitigated as a side
 effect: the second handling finds no running tasks left, so tasks are no longer
@@ -602,13 +623,35 @@ with the old immediate push restored, its retries started 31 and 16 ms apart.
 
 **Status**: 🟢 Completed - with #4
 
-#### 🔵 `scheduler.completed` never fires for a run with no successes
+#### 🟢 `scheduler.completed` never fires for a run with no successes
 `_checkCompletion` requires `stats.done > 0`, so a run in which every task
 fails, or (once #1 lands) every task is cancelled, never reports draining.
-Fixed as part of #1: the condition becomes "any task has reached a terminal
-state".
 
-**Status**: 🔵 Not Started - scheduled with #1
+**Outcome**: the condition is now "any task has reached a terminal state",
+`done + failed + cancelled > 0`. Tested by "scheduler.completed Without A
+Success" (cancellation suite); mutation check: restoring `done > 0` fails it.
+A behaviour change for the release notes: a run in which nothing succeeds now
+fires `scheduler.completed`.
+
+**Status**: 🟢 Completed - #1 stage 1 (`fdf8cdf`), on `task-cancellation` until #1 merges
+
+#### 🟢 A hung test stalled the whole run indefinitely
+No suite had a per-test timeout except error-handling (10 s, its own copy).
+A test awaiting a promise that never settles - which is what a mutation check
+of the cancellation suite produced - hung the run with no output naming the
+test, and would have hung CI until the job limit. The mutation script made it
+worse: it ran Deno through a shell, so its own timeout killed only the shell on
+Windows, and the run stalled for over an hour.
+
+**Outcome**: every suite runs its tests through `runTest` in `tests/harness.ts`,
+which fails a test still running after 60 s (the slowest test takes 11 s). The
+runner gained `--only <text>`, `--bail` and `--timeout <ms>`, so a mutation
+check runs the tests meant to catch it and stops at the first failure: the 12
+stage-1 cancellation mutations take 34 s in total. An `--only` that matches no
+test, and an unknown suite name, now fail the run instead of passing it with
+nothing run. Mutation scripts run Deno directly, never through a shell.
+
+**Status**: 🟢 Completed - `7cc93ca`, Deno 177/177 on that commit, Node 22, Chromium
 
 #### 🔵 `doc/design/pause-resume.md` is stale
 Written against an older architecture: `readyQueue`, a `dispatched` state,
