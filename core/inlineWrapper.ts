@@ -1,5 +1,13 @@
 import type { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, TaskWorkerContext } from "./workerInterface.ts";
 import { WorkerTerminationError, isWorkerTerminationError } from "./workerInterface.ts";
+import { WorkerMessageChannel } from "./messageChannel.ts";
+import { MessageStream } from "./messageChannel.ts";
+import type { ChannelEvent, MessageOptions, MessageSink } from "./messageChannel.ts";
+
+// Handed to an emit() that arrives once its run has ended or been abandoned, so
+// a stray emit has nowhere to land. Shared: a closed stream accepts nothing.
+const CLOSED_STREAM = new MessageStream();
+CLOSED_STREAM.closed = true;
 
 export class InlineWrapper extends EventTarget implements WorkerInstanceExtensions, WorkerInstanceState {
     runningTasks = 0;
@@ -19,6 +27,18 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     private terminationRequested = false;
     private terminationHandled = false;
 
+    // The same channel a threaded worker runs, so a pool switching between
+    // inline and threaded delivers the same events: same gate, cap, clone and
+    // batching. Delivery is deferred to a microtask, so a host listener never
+    // runs inside the worker's own emit() call.
+    private messages: WorkerMessageChannel;
+    /** Each task's stream, until its run has settled and been reported, or is abandoned. */
+    private messageStreams = new Map<string, MessageStream>();
+    private undelivered: ChannelEvent[] = [];
+    private deliveryScheduled = false;
+    /** Set by the pool. Receives each batch, already filtered. */
+    messageSink?: MessageSink;
+
     // WorkerInstanceState implementation
     state: 'initializing' | 'healthy' | 'busy' | 'failed' | 'terminated' = 'initializing';
     lastError?: { timestamp: number; message: string; metadata: any };
@@ -27,13 +47,53 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     tasksCompleted = 0;
     errorCount = 0;
     createdAt: number = Date.now();
-    constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}) {
+    constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}, messages?: MessageOptions) {
         super();
+        this.messages = new WorkerMessageChannel((events) => this._queueDelivery(events), messages);
         this.scriptUrl = scriptUrl;
         this.idleTimeout = idleTimeout;
         this.maxConcurrentTasks = maxConcurrentTasks;
         this.config = config;
         this.id = `inline-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    /** Open or close the message gate. Takes effect at once: the channel is in-process. */
+    setMessageGate(task: boolean, worker: boolean) {
+        this.messages.setGate(task, worker);
+    }
+
+    private _queueDelivery(events: ChannelEvent[]) {
+        for (const event of events) this.undelivered.push(event);
+        if (this.deliveryScheduled) return;
+        this.deliveryScheduled = true;
+        queueMicrotask(() => this._deliver());
+    }
+
+    /** Dispatch everything flushed so far. A task's events go only while its stream is live. */
+    private _deliver(retiring?: string) {
+        this.deliveryScheduled = false;
+        const events = this.undelivered;
+        this.undelivered = [];
+        this.messageSink?.(
+            events.filter(event => event.taskId === undefined || event.taskId === retiring || this.messageStreams.has(event.taskId)),
+            this.id,
+            'inline'
+        );
+    }
+
+    /**
+     * Flush and dispatch now, synchronously. Called before every event that
+     * ends something - a task's completed/failed, a setup or teardown outcome -
+     * so every event emitted before it arrives first. On a thread the port's
+     * FIFO order gives that for free; here the settle is synchronous, so it has
+     * to be done by hand.
+     */
+    //
+    // `retiring` names a task whose stream has just been removed from
+    // messageStreams: its events are still delivered, this once.
+    private _deliverNow(retiring?: string) {
+        this.messages.flush();
+        if (this.undelivered.length > 0) this._deliver(retiring);
     }
 
     canAcceptTask(): boolean {
@@ -52,7 +112,17 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     // The run itself cannot be stopped. Removing it from runningTaskIds is what
     // runTask checks before reporting anything, so whatever it does from here on
     // is discarded rather than attributed to the task's live attempt.
-    forgetTask(taskId: string): void {
+    //
+    // Its emitted events are discarded with it, unless `keepMessages`: a task
+    // failing itself through terminateWithError() is forgotten at once, but what
+    // it emitted before asking still belongs to its attempt and is delivered
+    // ahead of its task.failed.
+    forgetTask(taskId: string, keepMessages = false): void {
+        if (!keepMessages) {
+            const stream = this.messageStreams.get(taskId);
+            if (stream) this.messages.discard(stream);
+            this.messageStreams.delete(taskId);
+        }
         if (!this.runningTaskIds.delete(taskId)) return;
         this.runningTasks--;
         this.runningTaskData.delete(taskId);
@@ -75,7 +145,12 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // The calling task's outcome is decided now, and whatever its run
             // goes on to return is discarded
             const failing = taskId !== undefined && this.runningTaskIds.has(taskId) ? taskId : undefined;
-            if (failing !== undefined) this.forgetTask(failing);
+            if (failing !== undefined) {
+                // Its attempt ends here: nothing it emits from now on is delivered
+                const stream = this.messageStreams.get(failing);
+                if (stream) this.messages.close(stream);
+                this.forgetTask(failing, true);
+            }
 
             if (this.terminationRequested) return;
             this.terminationRequested = true;
@@ -88,6 +163,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // worker's own call - as on a thread, where this is a message
             queueMicrotask(() => {
                 if (failing !== undefined) {
+                    if (this.messageStreams.delete(failing)) this._deliverNow(failing);
                     this.dispatchEvent(new CustomEvent('task.failed', {
                         detail: {
                             taskId: failing, workerId: this.id, workerType: 'inline',
@@ -152,7 +228,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     private createBaseWorkerContext(): BaseWorkerContext {
         return {
             workerId: this.id,
-            terminateWithError: this.createTerminateWithError()
+            terminateWithError: this.createTerminateWithError(),
+            emit: (name, data) => this.messages.emitWorker(name, data)
         };
     }
 
@@ -216,6 +293,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 // its own: the outer initialization pair closed, the inner setup
                 // pair did not, and a consumer folding setup state was left
                 // holding a worker that never finished setting up.
+                this._deliverNow();
                 this.dispatchEvent(new CustomEvent('worker.setup.failed', {
                     detail: {
                         workerId: this.id,
@@ -229,6 +307,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 throw setupError;
             }
 
+            this._deliverNow();
             this.dispatchEvent(new CustomEvent('worker.setup.completed', {
                 detail: {
                     workerId: this.id,
@@ -275,6 +354,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 const cleanupStart = performance.now();
                 try {
                     await instance.teardown?.();
+                    this.messages.closeWorker();
+                    this._deliverNow();
                     this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
                         detail: {
                             workerId: this.id,
@@ -287,6 +368,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                     // Reported, never rethrown: the initialization failure below is
                     // the one the pool acts on, and masking it with a cleanup error
                     // would lose the reason the worker could not start.
+                    this.messages.closeWorker();
+                    this._deliverNow();
                     this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
                         detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now(), error: teardownError }
                     }));
@@ -359,6 +442,17 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             if (!this.runningTaskIds.has(taskId)) return undefined;
             fullExecutionStart = performance.now();
 
+            // Created on the first emit(), so a task that never emits costs
+            // nothing here: no allocation, no flush before it settles
+            let stream: MessageStream | undefined;
+            const streamFor = (): MessageStream => {
+                if (stream) return stream;
+                if (!this.runningTaskIds.has(taskId)) return CLOSED_STREAM;
+                stream = this.messages.openAttempt(taskId);
+                this.messageStreams.set(taskId, stream);
+                return stream;
+            };
+
             // Create TaskWorkerContext with both worker and task capabilities
             const context: TaskWorkerContext = {
                 // Worker-level context (inherited from BaseWorkerContext), except
@@ -392,10 +486,19 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                             timestamp: Date.now()
                         }
                     }));
-                }
+                },
+                emit: (name, data) => this.messages.emitTask(streamFor(), name, data)
             };
 
-            const result = await workerInstance.run(payload, context);
+            // The attempt's emits close when run() ends, either way, so a stray
+            // promise cannot add to a settled attempt
+            let result;
+            try {
+                result = await workerInstance.run(payload, context);
+            } finally {
+                if (stream) this.messages.close(stream);
+                else stream = CLOSED_STREAM;
+            }
 
             // Forgotten while running: the task was requeued off this worker, and
             // reporting this result would settle the attempt that replaced it
@@ -403,6 +506,9 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
 
             // Calculate full execution time including all coordination overhead
             const fullExecutionTime = performance.now() - fullExecutionStart;
+
+            // Everything it emitted goes first, then the stream is retired
+            if (this.messageStreams.delete(taskId)) this._deliverNow(taskId);
 
             // Emit task completed event with full execution timing
             this.dispatchEvent(new CustomEvent('task.completed', {
@@ -421,6 +527,9 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         } catch (error) {
             // Forgotten while running: as for a result above, nothing to report
             if (!this.runningTaskIds.has(taskId)) throw error;
+
+            // As for a result: its emitted events precede its task.failed
+            if (this.messageStreams.delete(taskId)) this._deliverNow(taskId);
 
             const fullExecutionTime = 0//performance.now() - fullExecutionStart;
             // Calculate execution time even for failed tasks
@@ -509,6 +618,9 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // worker-side wrapper has always got right via `teardown?.()`.
             await this.workerInstance.teardown?.();
 
+            // Nothing after teardown; what it emitted goes before its outcome
+            this.messages.closeWorker();
+            this._deliverNow();
             this.dispatchEvent(new CustomEvent('worker.teardown.completed', {
                 detail: {
                     workerId: this.id,
@@ -518,6 +630,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                 }
             }));
         } catch (teardownError) {
+            this.messages.closeWorker();
+            this._deliverNow();
             // Emit failure event but continue with cleanup
             this.dispatchEvent(new CustomEvent('worker.teardown.failed', {
                 detail: { workerId: this.id, workerType: 'inline', timestamp: Date.now(), error: teardownError }

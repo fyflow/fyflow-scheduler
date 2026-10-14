@@ -40,6 +40,7 @@ export default class RequeueWorker extends BaseWorker {
 
     if (payload.report) {
       context?.sendProgress(1, `from ${context.workerId}`);
+      context?.emit('log', { from: context.workerId });
       context?.spawnTask({
         id: `${context.taskId}-child-${context.workerId}`,
         workerType: payload.spawnWorkerType,

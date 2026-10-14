@@ -7,6 +7,7 @@ import type {
   ResourceUnblockReason
 } from './resourceEvents.ts';
 import { TaskQueue } from './taskQueue.ts';
+import type { TaskMessageDetail } from './workerInterface.ts';
 
 /**
  * Delimiter between a group id and a key in a blocked-queue id.
@@ -248,7 +249,7 @@ export class FyflowTask {
    * ```
    *
    * Emits: `task.running`, `task.retrying`, `task.completed`, `task.failed`,
-   * `task.progress`, `task.user_action`, `task.spawn_request`,
+   * `task.progress`, `task.message`, `task.user_action`, `task.spawn_request`,
    * `task.spawn_failed` and `scheduler.completed`.
    */
   export class FyflowScheduler extends EventTarget {
@@ -297,6 +298,12 @@ export class FyflowTask {
      */
     private resourceListeners = new Map<string, Set<unknown>>();
 
+    /**
+     * Subscribers to `task.message`, with the same Set semantics. While there
+     * are none, every pool is told so and its workers send nothing at all.
+     */
+    private messageListeners = new Set<unknown>();
+
     constructor(workerPools: any, groups: Record<string, any> = {}, options: FyflowSchedulerOptions = {}) {
       super();
       this.workerPools = workerPools;
@@ -322,6 +329,10 @@ export class FyflowTask {
           this.groups,
           (notice: any) => this._onResidentNotice(workerType, notice)
         );
+        // Injected rather than listened for, for the same reason: task.message
+        // fires here only, and a listener of ours would count as a subscriber
+        // and hold every worker's gate open
+        pool?._bindTaskMessages?.((detail: Omit<TaskMessageDetail, 'attemptNumber'>) => this._onTaskMessage(detail));
       }
 
       this._setupWorkerPoolListeners();
@@ -1367,6 +1378,13 @@ export class FyflowTask {
       options?: AddEventListenerOptions | boolean
     ): void {
       super.addEventListener(type, callback, options);
+      if (type === 'task.message') {
+        if (!this.messageListeners.has(callback)) {
+          this.messageListeners.add(callback);
+          if (this.messageListeners.size === 1) this._setMessageGate(true);
+        }
+        return;
+      }
       if (!type.startsWith('resource.')) return;
 
       let subscribers = this.resourceListeners.get(type);
@@ -1380,12 +1398,37 @@ export class FyflowTask {
       options?: EventListenerOptions | boolean
     ): void {
       super.removeEventListener(type, callback, options);
+      if (type === 'task.message') {
+        if (this.messageListeners.delete(callback) && this.messageListeners.size === 0) {
+          this._setMessageGate(false);
+        }
+        return;
+      }
       if (!type.startsWith('resource.')) return;
 
       const subscribers = this.resourceListeners.get(type);
       if (!subscribers) return;
       subscribers.delete(callback);
       if (subscribers.size === 0) this.resourceListeners.delete(type);
+    }
+
+    private _setMessageGate(open: boolean) {
+      for (const pool of Object.values(this.workerPools) as any[]) pool?._setTaskMessageGate?.(open);
+    }
+
+    /**
+     * A task's emitted event, from its pool. The pool has already dropped events
+     * from runs it abandoned; the state check covers anything that slips past
+     * a settle. `attemptNumber` is safe to read here: an attempt's events all
+     * arrive before it settles, and the number changes only at the next dispatch.
+     */
+    private _onTaskMessage(detail: Omit<TaskMessageDetail, 'attemptNumber'>) {
+      const task = this.tasks.get(detail.taskId);
+      if (!task || task.state !== 'running') return;
+      // The pool built this object for us alone, so it is completed in place
+      // rather than copied
+      (detail as TaskMessageDetail).attemptNumber = task.attemptNumber;
+      this.dispatchEvent(new CustomEvent('task.message', { detail }));
     }
 
     /** Whether building a resource event is worth the allocation. */

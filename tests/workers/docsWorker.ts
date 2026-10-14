@@ -26,6 +26,13 @@ export default class DocsWorker extends BaseWorker {
       await new Promise(resolve => setTimeout(resolve, payload.awaitMs));
     }
 
+    // AGENTS.md section 4: emit() is task.message on the scheduler
+    if (payload.log) {
+      for (let i = 0; i < payload.log; i++) {
+        context?.emit('log', { level: 'info', message: `line ${i}` });
+      }
+    }
+
     if (payload.fail) {
       throw new Error('DocsWorker was asked to fail');
     }

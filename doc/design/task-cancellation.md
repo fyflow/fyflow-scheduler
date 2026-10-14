@@ -20,8 +20,8 @@ on three known issues in `TODO_CHECKLIST.md`:
   state and queue transition completes before an event is dispatched, which this
   plan extends to three more sites.
 
-`doc/design/task-messages.md` describes what happens to a cancelled attempt's
-messages.
+Task messages (#2) have shipped; `AGENTS.md` §6 is their contract, and
+"Interplay" below says what cancelling means for them.
 
 ## The request
 
@@ -552,11 +552,14 @@ fires for an all-failed run, where it did not before. Release notes.
 
 ## Interplay with the other pass 1 work
 
-- **Messages (#2)**: a cancelling attempt's messages keep flowing and are
-  delivered before `task.cancelled`, because the worker flushes before posting its
-  result or error. A forced stop loses whatever is still buffered; the messages
-  plan lists it among the unavoidable losses. Places 1–3 never ran, so they have
-  no messages.
+- **Messages (#2, shipped)**: a cancelling attempt's messages keep flowing and
+  must arrive before `task.cancelled`. Threaded, that holds already: the worker
+  flushes before posting its result or error. Inline, `InlineWrapper` delivers
+  pending messages synchronously (`_deliverNow()`) before dispatching
+  `task.completed`/`task.failed`, so the settle that cancellation adds must come
+  after that, not before it. A forced stop loses whatever is still buffered,
+  like a crash (`AGENTS.md` §6, "Lost only with the worker"); add it to that
+  list. Places 1–3 never ran, so they have no messages.
 - **Attempts (#4)**: a cancelled task never emits `task.retrying`. Cancelling
   during a backoff is place 3. `attemptNumber` keeps the number of the attempt
   that was cancelled.

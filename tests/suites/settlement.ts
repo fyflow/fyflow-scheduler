@@ -996,6 +996,12 @@ class SettlementTestSuite {
     scheduler.addEventListener('task.progress', (e: any) => {
       if (e.detail.id === 'tenant') progress.push(e.detail.message);
     });
+    // Emitted events go the same way as progress. Subscribing also opens the
+    // message gate, which is closed while nobody listens.
+    const messages: string[] = [];
+    scheduler.addEventListener('task.message', (e: any) => {
+      if (e.detail.taskId === 'tenant') messages.push(e.detail.data?.from);
+    });
     // A requeue is not an attempt: both runs report the same number
     const attemptNumbers: number[] = [];
     scheduler.addEventListener('task.running', (e: any) => {
@@ -1055,7 +1061,7 @@ class SettlementTestSuite {
       );
     }
 
-    return { scheduler, first, second, settled, outcomes, progress, attemptNumbers };
+    return { scheduler, first, second, settled, outcomes, progress, attemptNumbers, messages };
   }
 
   private async testRequeueAbandonedResultIgnored(): Promise<void> {
@@ -1106,16 +1112,20 @@ class SettlementTestSuite {
     }
   }
 
-  // Progress and spawns sent by the abandoned run after the re-dispatch belong
-  // to no live attempt and must be dropped, or the live attempt reports another
-  // run's progress and the task spawns its children twice.
+  // Progress, emitted events and spawns sent by the abandoned run after the
+  // re-dispatch belong to no live attempt and must be dropped, or the live
+  // attempt reports another run's progress and the task spawns its children
+  // twice.
   private async testRequeueAbandonedSideEffectsDropped(): Promise<void> {
     for (const inline of [true, false]) {
       const kind = inline ? 'inline' : 'threaded';
-      const { scheduler, first, second, progress } = await this.requeueAbandonedRun(inline, { report: true });
+      const { scheduler, first, second, progress, messages } = await this.requeueAbandonedRun(inline, { report: true });
 
       if (progress.some(m => m === `from ${first.workerId}`)) {
         throw new Error(`${kind}: progress from the abandoned run was delivered: ${JSON.stringify(progress)}`);
+      }
+      if (messages.includes(first.workerId) || !messages.includes(second.workerId)) {
+        throw new Error(`${kind}: expected the live attempt's emitted events only, got ${JSON.stringify(messages)}`);
       }
       if (scheduler.tasks.has(`tenant-child-${first.workerId}`)) {
         throw new Error(`${kind}: the abandoned run's spawn was added`);

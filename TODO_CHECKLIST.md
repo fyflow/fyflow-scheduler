@@ -69,7 +69,7 @@ issues below. Includes the `scheduler.completed` fix below. Plan:
 
 **Status**: 🟡 Refinement - plan open in `doc/design/task-cancellation.md`
 
-#### 🟡 A log channel from workers (#2, P1)
+#### 🟢 A log channel from workers (#2, P1)
 Requested as `context.log(level, message, data?)` and `task.log`. Answered with
 a general worker-to-host event channel instead, with logging as one use of it,
 so the scheduler does not define log levels or formats: `context.emit()` to
@@ -81,13 +81,78 @@ used by both worker wrappers and `InlineWrapper` (it needs its own line in the
 questions. Its prerequisites, #4's `task.attemptNumber` and the requeue known
 issue below, have shipped. Defaults decided from a prototype benchmark:
 `flushIntervalMs: 20`, `maxBuffered: 100`, i.e. 5K events/s per buffer, at which
-16 workers flooding left the main thread at its idle floor; measurements in the
-plan.
+16 workers flooding left the main thread at its idle floor in the prototype;
+see the outcome below.
 
 `node:diagnostics_channel` was considered and rejected: it is per-thread, so it
 cannot carry worker output to the main thread, and the browser does not have it.
 
-**Status**: 🟡 Refinement complete - ready to implement, plan in `doc/design/task-messages.md`
+**Outcome**: built as planned; the plan is deleted and its contract is in
+`AGENTS.md` §4 (`emit` on both contexts), §5 (exports, the `messages` option),
+§6 (`task.message`, `worker.message` and their guarantees) and §10 (a log
+recipe). `core/messageChannel.ts` holds the gate, buffers, cap, clone and flush
+once, for both worker wrappers and `InlineWrapper`; 18 files now ship.
+
+Additions to the plan, found while building it:
+- **A stream ending over the cap lost its `dropped` count**, since nothing
+  later carried it. Its last discarded emit is now delivered as a marker, with
+  `data` undefined and `error: 'Discarded at the message cap'`, so delivered
+  plus `dropped` always equals emits made while someone listened.
+- **Closing an attempt's context is not redundant with the host's filter.** The
+  host drops events for a task no longer running on that worker, but a retry on
+  the same worker runs the same task id again, and only the closed context keeps
+  attempt 1's stray emit out of attempt 2. Found by a mutation that the planned
+  "nothing after settle" test did not catch; it has its own test now.
+- **Inline delivery is deferred to a microtask** and drained synchronously
+  (`_deliverNow()`) before every settle and lifecycle event, so a host listener
+  never runs inside the worker's `emit()` call, yet ordering still holds.
+- `jsr:smoke` caught parameter properties in the new module, which Node's type
+  stripping rejects and no typechecker here flags.
+
+Tests: a new `messages` suite (19), each test on both pool types unless the
+behaviour is thread-specific; the settlement requeue harness now also asserts
+an abandoned run's emits are dropped; a docs test for the log recipe; a
+Playwright spec on three engines asserting inline and threaded deliver the same
+stream. Mutation checks, each failing a test: no flush before `result`
+(threaded); no delivery before an inline `task.failed`; the context never
+closing; no time check in `emit()`; the gate forced open; cloning at the flush
+instead of `emit()`; no trailing-drop marker; the pool also dispatching
+`task.message`; gated emits not using a `seq`; inline delivering synchronously.
+`jsr:smoke` fails without the allowlist line.
+
+Defaults (from the plan's prototype benchmark, Deno 2.9.6, Windows): 16
+threaded workers flooding, worst main-thread stall over three runs, and latency
+at 16 x 1,000 events/s; the idle floor was 17 ms.
+
+| Interval / cap | Per buffer | 16 workers | Latency p50 / p99 |
+|---|---:|---:|---:|
+| 10 ms / 100 | 10K/s | 164 ms | 16 / 17 ms |
+| 20 ms / 200 | 10K/s | 74 ms | 18 / 34 ms |
+| **20 ms / 100** | **5K/s** | **16 ms** | **21 / 36 ms** |
+| 50 ms / 250 | 5K/s | 20 ms | 39 / 69 ms |
+
+Caps of 1,000 or more stalled it for seconds: a delivered batch is one
+uninterrupted main-thread task. Rerun against the real implementation, 16
+workers each emitting over 100,000/s in a loop that never yields: ~70,000
+events/s delivered to a listener formatting a log line, every emit accounted for
+(delivered plus `dropped`), worst stall 16-47 ms against 16 ms idle - about the
+host's limit. A first version dispatched each message twice on the way (an
+internal event per message, then the scheduler's); wrappers now hand the pool a
+batch through a callback, so each message is one object and one dispatch.
+
+Benchmark: a first `benchmark:quick` comparison showed 50K inline -8.5% with
+every run below the base's, because every inline task allocated a message
+stream and flushed before settling even when it never emitted. Streams are now
+created on the first `emit()`, and an empty flush returns before reading the
+clock. Six alternated rounds of the inline volume scenarios after that: 1K
++0.4%, 10K -5.1%, 50K -3.6%, 100K +3.9%, each within the other's spread.
+Threaded scenarios -2.4% to +2.4% in the quick suite, within spread.
+
+Release notes: `emit` is a new required member of `BaseWorkerContext` and
+`TaskWorkerContext`, which is source-breaking for code that builds a context
+object literal (typically to unit-test a worker's `run()`).
+
+**Status**: 🟢 Completed - Deno and Node 22 177/177, browser 78/78, `jsr:smoke` (Node 24)
 
 #### 🟢 Start a task with attempts already spent (#4, P2)
 A config field so a resumed task does not get a fresh retry budget, and an event

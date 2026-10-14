@@ -122,6 +122,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Rate Limit Group', () => this.docRateLimitGroup()));
     this.results.push(await this.runTest('Doc: Resource Metrics And Stats', () => this.docResourceMonitoring()));
     this.results.push(await this.runTest('Doc: Progress Reporting', () => this.docProgress()));
+    this.results.push(await this.runTest('Doc: A Log Channel With emit()', () => this.docLogChannel()));
     this.results.push(await this.runTest('Doc: Spawning And Descendants', () => this.docSpawning()));
     this.results.push(await this.runTest('Doc: Retry Policy', () => this.docRetry()));
     this.results.push(await this.runTest('Doc: Resuming Keeps The Retry Budget', () => this.docResumeRetryBudget()));
@@ -460,6 +461,41 @@ class DocsTestSuite {
     await (after.addTask(spent, { createPromise: true }) as Promise<any>).catch(() => {});
     if (spent.attemptNumber !== 4 || spent.attempts !== 3) {
       throw new Error(`A spent budget: attempt ${spent.attemptNumber}, attempts ${spent.attempts}`);
+    }
+  }
+
+  // RECIPE: AGENTS.md section 10 - a log channel from workers, on both pool
+  // types, with the section 6 claims it relies on
+  private async docLogChannel(): Promise<void> {
+    for (const inline of [true, false]) {
+      const scheduler = this.makeScheduler({ inline, maxThreads: 1, maxConcurrentTasks: 1 });
+      const pool = scheduler.workerPools.DocsWorker;
+      const logs: Array<{ taskId: string; attemptNumber: number; seq: number; message: string }> = [];
+      const appendLog = (taskId: string, line: any) => logs.push({ taskId, ...line });
+
+      // As published: subscribe before adding tasks
+      scheduler.addEventListener('task.message', (e: any) => {
+        const { taskId, attemptNumber, name, data, seq, dropped } = e.detail;
+        if (name !== 'log') return;
+        if (dropped) appendLog(taskId, { level: 'warn', message: `${dropped} lines dropped` });
+        appendLog(taskId, { ...data, attemptNumber, seq });
+      });
+      let completeAtSettle = -1;
+      scheduler.addEventListener('task.failed', () => { completeAtSettle = logs.length; });
+      let onPool = 0;
+      pool.addEventListener('task.message', () => { onPool++; });
+
+      await (scheduler.addTask(new FyflowTask({
+        id: 'doc-log', workerType: 'DocsWorker', payload: { id: 'doc-log', log: 3, fail: true }
+      }), { createPromise: true }) as Promise<any>).catch(() => {});
+
+      const kind = inline ? 'inline' : 'threaded';
+      const lines = logs.map(l => `${l.attemptNumber}.${l.seq} ${l.message}`).join(', ');
+      if (lines !== '1.0 line 0, 1.1 line 1, 1.2 line 2') throw new Error(`${kind}: log was ${lines}`);
+      // "Each attempt's log is complete by the time its task.failed fires"
+      if (completeAtSettle !== 3) throw new Error(`${kind}: ${completeAtSettle} of 3 lines before task.failed`);
+      // "Scheduler only"
+      if (onPool !== 0) throw new Error(`${kind}: task.message also fired on the pool`);
     }
   }
 

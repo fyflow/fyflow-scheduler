@@ -72,6 +72,7 @@ is resolved - it differs between Deno, Node and the browser.
 - **Cross-Platform**: Node.js, Browser, and Deno support
 - **Worker Pools**: Thread-based and inline execution modes
 - **Progress Reporting**: Real-time task progress and event monitoring
+- **Worker Messages**: Workers `emit()` named events - logs, metrics, partial results - to the host, batched, bounded and sent only while someone listens
 - **Zero Dependencies**: Self-contained with no external requirements
 - **In-Memory**: Fast coordination with extensible persistence APIs
 
@@ -370,9 +371,9 @@ worker that cannot be built and one that keeps dying.
 
 ### Events
 
-On the **scheduler**: `task.running`, `task.completed`, `task.failed`,
-`task.progress`, `task.user_action`, `task.spawn_request`, `task.spawn_failed`,
-`scheduler.completed`, `resource.acquired`, `resource.released`,
+On the **scheduler**: `task.running`, `task.retrying`, `task.completed`,
+`task.failed`, `task.progress`, `task.message`, `task.user_action`,
+`task.spawn_request`, `task.spawn_failed`, `scheduler.completed`, `resource.acquired`, `resource.released`,
 `resource.blocked`, `resource.unblocked`. Every one carries a `timestamp`.
 
 The four `resource.*` events let a resource view be a fold of a stream rather
@@ -384,17 +385,17 @@ conservation invariants worth folding against.
 
 On a **WorkerManager**: `task.started`, `task.completed`, `task.failed`,
 `task.progress`, `task.spawn_request`, `task.requeue_required`, `worker.failed`,
-`worker.self_terminated`, `worker.restart_limit_exceeded`, plus the worker
-lifecycle events `worker.initialization.started|completed|failed`,
+`worker.self_terminated`, `worker.restart_limit_exceeded`, `worker.message`,
+plus the worker lifecycle events `worker.initialization.started|completed|failed`,
 `worker.setup.started|completed` and `worker.teardown.started|completed|failed`.
 
 > An event `detail` is a **live object, not a snapshot**. For `task.running`,
-> `task.completed`, `task.failed` and `task.user_action` it *is* the
+> `task.retrying`, `task.completed`, `task.failed` and `task.user_action` it *is* the
 > `FyflowTask` the scheduler keeps mutating, so `arr.push(e.detail)` gives you
 > entries that all read the terminal state later. Listeners run synchronously -
 > project the fields you need inside the listener instead. `task.progress`,
-> `scheduler.completed` and the `resource.*` events are unaffected; their
-> details are copies.
+> `task.message`, `worker.message`, `scheduler.completed` and the `resource.*`
+> events are unaffected; their details are copies.
 
 Lifecycle events carry `{ workerId, workerType, timestamp }`, plus `duration` on
 `*.completed` and `error` on `*.failed`. Inline and threaded pools emit the same

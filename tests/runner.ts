@@ -82,6 +82,9 @@ class TestRunner {
       // Run resource event tests
       await this.runSuite('Resource Events', `./suites/resource-events${ext}`);
 
+      // Run worker -> host message tests
+      await this.runSuite('Worker Messages', `./suites/messages${ext}`);
+
       // Run the executable documentation examples
       await this.runSuite('Documentation Examples', `./suites/docs${ext}`);
 
@@ -107,6 +110,7 @@ class TestRunner {
       'resident-groups': `./suites/resident-groups${ext}`,
       'events': `./suites/resource-events${ext}`,
       'resource-events': `./suites/resource-events${ext}`,
+      'messages': `./suites/messages${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
 

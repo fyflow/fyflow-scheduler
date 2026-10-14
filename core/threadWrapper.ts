@@ -4,6 +4,7 @@
 import getWorkerUrl from "./workerWrapperUrl.ts";
 import type { WorkerInstanceExtensions, WorkerInstanceState } from "./workerInterface.ts";
 import { WorkerTerminationError } from "./workerInterface.ts";
+import type { ChannelEvent, MessageOptions, MessageSink } from "./messageChannel.ts";
 
 // How long terminate() waits for the worker to acknowledge teardown before
 // giving up on it. A module constant rather than a field or an option:
@@ -49,8 +50,18 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     // more than once must not report its failure more than once
     private terminationHandled = false;
 
+    // Whether anyone listens to task.message / worker.message, as the pool last
+    // said. Sent with init and on every change; the worker sends nothing while
+    // a flag is off.
+    private messageGate = { task: false, worker: false };
+    private messageOptions?: MessageOptions;
+    /** Batches of emitted events received. Diagnostic: the gate test counts them. */
+    messageBatches = 0;
+    /** Set by the pool. Receives each batch, already filtered. */
+    messageSink?: MessageSink;
+
     //DENO SPECIFIC USE OF WORKER, node uses worker_threads
-    constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}) {
+    constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}, messages?: MessageOptions) {
       super();
       //ideally we shim this
       this.originalScriptUrl = (scriptUrl || "").toString();
@@ -58,9 +69,19 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
       this.idleTimeout = idleTimeout;
       this.maxConcurrentTasks = maxConcurrentTasks;
       this.config = config;
+      this.messageOptions = messages;
       this.id = `thread-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
 
+    }
+
+    /**
+     * Open or close the message gate. The full state goes every time, so the
+     * message is idempotent and its order relative to init does not matter.
+     */
+    setMessageGate(task: boolean, worker: boolean) {
+      this.messageGate = { task, worker };
+      this.worker?.postMessage({ action: 'gate', gate: this.messageGate });
     }
 
     canAcceptTask(): boolean {
@@ -310,6 +331,18 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
             }
             return;
 
+          // Emitted events, batched by the worker. A task's are dropped once the
+          // task is no longer running here - a requeued run keeps executing and
+          // emitting, and its stream belongs to no live attempt.
+          case 'messages':
+            this.messageBatches++;
+            this.messageSink?.(
+              (data as ChannelEvent[]).filter(event => event.taskId === undefined || this.callbacks.has(event.taskId)),
+              this.id,
+              'thread'
+            );
+            return;
+
           case 'spawn_task':
             if (taskId && this.callbacks.has(taskId)) {
               this.dispatchEvent(new CustomEvent('task.spawn_request', {
@@ -502,7 +535,9 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
           action: 'init',
           config: this.config,
           workerUrl: absoluteWorkerUrl,
-          workerId: this.id
+          workerId: this.id,
+          gate: this.messageGate,
+          messages: this.messageOptions
         });
       });
     }

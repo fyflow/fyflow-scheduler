@@ -97,7 +97,7 @@ cheaper pools overtake it.
 # Deno
 deno task check          # type check (includes scripts/)
 deno task test           # all suites
-deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events
+deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages
 deno task examples       # run every example on Deno, then the bundled ones on Node
 deno task jsr:smoke      # stage only the publishable files and run a real worker against them
 deno lint .
@@ -115,7 +115,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Seven suites, 157 tests, all in the default `deno task test` run:
+Eight suites, 177 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -125,7 +125,8 @@ Seven suites, 157 tests, all in the default `deno task test` run:
 | settlement | 33 | exactly-once settlement, counter cardinality, requeue, self-termination, attempts and backoff |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 25 | `resource.*` events, gauges, admission queue |
-| docs | 36 | **executes every snippet in README.md and AGENTS.md** |
+| messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
+| docs | 37 | **executes every snippet in README.md and AGENTS.md** |
 
 `deno task test:scripts` is separate and not included in `deno task test` — it
 unit-tests `scripts/publishOutput.ts`.
@@ -189,7 +190,7 @@ no build step, but only if it is erasable. `AGENTS.md` §3 documents the
 conditions and the docs suite tests them.
 
 **`publish.exclude` in `deno.json` is an allowlist** (`**` plus `!` exceptions),
-so a new published module must be added explicitly. It currently ships 17 files.
+so a new published module must be added explicitly. It currently ships 18 files.
 
 **The package must have no dependencies.** `scripts/` uses `@std/path` and is
 kept out of the package by the allowlist alone — Deno has no devDependencies — so

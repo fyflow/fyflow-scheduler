@@ -47,7 +47,8 @@ export interface WorkerConfig {
  */
 export interface WorkerMessage {
     type: 'init' | 'teardown' | 'result' | 'error' | 'progress' | 'spawn_task'
-        | 'setup_started' | 'setup_completed' | 'setup_failed' | 'teardown_started';
+        | 'setup_started' | 'setup_completed' | 'setup_failed' | 'teardown_started'
+        | 'messages';
     taskId?: string; // Only for task-related messages
     data?: any; // Message-specific payload
     timestamp?: number;
@@ -90,6 +91,18 @@ export interface BaseWorkerContext {
      * instead, and only the others are requeued.
      */
     terminateWithError: (error: Error, metadata?: { canRestart?: boolean; restartDelay?: number }) => void;
+    /**
+     * Send an event to the host: `worker.message` on the pool, attributed to
+     * this worker rather than a task - for example model-loading progress from
+     * `setup()`. Called through a task's context it is `task.message` instead.
+     *
+     * Fire-and-forget: returns at once, never throws, and delivers
+     * asynchronously. `data` is copied with `structuredClone` at the call, so
+     * changing it afterwards has no effect; data that cannot be copied arrives
+     * as an event with `error` set and no `data`. Nothing is sent while nobody
+     * listens, and a pool's `messages` option bounds how much can be.
+     */
+    emit: (name: string, data?: unknown) => void;
 }
 
 /**
@@ -113,6 +126,56 @@ export interface TaskWorkerContext extends BaseWorkerContext {
      * `task.spawn_failed` and fails only that spawn.
      */
     spawnTask: (config: SpawnTaskConfig) => void;
+    /**
+     * Send an event about this attempt to the host: `task.message` on the
+     * scheduler. Every event an attempt emits arrives before its
+     * `task.completed`, `task.failed` or `task.retrying`, and nothing emitted
+     * after it settles is delivered. Otherwise as {@link BaseWorkerContext.emit}.
+     */
+    emit: (name: string, data?: unknown) => void;
+}
+
+/**
+ * Detail of `task.message`, which fires on the scheduler only. A fresh object
+ * per event, safe to keep.
+ */
+export interface TaskMessageDetail {
+    taskId: string;
+    workerId: string;
+    /** The attempt that emitted it - `task.attemptNumber`, 1-based. */
+    attemptNumber: number;
+    name: string;
+    /** A copy taken at `emit()`. Undefined when `error` is set. */
+    data: unknown;
+    /**
+     * Index of the `emit()` call within its attempt, from 0. Calls made while
+     * nobody listened use a number too, so a gap is either that or `dropped`.
+     */
+    seq: number;
+    /** `Date.now()` at `emit()`, in the worker. */
+    timestamp: number;
+    /** Events discarded at the pool's `messages.maxBuffered` cap immediately before this one. */
+    dropped?: number;
+    /**
+     * Set, with `data` undefined, when `data` could not be cloned - or, as
+     * `'Discarded at the message cap'`, on the last discarded event of an
+     * attempt that ended over the cap, so its `dropped` count is not lost.
+     */
+    error?: string;
+}
+
+/** Detail of `worker.message`, on the `WorkerManager`. A fresh object per event. */
+export interface WorkerMessageDetail {
+    workerId: string;
+    /** `'inline'` or `'thread'`, as on every other `worker.*` event. */
+    workerType: 'inline' | 'thread';
+    name: string;
+    data: unknown;
+    /** Per worker instance, from 0. */
+    seq: number;
+    timestamp: number;
+    dropped?: number;
+    error?: string;
 }
 
 // Legacy alias for backwards compatibility

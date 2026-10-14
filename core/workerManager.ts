@@ -1,6 +1,8 @@
 import { ThreadWrapper } from "./threadWrapper.ts";
 import { InlineWrapper } from "./inlineWrapper.ts";
-import type { WorkerStatus } from "./workerInterface.ts";
+import type { TaskMessageDetail, WorkerStatus } from "./workerInterface.ts";
+import { resolveMessageOptions } from "./messageChannel.ts";
+import type { ChannelEvent, MessageOptions } from "./messageChannel.ts";
 
 type WorkerInstance = ThreadWrapper | InlineWrapper;
 
@@ -23,6 +25,13 @@ export type ResidentResourceNotice =
 
 /** Injected by the scheduler at {@link WorkerManager._bindResidentGroups}. */
 export type ResidentResourceNotifier = (notice: ResidentResourceNotice) => void;
+
+/**
+ * A task's emitted event, handed to the scheduler rather than dispatched here:
+ * `task.message` is scheduler-only, so a consumer listening to both cannot
+ * receive it twice. `attemptNumber` is added by the scheduler.
+ */
+export type TaskMessageNotifier = (detail: Omit<TaskMessageDetail, 'attemptNumber'>) => void;
 
 export interface WorkerManagerOptions {
   /**
@@ -97,6 +106,24 @@ export interface WorkerManagerOptions {
   requeueFailedTasks?: boolean;
   /** Restarts allowed before the pool gives up and emits `worker.restart_limit_exceeded`. Default 3. */
   maxWorkerRestarts?: number;
+  /**
+   * Bounds on what each worker can send with `emit()`. Default
+   * `{ flushIntervalMs: 20, maxBuffered: 100 }`: events are batched for up to
+   * 20 ms, and each buffer - one per running attempt, one for the worker -
+   * holds 100 between flushes, so at most 5,000 events/s each. Emits over the
+   * cap are discarded and counted in the next event's `dropped`.
+   *
+   * Measured at the defaults: 16 threaded workers emitting in tight loops
+   * delivered ~70,000 events/s with the main thread stalling at most 16-47 ms
+   * (16 ms idle) - about its limit. More emitting workers, or a slower
+   * listener, will saturate it. Raise `maxBuffered` for a worker that
+   * emits large bursts; each delivered batch is one uninterrupted stretch of
+   * main-thread work, so keep it in the hundreds.
+   *
+   * @throws RangeError at construction for a non-positive interval or a cap
+   *   that is not a positive integer.
+   */
+  messages?: MessageOptions;
 }
 
 /**
@@ -134,6 +161,15 @@ export class WorkerManager extends EventTarget {
   groups: string[];
   requeueFailedTasks: boolean;
   maxWorkerRestarts: number;
+  /** Resolved `messages` option, passed to every worker this pool creates. */
+  readonly messages: Required<MessageOptions>;
+
+  // Message gate. task.message is the scheduler's to open, worker.message this
+  // pool's: each flag is on while that event has a listener. Held here and
+  // applied to every wrapper, existing ones on change and new ones at creation.
+  private taskMessageGate = false;
+  private workerMessageListeners = new Set<unknown>();
+  private taskMessageNotify?: TaskMessageNotifier;
 
   // Track restart count for entire pool (simpler and more logical)
   private poolRestartCount = 0;
@@ -314,6 +350,7 @@ export class WorkerManager extends EventTarget {
     this.residentGroups = WorkerManager._normalizeResidentGroups(options.residentGroups);
     this.requeueFailedTasks = options.requeueFailedTasks ?? true; // Default to requeue as specified
     this.maxWorkerRestarts = options.maxWorkerRestarts ?? 3; // Default: 3 restarts per worker
+    this.messages = resolveMessageOptions(options.messages);
 
     // Set up worker failure handling
     this._setupWorkerFailureHandling();
@@ -330,9 +367,7 @@ export class WorkerManager extends EventTarget {
     // Note: initializingThreads tracks threads being created to prevent race conditions
     if (!targetThread && (this.threads.length + this.initializingThreads.size) < this.maxThreads
         && this._acquireResident()) {
-      const newThread = this.inline
-        ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config)
-        : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config);
+      const newThread = this._newWorker(this.config);
 
       this._bindResidentHolder(newThread.id);
 
@@ -378,13 +413,64 @@ export class WorkerManager extends EventTarget {
     return targetThread.runTask(taskId, payload);
   }
 
+  /** Every worker is created here, so each one gets the message options and the current gate. */
+  private _newWorker(config: any): WorkerInstance {
+    const worker = this.inline
+      ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config, this.messages)
+      : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config, this.messages);
+    worker.setMessageGate(this.taskMessageGate, this.workerMessageListeners.size > 0);
+    worker.messageSink = (events, workerId, workerType) => this._onMessages(events, workerId, workerType);
+    return worker;
+  }
+
+  /**
+   * A delivered batch. A task's events go to the scheduler and never fire here,
+   * so a consumer listening to both cannot count them twice; the worker's own
+   * fire as `worker.message`. Each detail is built once, for the consumer.
+   */
+  private _onMessages(events: ChannelEvent[], workerId: string, workerType: 'inline' | 'thread') {
+    for (const { taskId, name, data, seq, timestamp, dropped, error } of events) {
+      if (taskId !== undefined) {
+        // attemptNumber is the scheduler's to fill in; present from the start
+        // so the object keeps one shape and its documented field order
+        const detail: any = { taskId, workerId, attemptNumber: 0, name, data, seq, timestamp };
+        if (dropped !== undefined) detail.dropped = dropped;
+        if (error !== undefined) detail.error = error;
+        this.taskMessageNotify?.(detail);
+      } else {
+        const detail: any = { workerId, workerType, name, data, seq, timestamp };
+        if (dropped !== undefined) detail.dropped = dropped;
+        if (error !== undefined) detail.error = error;
+        this.dispatchEvent(new CustomEvent('worker.message', { detail }));
+      }
+    }
+  }
+
+  private _applyMessageGate() {
+    const worker = this.workerMessageListeners.size > 0;
+    for (const thread of this.threads) thread.setMessageGate(this.taskMessageGate, worker);
+  }
+
+  /**
+   * Called by the scheduler: where this pool's `task.message` events go. The
+   * pool never dispatches them itself.
+   */
+  _bindTaskMessages(notify: TaskMessageNotifier) {
+    this.taskMessageNotify = notify;
+  }
+
+  /** Called by the scheduler when its `task.message` listeners go from none to some, or back. */
+  _setTaskMessageGate(open: boolean) {
+    if (this.taskMessageGate === open) return;
+    this.taskMessageGate = open;
+    this._applyMessageGate();
+  }
+
   private _createPredictiveThread(): WorkerInstance | null {
     // A replacement worker still has to fit in the resident groups.
     if (!this._acquireResident()) return null;
 
-    const thread = this.inline
-      ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config)
-      : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, this.config);
+    const thread = this._newWorker(this.config);
 
     this._bindResidentHolder(thread.id);
 
@@ -402,6 +488,19 @@ export class WorkerManager extends EventTarget {
   override addEventListener(event: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void {
     super.addEventListener(event, listener, options);
     this._trackListener(this, event, listener as Function);
+    // A Set, as the scheduler keeps for resource.*: removing a listener that was
+    // never added must not close the gate on one that is still there
+    if (event === 'worker.message' && !this.workerMessageListeners.has(listener)) {
+      this.workerMessageListeners.add(listener);
+      if (this.workerMessageListeners.size === 1) this._applyMessageGate();
+    }
+  }
+
+  override removeEventListener(event: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void {
+    super.removeEventListener(event, listener, options);
+    if (event === 'worker.message' && this.workerMessageListeners.delete(listener)) {
+      if (this.workerMessageListeners.size === 0) this._applyMessageGate();
+    }
   }
 
   // Helper to track listeners for cleanup
@@ -667,9 +766,7 @@ export class WorkerManager extends EventTarget {
 
     // Create new worker with updated config
     const config = { ...this.config, ...(newConfig || {}) };
-    const newWorker = this.inline
-      ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config)
-      : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config);
+    const newWorker = this._newWorker(config);
 
     this._setupWorkerEventListeners(newWorker);
     this.threads.push(newWorker);

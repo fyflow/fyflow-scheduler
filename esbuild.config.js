@@ -131,6 +131,7 @@ if (buildType === 'development') {
       "tests/suites/docs.ts",
       "tests/suites/resident-groups.ts",
       "tests/suites/resource-events.ts",
+      "tests/suites/messages.ts",
       "tests/performance/contention-scaling.ts",
       "benchmark/runBenchmarks.ts"
     ],
@@ -156,6 +157,7 @@ if (buildType === 'development') {
       "tests/workers/testThreadWorker.ts",
       "tests/workers/crashingWorker.ts",
       "tests/workers/selfTerminatingWorker.ts",
+      "tests/workers/messageWorker.ts",
       "groups/concurrentLimitGroup.ts",
       "groups/rateLimitGroup.ts"
     ],

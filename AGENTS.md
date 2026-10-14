@@ -33,6 +33,7 @@ A", either await A and then add B, or have A spawn B (§7).
 | `StrictLimitGroup`, token/semaphore acquisition | `ConcurrentLimitGroup` (soft) or `RateLimitGroup` |
 | `DagScheduler`, `DagTask` | `FyflowScheduler`, `FyflowTask` |
 | Priorities, cron/scheduled tasks, persistence | Not implemented |
+| `context.log()`, `task.log`, log levels | `context.emit('log', ...)` and `task.message` (§6, recipe in §10) |
 | Cancelling a queued task | Not implemented |
 
 Both group types are **optimistic**: a limit can be briefly exceeded by up to
@@ -183,6 +184,7 @@ export default class MyWorker extends BaseWorker {
 
   async run(payload: any, context?: TaskWorkerContext): Promise<any> {
     context?.sendProgress(0.5, 'halfway');       // 0-1, NOT a percentage
+    context?.emit('log', { level: 'info', message: 'multiplying' });   // task.message
     return { value: payload.value * this.multiplier };
   }
 }
@@ -220,6 +222,13 @@ export default class MyWorker extends BaseWorker {
   Use the task context when this task is the problem, and the worker context
   when the worker is: a task that calls the worker-level version is requeued and
   runs again, and if it asks again every time, the pool spends its restarts on it.
+- `emit(name, data?)` sends an event to the host: on the task's `context` it is
+  `task.message` on the scheduler, on `this.workerContext` it is
+  `worker.message` on the pool - use the latter where there is no task, such
+  as model-loading progress from `setup()`. It returns at once, never throws,
+  and delivers asynchronously. `data` is copied with `structuredClone` at the
+  call, on inline pools too, so it must be cloneable and changing it afterwards
+  has no effect. Nothing is sent while nobody listens (§6).
 - One instance is created per worker, lazily, and reused across tasks. Instance
   state persists between tasks — do not assume a fresh object per task.
 - Throwing from `run()` fails that task. Throwing from `setup()` fails the
@@ -243,6 +252,7 @@ import type {
   WorkerManagerOptions, WorkerConfig, WorkerInterface, WorkerStatus,
   WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerContext,
   SpawnTaskConfig, ProgressData,
+  TaskMessageDetail, WorkerMessageDetail, MessageOptions,     // emitted events
   ResourceGroup, ResourceGroupMetrics, ResourceGroupStats,
   RateWindow, KeyedRateLimitGroupOptions, KeyedTaskLike,
   GaugeKind, GaugeSpec, GaugeReading, GaugeDescription,       // gauges
@@ -335,6 +345,7 @@ this task plus everything it spawns (§7).
 | `idleCheckIntervalMs` | `5000` | How often idle workers are swept |
 | `requeueFailedTasks` | `true` | Requeue in-flight tasks when a worker dies |
 | `maxWorkerRestarts` | `3` | Then `worker.restart_limit_exceeded` |
+| `messages` | `{ flushIntervalMs: 20, maxBuffered: 100 }` | Bounds on `emit()`, per buffer (one per running attempt, one per worker): events are batched for up to `flushIntervalMs`, and emits beyond `maxBuffered` between flushes are discarded and counted. `RangeError` if either is not positive (`maxBuffered` must be an integer) |
 
 Management: `getWorkerIds()`, `getWorkerStatus(id)`, `getAllWorkerStatuses()`,
 `restartWorker(id, newConfig?)`, `replaceWorker(...)` (alias),
@@ -547,6 +558,7 @@ Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
 | `task.completed` | the `FyflowTask` (with `result`, `executionTime`) |
 | `task.failed` | the task, plus `error` |
 | `task.progress` | the task's fields **spread flat** (so the id is `id`, **not** `taskId`), plus `{ workerId, workerType, progress (0–1), message, details, timestamp }` |
+| `task.message` | `TaskMessageDetail`: `{ taskId, workerId, attemptNumber, name, data, seq, timestamp, dropped?, error? }` - a task's `context.emit()`. **Scheduler only**; see below |
 | `task.user_action` | the task — failed, out of retries, not optional. Fires once, only after the retry budget is spent |
 | `task.spawn_request` | `{ parentTask, spawnConfig, workerId, workerType }` |
 | `task.spawn_failed` | `{ parentTask, spawnConfig, error }` |
@@ -587,14 +599,62 @@ describes a moment, which a consumer keeps, so it has to be a copy.
 > `endTime`: those are fields on the same live object.
 >
 > Not affected: `task.progress` (`detail` is a shallow copy),
-> `scheduler.completed` (a copy of `stats`, not the live counters), and the four
-> `resource.*` events (a fresh object per event). Details are not frozen or
+> `scheduler.completed` (a copy of `stats`, not the live counters), the four
+> `resource.*` events, `task.message` and `worker.message` (a fresh object per
+> event). Details are not frozen or
 > defensively copied on the hot path — this is a documented contract, not an
 > oversight.
 
 **On a `WorkerManager`:** `task.started`, `task.completed`, `task.failed`,
 `task.progress`, `task.spawn_request`, `task.requeue_required`, `worker.failed`,
-`worker.self_terminated`, `worker.restart_limit_exceeded`.
+`worker.self_terminated`, `worker.restart_limit_exceeded`, and `worker.message`
+- `WorkerMessageDetail`: `{ workerId, workerType, name, data, seq, timestamp,
+dropped?, error? }`, from `this.workerContext.emit()`. `workerType` is
+`'inline'`/`'thread'`, as on every `worker.*` event.
+
+### `task.message` and `worker.message` — events workers emit
+
+A worker sends whatever it likes - a log line, a metric, a partial result - as
+`emit(name, data)`. The scheduler defines no names or formats: `name` is yours,
+and `data` is any value `structuredClone` can copy.
+
+- **Scheduler only.** `task.message` fires on the scheduler and **not** on the
+  pool, unlike `task.progress`, which fires on both. Listening to both cannot
+  double-count. It carries no `workerType`; the pool is
+  `scheduler.tasks.get(taskId).workerType`.
+- **Subscribe before adding tasks.** While a scope has no listener its workers
+  send nothing at all, so emitting costs nothing until someone listens. A
+  listener added mid-run starts receiving shortly after; the first `seq` it sees
+  says how many emits it missed.
+- **In order, per attempt and per worker.** `seq` counts `emit()` calls from 0,
+  per attempt for `task.message` and per worker instance for `worker.message`.
+  A gap is either emits made while nobody listened, or `dropped`.
+- **Before the attempt settles.** Every event an attempt emitted arrives before
+  its `task.completed`, `task.failed` or `task.retrying`, so a settled attempt's
+  log is complete. Nothing it emits afterwards (a stray timer) is delivered.
+  Events from `setup()` and the constructor arrive before
+  `worker.setup.completed`/`failed`, and from `teardown()` before
+  `worker.teardown.completed`/`failed`.
+- **A retry** starts `seq` again at 0, with the next `attemptNumber`. A requeued
+  run (§8) delivers nothing once it has been abandoned.
+- **Bounded**, by the pool's `messages` option: at most `maxBuffered` events per
+  buffer per `flushIntervalMs` - by default 100 per 20 ms, 5,000 events/s per
+  attempt. Over the cap, emits are discarded and counted in the next delivered
+  event's `dropped`. An attempt that ends over the cap delivers its last
+  discarded event with `data` undefined and `error: 'Discarded at the message
+  cap'`, so the count is never lost: delivered events plus `dropped` always
+  equals the emits made while someone listened. That bound is per worker, and
+  the main thread is shared: measured at the defaults, 16 threaded workers
+  emitting in tight loops - over 2 million emits a second - delivered about
+  70,000 events/s to a listener formatting a log line, with the main thread
+  stalling for at most 16-47 ms (16 ms when idle). That is about its limit;
+  more emitting workers, or a slower listener, will saturate it. A worker that emits a large block at once should send it as one event or
+  have its pool's `maxBuffered` raised.
+- **`data` that cannot be cloned** (a function, a class instance with methods)
+  arrives as an event with `data` undefined and `error` set to the clone error,
+  at its own `seq`. `emit()` itself never throws.
+- **Lost only with the worker**: a worker that crashes, or a thread killed for
+  not acknowledging teardown in time, loses what it had not yet sent.
 
 **Worker lifecycle, on a `WorkerManager`:**
 
@@ -922,6 +982,26 @@ setInterval(() => {
   const m = scheduler.getResourceMetrics();
   console.log(scheduler.stats, `cpu ${m.cpu.running}/${m.cpu.limit}`);
 }, 1000);
+```
+
+**A log channel from workers**
+
+The scheduler has no log levels; a log is one name on `emit()`, in a shape you
+choose:
+
+```typescript
+// worker, inside run()
+context?.emit('log', { level: 'info', message: `fetched ${rows.length} rows` });
+
+// host - subscribe before adding tasks
+scheduler.addEventListener('task.message', (e) => {
+  const { taskId, attemptNumber, name, data, seq, dropped } = e.detail;
+  if (name !== 'log') return;
+  if (dropped) appendLog(taskId, { level: 'warn', message: `${dropped} lines dropped` });
+  appendLog(taskId, { ...data, attemptNumber, seq });
+});
+// Each attempt's log is complete by the time its task.completed,
+// task.failed or task.retrying fires
 ```
 
 **Measuring worker startup cost**

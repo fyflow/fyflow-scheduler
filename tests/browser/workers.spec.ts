@@ -308,6 +308,48 @@ test.describe('FyFlow Web Worker Functionality', () => {
     }
   });
 
+  // The browser runs workerWrapper.ts under its own host, so emitted events
+  // are checked here too: same stream inline and threaded, every task's events
+  // before its settle, and a worker-level event from setup()
+  test('should deliver emitted events identically inline and in a Web Worker', async ({ page }) => {
+    const shapes = await page.evaluate(async () => {
+      const { FyflowScheduler, FyflowTask, WorkerManager } = await import('/dev-dist/browser/index.js');
+
+      const out: string[] = [];
+      for (const inline of [true, false]) {
+        const pool = new WorkerManager('/dev-dist/browser/tests/workers/messageWorker.js', {
+          maxThreads: 1, maxConcurrentTasks: 1, inline, idleTimeout: 0, config: { emitInSetup: true }
+        });
+        const scheduler = new FyflowScheduler({ Msg: pool }, {});
+        const log: string[] = [];
+        scheduler.addEventListener('task.message', (e: any) =>
+          log.push(`${e.detail.taskId}:${e.detail.name}:${e.detail.seq}:${e.detail.error ? 'error' : JSON.stringify(e.detail.data)}`));
+        scheduler.addEventListener('task.completed', (e: any) => log.push(`${e.detail.id}:completed`));
+        scheduler.addEventListener('task.failed', (e: any) => log.push(`${e.detail.id}:failed`));
+        pool.addEventListener('worker.message', (e: any) => log.push(`worker:${e.detail.name}`));
+
+        const run = (id: string, payload: any) => Promise.race([
+          (scheduler.addTask(new FyflowTask({ id, workerType: 'Msg', payload }), { createPromise: true }) as Promise<any>)
+            .catch(() => {}),
+          new Promise(resolve => setTimeout(resolve, 5000))
+        ]);
+        await run('a', { mode: 'emit', count: 12, yieldEvery: 5 });
+        await run('b', { mode: 'odd' });
+        await run('c', { mode: 'emit', count: 3, throws: true });
+        out.push(log.join(' '));
+        await scheduler.shutdown();
+      }
+      return out;
+    });
+
+    const [inline, threaded] = shapes;
+    expect(threaded).toBe(inline);
+    expect(inline).toContain('worker:loading');
+    expect(inline).toContain('a:log:11:{"i":11} a:completed');
+    expect(inline).toContain('b:42:0:{"ok":true} b:fn:1:error b:after:2:{"ok":true} b:completed');
+    expect(inline).toContain('c:log:2:{"i":2} c:failed');
+  });
+
   test('should handle mixed inline and Web Worker execution', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {

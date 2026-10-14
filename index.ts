@@ -54,7 +54,10 @@ export type {
   SpawnTaskConfig,
   ProgressData,
   WorkerStatus,
-  WorkerInstanceState
+  WorkerInstanceState,
+  TaskMessageDetail,
+  WorkerMessageDetail
 } from "./core/workerInterface.ts";
+export type { MessageOptions } from "./core/messageChannel.ts";
 export { BaseWorker, WorkerTerminationError } from "./core/workerInterface.ts";
 
