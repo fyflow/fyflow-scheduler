@@ -296,13 +296,62 @@ deserialisation and one `dispatchEvent` per event. So, when the gate is open:
   synchronous loop, this is a rate bound (at most `cap` per buffer per flush
   interval), not a lifetime one.
 - **Always flushed before an ending message**, as described under Delivery.
-- **Defaults are measured, not guessed.** Configured per pool, as
-  `messages: { flushIntervalMs, maxBuffered }` on `WorkerManager`, with defaults
-  chosen from a benchmark of a deliberately chatty worker, synchronous and
-  asynchronous.
+- **Defaults: `flushIntervalMs: 20`, `maxBuffered: 100`**, configured per pool
+  as `messages: { flushIntervalMs, maxBuffered }` on `WorkerManager`. Measured,
+  see below.
 
 Dispatch on the host is not throttled. The bound is on what a worker can send,
 which is the one side a consumer cannot control.
+
+### How the defaults were chosen
+
+Measured on Deno 2.9.6, Windows, with a prototype of the buffering above (clone
+at `emit()`, per-buffer cap with `dropped`, time check in `emit()`, trailing
+timer) in real worker threads, and a host dispatching one `CustomEvent` per
+delivered message to a listener that formats and keeps a log line. Worker
+startup was kept outside the measured window. "Stall" is the longest gap between
+1 ms main-thread ticks; idle, it is 17 ms on this machine, Windows timer
+resolution.
+
+Two things set the defaults, and the plan above did not anticipate the second:
+
+- **The per-worker rate, `maxBuffered / flushIntervalMs`, against what the main
+  thread can absorb.** With that listener, the host absorbs roughly 50-75K
+  events/s; past it, messages queue in the port and stalls grow into seconds.
+  The bound is per buffer and the host is not throttled, so the aggregate
+  scales with the number of workers emitting.
+- **The cap also bounds one main-thread task.** A delivered batch is dispatched
+  in one go, at about 20 µs per event with that listener, so `maxBuffered`
+  events is one uninterrupted task: 100 is ~2 ms, 1,000 is ~20 ms, and several
+  arrive back to back.
+
+Workers flooding in a synchronous loop, worst stall over three runs (median),
+and latency at a normal rate (16 workers x 1,000 events/s):
+
+| Interval / cap | Per buffer | 8 workers | 16 workers | Latency p50 / p99 |
+|---|---:|---:|---:|---:|
+| 10 ms / 100 | 10K/s | 15 ms | 164 ms | 16 / 17 ms |
+| 20 ms / 200 | 10K/s | 16 ms | 74 ms | 18 / 34 ms |
+| 50 ms / 500 | 10K/s | 18 ms | 86 ms | 34 / 66 ms |
+| **20 ms / 100** | **5K/s** | **16 ms** | **16 ms** | **21 / 36 ms** |
+| 50 ms / 250 | 5K/s | 17 ms | 20 ms | 39 / 69 ms |
+| 100 ms / 1000 | 10K/s | 35 ms | 118 ms | 65 / 118 ms |
+
+Caps of 1,000 at 10 or 20 ms, and 5,000 at 50 ms, stalled the main thread for 1.4
+to 7.4 s. At a normal rate every setting costs the same, about 2.5% of the main
+thread for 16,000 events/s; only latency differs, roughly the interval plus the
+timer floor.
+
+At 5K/s per buffer, 16 workers flooding left the main thread at its idle floor.
+Within that rate, 20 ms / 100 was chosen over 50 ms / 250 for latency, at the
+cost of burst tolerance: more than 100 emits within 20 ms drops the excess,
+reported as `dropped`. The tested envelope is 16 flooding buffers; more, or a
+slower listener, can still overwhelm the host, so `AGENTS.md` should state the
+envelope and point at the option.
+
+Inside the worker, an accepted `emit()` costs about 3.7 µs, 2.2 µs of it the
+clone; with the gate closed it is a counter increment. On an inline pool that is
+main-thread time.
 
 ## Cloning: at `emit()`, not at the flush
 
@@ -438,10 +487,12 @@ exercise `workerWrapper.node.ts` under `pnpm test` and `workerWrapper.ts` under
 - **`jsr:smoke`**: passes with the new module, and fails with its allowlist line
   removed.
 - **Benchmark**: `benchmark:quick` before and after, run back to back, since
-  every task's context gains a member and every worker gains flag checks. Plus a
-  chatty-worker scenario, gated and ungated, synchronous and asynchronous, used
-  to choose the defaults.
+  every task's context gains a member and every worker gains flag checks. Plus
+  the flood measurement above, rerun against the real implementation: 16
+  threaded workers flooding at the defaults must leave the main thread near its
+  idle floor.
 
 ## Open questions
 
-1. **Default flush interval and cap.** To be chosen from the benchmark above.
+None. The default flush interval and cap were the last; see "How the defaults
+were chosen".

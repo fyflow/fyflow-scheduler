@@ -77,14 +77,17 @@ so the scheduler does not define log levels or formats: `context.emit()` to
 on the pool. Nothing is sent while nobody listens. The gate, buffers, cap,
 clone and flush live once, in a new runtime-neutral `core/messageChannel.ts`
 used by both worker wrappers and `InlineWrapper` (it needs its own line in the
-`deno.json` publish allowlist). Plan: `doc/design/task-messages.md`. Ships with
-or after #4, whose `task.attemptNumber` it carries, and after the requeue known
-issue below. Remaining open: default flush interval and cap (from a benchmark).
+`deno.json` publish allowlist). Plan: `doc/design/task-messages.md`, no open
+questions. Its prerequisites, #4's `task.attemptNumber` and the requeue known
+issue below, have shipped. Defaults decided from a prototype benchmark:
+`flushIntervalMs: 20`, `maxBuffered: 100`, i.e. 5K events/s per buffer, at which
+16 workers flooding left the main thread at its idle floor; measurements in the
+plan.
 
 `node:diagnostics_channel` was considered and rejected: it is per-thread, so it
 cannot carry worker output to the main thread, and the browser does not have it.
 
-**Status**: 🟡 Refinement - plan open in `doc/design/task-messages.md`
+**Status**: 🟡 Refinement complete - ready to implement, plan in `doc/design/task-messages.md`
 
 #### 🟢 Start a task with attempts already spent (#4, P2)
 A config field so a resumed task does not get a fresh retry budget, and an event
