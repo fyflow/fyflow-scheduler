@@ -137,7 +137,18 @@ Two conventions worth keeping:
   documentation drifting from the code.
 - **Mutation-check a regression test.** Several tests here were once vacuous —
   a rate-limit test that passed with the limit removed entirely. Break the fix
-  and confirm the test fails, then restore it.
+  and confirm the test fails, then restore it. Run only the tests meant to
+  catch it, and stop at the first failure:
+  `deno task test:settlement --only "requeue" --bail --timeout 5000`.
+
+Every test has a timeout, 60 s by default, enforced by `runTest` in
+`tests/harness.ts`, which every suite delegates to. Without it a mutation, or a
+real regression, that leaves a promise unsettled hangs the run indefinitely;
+that once stalled a mutation check for over an hour. A test the timeout fails
+may still be running, so the runner exits non-zero rather than waiting for it.
+`--only` that matches no test fails the run, so a typo cannot pass a mutation
+check by running nothing. On Node, pass the flags after `--`:
+`pnpm run test:settlement -- --only requeue`.
 
 ## Release process
 

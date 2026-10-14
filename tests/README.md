@@ -7,6 +7,7 @@ Organized test structure for FyFlow's comprehensive testing framework.
 ```
 tests/
 ├── runner.ts              # Unified test runner
+├── harness.ts             # runTest(): per-test timeout, --only, --bail
 ├── suites/                 # Core test suites
 │   ├── core.ts            # Core functionality tests
 │   └── error-handling.ts  # Error handling tests
@@ -46,6 +47,19 @@ deno task test:error
 # Performance tests
 deno task test:performance
 ```
+
+#### Options
+```bash
+# Only tests whose name contains the text (case-insensitive, repeatable)
+deno task test:settlement --only "requeue"
+# Stop at the first failing test
+deno task test:settlement --bail
+# Fail a test still running after this many ms (default 60000)
+deno task test:settlement --timeout 5000
+```
+
+On Node, pass them after `--`: `pnpm run test:settlement -- --only requeue`.
+An `--only` that matches no test fails the run.
 
 #### Individual Test Files
 ```bash
@@ -188,7 +202,9 @@ Basic test workers for validating inline vs threaded execution patterns.
 
 ### Deno/Node.js Tests
 1. **Add to existing suite**: Extend `core.ts` or `error-handling.ts`
-2. **Create new suite**: Add to `suites/` and update `runner.ts`
+2. **Create new suite**: Add to `suites/` and update `runner.ts`. Run each test
+   through `runTest` from `harness.ts`, which applies the timeout and the
+   `--only` / `--bail` options, and drop `skipped` results before counting
 3. **Add test workers**: Place in `workers/` directory
 4. **Performance tests**: Add to `performance/` directory
 

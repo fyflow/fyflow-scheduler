@@ -4,6 +4,8 @@
 // Node.js process declaration for cross-platform compatibility
 declare const process: any;
 
+import { DEFAULT_TIMEOUT_MS, parseArgs, testsRun, type HarnessOptions } from './harness.ts';
+
 class TestRunner {
   private failedSuites: string[] = [];
 
@@ -82,6 +84,7 @@ class TestRunner {
       // Run resource event tests
       await this.runSuite('Resource Events', `./suites/resource-events${ext}`);
 
+
       // Run worker -> host message tests
       await this.runSuite('Worker Messages', `./suites/messages${ext}`);
 
@@ -118,6 +121,7 @@ class TestRunner {
     if (!suitePath) {
       console.error(`❌ Unknown test suite: ${suiteName}`);
       console.log('Available suites:', Object.keys(suiteMap).join(', '));
+      this.failedSuites.push(`${suiteName} (unknown suite)`);
       return;
     }
 
@@ -129,51 +133,84 @@ class TestRunner {
 async function main() {
   const runner = new TestRunner();
 
-  // Parse command line arguments
+  // Parse command line arguments: one optional suite name, plus the harness
+  // options, which each suite also reads for itself (see tests/harness.ts)
   const args = typeof Deno !== 'undefined' ? Deno.args : process.argv.slice(2);
-
-  if (args.length === 0) {
-    // Run all suites by default
-    await runner.runAllSuites();
-  } else if (args[0] === '--help' || args[0] === '-h') {
+  if (args.includes('--help') || args.includes('-h')) {
     console.log('FyFlow Test Runner');
     console.log('Usage:');
-    console.log('  deno run --allow-read --allow-net tests/runner.ts [suite]');
-    console.log('  npm run test [suite]');
-    console.log('  npm run test:browser      # Browser tests with Playwright');
+    console.log('  deno run --allow-read --allow-net tests/runner.ts [suite] [options]');
+    console.log('  deno task test:<suite> [options]');
+    console.log('  pnpm run test:<suite> -- [options]');
+    console.log('  pnpm run test:browser      # Browser tests with Playwright');
     console.log('');
     console.log('Available suites:');
-    console.log('  core        - Core functionality tests');
-    console.log('  error       - Error handling tests');
-    console.log('  spawning    - Task spawning and descendant tracking tests');
-    console.log('  settlement  - Task settlement and failure accounting tests');
-    console.log('  docs        - Executable documentation examples');
-    console.log('  resident    - Resident (worker-lifetime) resource groups');
-    console.log('  performance - Performance tests');
+    console.log('  core         - Core functionality tests');
+    console.log('  error        - Error handling tests');
+    console.log('  spawning     - Task spawning and descendant tracking tests');
+    console.log('  settlement   - Task settlement and failure accounting tests');
+    console.log('  resident     - Resident (worker-lifetime) resource groups');
+    console.log('  events       - resource.* events, gauges and the admission queue');
+    console.log('  messages     - Worker -> host messages via emit()');
+    console.log('  docs         - Executable documentation examples');
+    console.log('  performance  - Performance tests');
     console.log('');
-    console.log('Browser testing:');
-    console.log('  npm run test:browser         # All browsers');
-    console.log('  npm run test:browser:headed  # With browser UI');
-    console.log('  npm run test:browser:debug   # Debug mode');
-    console.log('  npm run test:all             # Node.js + Browser tests');
+    console.log('Options:');
+    console.log('  --only <text>   Run only tests whose name contains <text> (case-insensitive).');
+    console.log('                  Repeatable. Fails if no test matches.');
+    console.log('  --bail          Stop at the first failing test, in every suite.');
+    console.log(`  --timeout <ms>  Fail a test still running after <ms> (default ${DEFAULT_TIMEOUT_MS}).`);
     console.log('');
     console.log('Examples:');
-    console.log('  tests/runner.ts           # Run all suites');
-    console.log('  tests/runner.ts core      # Run only core tests');
-    console.log('  tests/runner.ts error     # Run only error handling tests');
+    console.log('  tests/runner.ts                                   # Run all suites');
+    console.log('  tests/runner.ts core                              # Run only core tests');
+    console.log('  tests/runner.ts settlement --only "requeue" --bail');
+    return;
+  }
+
+  let positional: string[];
+  let options: HarnessOptions;
+  try {
+    ({ positional, options } = parseArgs(args));
+  } catch (error: any) {
+    console.error(`❌ ${error.message} - see --help`);
+    exit(1);
+    return;
+  }
+
+  if (positional.length > 1) {
+    console.error(`❌ One suite at a time, got: ${positional.join(', ')}`);
+    exit(1);
+    return;
+  }
+
+  if (positional.length === 0) {
+    // Run all suites by default
+    await runner.runAllSuites();
   } else {
     // Run specific suite
-    await runner.runSpecificSuite(args[0]);
+    await runner.runSpecificSuite(positional[0]);
+  }
+
+  if (options.only.length > 0 && testsRun() === 0) {
+    console.error(`
+❌ --only ${options.only.map(o => JSON.stringify(o)).join(' --only ')} matched no test`);
+    exit(1);
+    return;
   }
 
   // Surface failures to CI/CD via the process exit code
   if (runner.hasFailures) {
     runner.reportFailures();
-    if (typeof Deno !== 'undefined') {
-      Deno.exit(1);
-    } else {
-      process.exit(1);
-    }
+    exit(1);
+  }
+}
+
+function exit(code: number): void {
+  if (typeof Deno !== 'undefined') {
+    Deno.exit(code);
+  } else {
+    process.exit(code);
   }
 }
 

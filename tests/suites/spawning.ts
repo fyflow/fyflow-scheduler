@@ -4,16 +4,10 @@
 // lineage, not a scheduling dependency - it never affects dispatch order.
 
 import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
+import { runTest, type TestResult } from '../harness.ts';
 
 // Node.js process declaration for cross-platform compatibility
 declare const process: any;
-
-interface TestResult {
-  name: string;
-  passed: boolean;
-  duration: number;
-  error?: string;
-}
 
 interface TestSuiteResult {
   platform: string;
@@ -53,19 +47,7 @@ class SpawningTestSuite {
   }
 
   private async runTest(name: string, testFn: () => Promise<void>): Promise<TestResult> {
-    console.log(`\n🧪 Running: ${name}`);
-    const start = performance.now();
-
-    try {
-      await testFn();
-      const duration = performance.now() - start;
-      console.log(`✅ PASSED: ${name} (${duration.toFixed(1)}ms)`);
-      return { name, passed: true, duration };
-    } catch (error: any) {
-      const duration = performance.now() - start;
-      console.log(`❌ FAILED: ${name} (${duration.toFixed(1)}ms) - ${error.message}`);
-      return { name, passed: false, duration, error: error.message };
-    }
+    return runTest(name, testFn);
   }
 
   async runAllTests(exitOnComplete = true): Promise<TestSuiteResult> {
@@ -99,6 +81,7 @@ class SpawningTestSuite {
     this.results.push(await this.runTest('Shutdown Drain Still Hears The Pools', () => this.testShutdownDrainHearsThePools()));
 
     const totalDuration = performance.now() - this.startTime;
+    this.results = this.results.filter(r => !r.skipped);
     const passed = this.results.filter(r => r.passed).length;
     const failed = this.results.length - passed;
 

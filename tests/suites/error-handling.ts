@@ -2,17 +2,11 @@
 // Tests worker crashes, self-termination, and error recovery scenarios
 
 import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
+import { runTest, type TestResult } from '../harness.ts';
 import { ConcurrentLimitGroup } from '../../groups/concurrentLimitGroup.ts';
 
 // Node.js process declaration for cross-platform compatibility
 declare const process: any;
-
-interface TestResult {
-  name: string;
-  passed: boolean;
-  duration: number;
-  error?: string;
-}
 
 interface TestSuiteResult {
   platform: string;
@@ -71,23 +65,7 @@ class ErrorHandlingTestSuite {
       this.selfTerminatingWorkerUrl = new URL((await import('../workers/selfTerminatingWorker.ts?worker-direct')).default).href;
     }
 
-    console.log(`\n🧪 Running: ${name}`);
-    const start = performance.now();
-
-    try {
-      // Add timeout protection for all tests
-      await Promise.race([
-        testFn(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Test timeout - exceeded 10 seconds')), 10000))
-      ]);
-      const duration = performance.now() - start;
-      console.log(`✅ PASSED: ${name} (${duration.toFixed(1)}ms)`);
-      return { name, passed: true, duration };
-    } catch (error: any) {
-      const duration = performance.now() - start;
-      console.log(`❌ FAILED: ${name} (${duration.toFixed(1)}ms) - ${error.message}`);
-      return { name, passed: false, duration, error: error.message };
-    }
+    return runTest(name, testFn);
   }
 
   async runAllTests(exitOnComplete = true): Promise<TestSuiteResult> {
@@ -123,6 +101,7 @@ class ErrorHandlingTestSuite {
     this.results.push(await this.runTest('Worker Restart after Failure', () => this.testWorkerRestart()));
 
     const totalDuration = performance.now() - this.startTime;
+    this.results = this.results.filter(r => !r.skipped);
     const passed = this.results.filter(r => r.passed).length;
     const failed = this.results.length - passed;
 

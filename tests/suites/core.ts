@@ -3,20 +3,13 @@
 
 
 import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
+import { runTest, type TestResult } from '../harness.ts';
 import { ConcurrentLimitGroup } from '../../groups/concurrentLimitGroup.ts';
 import { RateLimitGroup } from '../../groups/rateLimitGroup.ts';
 import { TaskQueue } from '../../core/taskQueue.ts';
 
 // Node.js process declaration for cross-platform compatibility
 declare const process: any;
-
-interface TestResult {
-  name: string;
-  passed: boolean;
-  duration: number;
-  error?: string;
-  details?: any;
-}
 
 interface TestSuiteResult {
   platform: string;
@@ -47,19 +40,7 @@ class CrossPlatformTestSuite {
     }
 
     
-    console.log(`\n🧪 Running: ${name}`);
-    const start = performance.now();
-
-    try {
-      await testFn();
-      const duration = performance.now() - start;
-      console.log(`✅ PASSED: ${name} (${duration.toFixed(1)}ms)`);
-      return { name, passed: true, duration };
-    } catch (error: any) {
-      const duration = performance.now() - start;
-      console.log(`❌ FAILED: ${name} (${duration.toFixed(1)}ms) - ${error.message}`);
-      return { name, passed: false, duration, error: error.message };
-    }
+    return runTest(name, testFn);
   }
 
   async runAllTests(_exitOnComplete = true): Promise<TestSuiteResult> {
@@ -132,6 +113,7 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('Limits Hold Past Queue Compaction', () => this.testLimitsHoldAtScale()));
 
     const totalDuration = performance.now() - this.startTime;
+    this.results = this.results.filter(r => !r.skipped);
     const passed = this.results.filter(r => r.passed).length;
     const failed = this.results.length - passed;
 
