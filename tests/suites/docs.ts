@@ -453,8 +453,9 @@ class DocsTestSuite {
     }
   }
 
-  // RECIPE: AGENTS.md section 10 - a log channel from workers, on both pool
-  // types, with the section 6 claims it relies on
+  // RECIPE: AGENTS.md section 10 and README "Worker Messages" - the same log
+  // channel snippet in both - on both pool types, with the AGENTS.md section 6
+  // claims it relies on
   private async docLogChannel(): Promise<void> {
     for (const inline of [true, false]) {
       const scheduler = this.makeScheduler({ inline, maxThreads: 1, maxConcurrentTasks: 1 });

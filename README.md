@@ -11,7 +11,7 @@ Zero-dependency parallel task scheduler with resource management and cross-platf
 
 ## Overview
 
-FyFlow is a self-contained parallel task scheduler with resource management. Fully in-memory operation with zero dependencies. Extensible APIs allow enhancement for persistence, distributed execution, or multi-machine coordination.
+FyFlow is a self-contained parallel task scheduler with resource management. Fully in-memory operation with zero dependencies.
 
 ## Installation
 
@@ -60,7 +60,7 @@ const results = await Promise.all(scheduler.addTasks(tasks, { createPromise: tru
 await scheduler.shutdown();   // required, or live workers keep the process alive
 ```
 
-See [Loading Workers](#loading-workers-differs-per-runtime) for how `./worker.js`
+See [Loading Workers](#loading-workers) for how `./worker.js`
 is resolved - it differs between Deno, Node and the browser.
 
 ## Key Features
@@ -75,7 +75,7 @@ is resolved - it differs between Deno, Node and the browser.
 - **Worker Messages**: Workers `emit()` named events - logs, metrics, partial results - to the host, batched, bounded and sent only while someone listens
 - **Cancellation**: Stop a waiting or running task; workers see an `AbortSignal`, and a threaded worker that ignores it is stopped for them
 - **Zero Dependencies**: Self-contained with no external requirements
-- **In-Memory**: Fast coordination with extensible persistence APIs
+- **In-Memory**: Fast coordination, with nothing persisted
 
 ## Basic Usage
 
@@ -242,6 +242,53 @@ must exist; all three are rejected at construction.
 
 See `examples/resident-groups.ts` for a runnable walkthrough.
 
+### Worker Messages
+
+A worker sends named events to the host with `emit()` - a log line, a metric, a
+partial result. The scheduler defines no names or formats, so a log is one name
+in a shape you choose:
+
+```typescript
+// worker, inside run()
+context?.emit('log', { level: 'info', message: `fetched ${rows.length} rows` });
+
+// host - subscribe before adding tasks
+scheduler.addEventListener('task.message', (e) => {
+  const { taskId, attemptNumber, name, data, seq, dropped } = e.detail;
+  if (name !== 'log') return;
+  if (dropped) appendLog(taskId, { level: 'warn', message: `${dropped} lines dropped` });
+  appendLog(taskId, { ...data, attemptNumber, seq });
+});
+// Each attempt's log is complete by the time its task.completed,
+// task.failed or task.retrying fires
+```
+
+Nothing is sent while nobody listens, so emitting is free until someone
+subscribes. Events arrive in order per attempt, `data` is copied with
+`structuredClone` on both pool types, and delivery is bounded by the pool's
+`messages` option: batched every 20 ms, at most 100 per batch by default, with
+the excess counted in `dropped`. A worker with no task at hand - loading a model
+in `setup()` - emits on `this.workerContext` instead, which arrives as
+`worker.message` on the pool. See `AGENTS.md` §6 for every guarantee.
+
+### Retries and Attempts
+
+```typescript
+new FyflowTask({
+  id: 'flaky', workerType: 'MyWorker', payload: {},
+  retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+  attemptsSpent: 0          // attempts already made, e.g. before a restart
+});
+```
+
+A retry starts no earlier than `backoffMs` after the attempt failed, however busy
+the scheduler is, and `task.retrying` fires when one is decided.
+`task.attemptNumber` is the 1-based number of the current attempt; `attempts`
+counts retries used. A task re-added after a process restart keeps its budget
+if you pass what it had spent as `attemptsSpent` - record the highest
+`attemptNumber` seen on `task.running`. A requeue after a worker dies is not an
+attempt. See `AGENTS.md` §5 and the resume recipe in §10.
+
 ### Cancelling Tasks
 
 ```typescript
@@ -291,7 +338,8 @@ scheduler.addEventListener('task.progress', (e) => {
 });
 
 scheduler.addEventListener('scheduler.completed', (e) => {
-  console.log(`All tasks completed. Stats:`, e.detail);
+  // Nothing left queued, blocked or running - whatever each task's outcome
+  console.log(`Drained. Stats:`, e.detail);
 });
 ```
 
@@ -314,7 +362,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `cancel(taskId, options?)`: Stop a task, waiting or running. Resolves `true`
   once it is cancelled, `false` if it had already finished. `options.reason`,
   `options.graceMs` for a threaded worker
-- `stats`: Current execution statistics
+- `stats`: `{ queued, running, done, failed, cancelled }`, counting tasks rather
+  than attempts
 - `getResourceMetrics()` / `getResourceStats()`: Per-group utilisation and lifetime counters
 - `describeResources()`: The gauges every group presents. Schema, not state -
   safe to read once and cache
@@ -334,6 +383,10 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `retryPolicy`: `{ maxRetries, backoffMs }`
 - `attemptsSpent`: Attempts already made, so a task re-added after a restart
   keeps its retry budget
+- `handleRejection`: Silence an unhandled rejection for fire-and-forget use
+  (default true)
+- Readable as it runs: `state`, `result`, `error`, `attempts`, `attemptNumber`,
+  `cancellation`, `startTime`, `endTime`, `executionTime`
 - `onCompletePromise()`: Promise for this task alone
 - `onCompleteDescendants()`: Promise for this task plus everything it spawns
 
@@ -348,6 +401,13 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `residentGroups`: Groups held for a **worker's** lifetime, `string[]` (cost 1
   each) or `Record<string, number>` for weighted costs. Per worker, not per pool
 - `inline`: Use inline execution (default: false)
+- `config`: First constructor argument for every worker instance in the pool
+- `requeueFailedTasks`: Requeue a dead worker's tasks rather than failing them
+  (default true)
+- `maxWorkerRestarts`: Restarts before the pool gives up and emits
+  `worker.restart_limit_exceeded` (default 3)
+- `messages`: Bounds on `emit()` (default
+  `{ flushIntervalMs: 20, maxBuffered: 100 }`)
 - `idleTimeout`: Ms before an idle worker is terminated (0 = never, default 5000)
 - `idleCheckIntervalMs`: How often idle workers are swept (default 5000). This is
   the floor on how promptly a resident group is handed over
@@ -453,7 +513,9 @@ arrive in waves.
 
 Workers extend `BaseWorker` and implement:
 - `constructor(config)`: Setup worker configuration
-- `async run(payload, context)`: Execute task logic
+- `async run(payload, context)`: Execute task logic. `context` carries
+  `sendProgress()`, `emit()`, `spawnTask()`, `terminateWithError()` and
+  `signal`, the `AbortSignal` that `cancel()` aborts
 - `async setup()`: Initialize worker (required by `BaseWorker`; may be empty)
 - `async teardown()`: Cleanup worker (required by `BaseWorker`; may be empty)
 
@@ -461,13 +523,14 @@ Workers extend `BaseWorker` and implement:
 
 Measured with `npm run benchmark:quick`:
 
-- **Throughput (inline)**: tens of thousands of tasks/sec at 10K tasks, falling
-  at larger volumes as coordination grows relative to per-task work
+- **Throughput (inline)**: tens of thousands of tasks/sec, roughly flat from 10K
+  to 100K tasks - queueing and cancelling cost the same per task at any queue
+  length
 - **Efficiency (threaded, CPU work)**: 96-98%. This is achieved average
   concurrency over configured concurrency - "how much of the parallelism I asked
   for did I get" - so steady-state coordination overhead is a few percent
-- **Memory**: roughly 1MB per 1,000 in-flight tasks at 10K scale. Completed tasks
-  are retained by default; see `maxCompletedTasks`
+- **Memory**: completed tasks are retained by default, with their payloads and
+  results, so a long-running scheduler grows until `maxCompletedTasks` is set
 
 **Worker startup** is measured separately (`npm run benchmark:startup`), because
 every other scenario pre-warms its pool. It is the largest difference between the
@@ -508,7 +571,7 @@ being a global, which landed in Node 19.
 # Build library
 npm run build
 
-# Run tests - core, error handling, spawning and the documentation examples
+# Run tests - all nine suites, the documentation examples among them
 npm test                    # Node.js tests (requires Node >= 22)
 npm run test:browser        # Browser tests (Playwright)
 npm run test:deno           # Deno tests
