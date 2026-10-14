@@ -3,7 +3,7 @@
 // import { Worker } from 'worker_threads';
 import getWorkerUrl from "./workerWrapperUrl.ts";
 import type { WorkerInstanceExtensions, WorkerInstanceState } from "./workerInterface.ts";
-import { WorkerTerminationError } from "./workerInterface.ts";
+import { CancelledError, WorkerTerminationError } from "./workerInterface.ts";
 import type { ChannelEvent, MessageOptions, MessageSink } from "./messageChannel.ts";
 
 // How long terminate() waits for the worker to acknowledge teardown before
@@ -107,12 +107,46 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     // Dropping the callback is what silences the run: every message about a
     // task is looked up through it, so a late result, failure, progress or
     // spawn from this thread finds nothing and is discarded.
-    forgetTask(taskId: string): void {
+    //
+    // Returns the promise's reject, which nothing else can reach any more: the
+    // pool rejects it once this thread is dead.
+    forgetTask(taskId: string): ((reason?: any) => void) | void {
+        let reject: ((reason?: any) => void) | undefined;
         const queued = this.taskQueue.findIndex(task => task.taskId === taskId);
-        if (queued !== -1) this.taskQueue.splice(queued, 1);
-        if (this.callbacks.delete(taskId)) this.runningTasks--;
+        if (queued !== -1) reject = this.taskQueue.splice(queued, 1)[0].reject as (reason?: any) => void;
+        const callback = this.callbacks.get(taskId);
+        if (callback) {
+            reject = callback.reject as (reason?: any) => void;
+            this.callbacks.delete(taskId);
+            this.runningTasks--;
+        }
         this.taskStartTimes.delete(taskId);
         this.runningTaskData.delete(taskId);
+        return reject;
+    }
+
+    hasTask(taskId: string): boolean {
+        return this.callbacks.has(taskId) || this.taskQueue.some(task => task.taskId === taskId);
+    }
+
+    cancelTask(taskId: string, reason?: unknown): void {
+        // Still waiting for the thread to initialise: it never starts. Its
+        // promise must be rejected - removing it alone would leave it pending
+        // for ever, since only a message from the thread settles it
+        const queued = this.taskQueue.findIndex(task => task.taskId === taskId);
+        if (queued !== -1) {
+            const [entry] = this.taskQueue.splice(queued, 1);
+            entry.reject(new CancelledError(taskId, reason));
+            return;
+        }
+        if (!this.callbacks.has(taskId)) return;
+        try {
+            this.worker?.postMessage({ action: 'cancel', taskId, reason });
+        } catch {
+            // A reason that cannot be cloned stays on the host; the worker's
+            // signal gets the standard AbortError instead
+            this.worker?.postMessage({ action: 'cancel', taskId });
+        }
     }
 
     // Handle termination request after task completion
@@ -645,11 +679,16 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         }
       }
 
-      this.worker?.terminate();
+      // Node's worker_threads returns a promise that resolves once the thread
+      // has exited; a web Worker's terminate() returns nothing and is immediate.
+      // Awaited, so that when this resolves the thread really is gone - a task
+      // held across a worker failure settles only then.
+      const exited: unknown = this.worker?.terminate();
       this.worker = null;
       this.runningTasks = 0;
       this.callbacks.clear();
       this.initialized = false;
+      if (exited instanceof Promise) await exited.catch(() => {});
     }
   }
   

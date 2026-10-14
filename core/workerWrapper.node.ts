@@ -32,6 +32,10 @@ const channel = new WorkerMessageChannel(
     (events) => sendMessage({ type: 'messages', data: events })
 );
 
+// The running attempts' controllers, so a 'cancel' can reach the signal of the
+// attempt it names
+const controllers = new Map<string, AbortController>();
+
 // terminateWithError() is a request: it posts a message and returns, and never
 // throws, so it is safe from a timer or a callback. Sent with the task's id from
 // a task's context, that task fails and the worker's others are requeued; sent
@@ -63,7 +67,11 @@ function createBaseWorkerContext(): BaseWorkerContext {
     };
 }
 
-function createWorkerContext(taskId: string, stream: ReturnType<WorkerMessageChannel['openAttempt']>): TaskWorkerContext {
+function createWorkerContext(
+    taskId: string,
+    stream: ReturnType<WorkerMessageChannel['openAttempt']>,
+    signal: AbortSignal
+): TaskWorkerContext {
     const baseContext = createBaseWorkerContext();
     return {
         // Worker-level context, except that terminating through it fails this
@@ -79,12 +87,22 @@ function createWorkerContext(taskId: string, stream: ReturnType<WorkerMessageCha
         spawnTask: (config: SpawnTaskConfig) => {
             sendMessage({ type: 'spawn_task', taskId, data: config });
         },
-        emit: (name, data) => channel.emitTask(stream, name, data)
+        emit: (name, data) => channel.emitTask(stream, name, data),
+        signal
     };
 }
 
 parentPort?.on('message', async (data: any) => {
     const { taskId, payload, action, config, workerUrl, workerId: receivedWorkerId, gate, messages } = data;
+
+    // Never replies, and is handled before the action dispatch: a cancel can
+    // arrive after its attempt has ended or after teardown, and the 'Invalid
+    // action' branch below would report it as a failure of that task. Abort
+    // with no reason gives the standard AbortError.
+    if (action === 'cancel') {
+        controllers.get(taskId)?.abort(data.reason);
+        return;
+    }
 
     // Handled before the action dispatch, whatever state the worker is in: a
     // gate change can arrive before init completes or after teardown, and must
@@ -155,7 +173,11 @@ parentPort?.on('message', async (data: any) => {
         } else if (action === 'run' && workerInstance && workerId) {
             // Create TaskWorkerContext with both worker and task capabilities
             const stream = channel.openAttempt(taskId);
-            const context = createWorkerContext(taskId, stream);
+            // Before the first await, so a 'cancel' that follows this message
+            // finds it
+            const controller = new AbortController();
+            controllers.set(taskId, controller);
+            const context = createWorkerContext(taskId, stream, controller.signal);
 
             // Run task with context. The attempt's emits close when run() ends,
             // either way, so a stray promise cannot add to a settled attempt;
@@ -165,6 +187,7 @@ parentPort?.on('message', async (data: any) => {
                 result = await workerInstance.run(payload, context);
             } finally {
                 channel.close(stream);
+                if (controllers.get(taskId) === controller) controllers.delete(taskId);
             }
             sendMessage({ type: 'result', taskId, data: result });
         } else if (action === 'teardown' && workerInstance) {

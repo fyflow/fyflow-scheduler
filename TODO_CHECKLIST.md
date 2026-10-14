@@ -74,11 +74,21 @@ into `main` once all four are done:
    `task.cancelled`, `stats.cancelled`, queue tombstones, transitions before
    events in `_dispatchTask`, cancel wins in `_settleTask` (`fdf8cdf`). The new
    `cancellation` suite has 16 tests; all 12 mutations of the stage are caught.
-2. 🔵 Cooperative cancel: `context.signal`, routing through the pool and wrapper
-   to the attempt, the three dispatched-but-not-running places (enqueue in
-   flight, `ThreadWrapper.taskQueue`, inline before `run()`), and rejecting a
-   forgotten threaded promise once its worker is dead, so a cancelling task
-   whose worker fails cannot hang.
+2. 🟢 Cooperative cancel: `context.signal` (one `AbortController` per attempt,
+   aborted in a microtask inline, by a never-replying `cancel` message on a
+   thread), routing through the pool to the wrapper holding the attempt, the
+   three dispatched-but-not-running places (enqueue in flight,
+   `ThreadWrapper.taskQueue`, inline before `run()`), and the release: a
+   forgotten threaded promise is rejected once its worker is dead, so a
+   cancelling task whose worker fails settles then instead of hanging.
+   `ThreadWrapper.terminate()` now awaits Node's exit promise. 10 new tests,
+   among them the check order and capacity race left from stage 1; two stage-1
+   tests had become vacuous - they cancelled before `run()`, which now never
+   starts - and cancel from inside it again. 15 mutations caught, the worker
+   side on Deno and Node.
+   Not covered: a cancelling task that itself calls `terminateWithError()` on a
+   thread settles at the request, while its run may go on until the worker is
+   torn down - as any task failing itself that way does today.
 3. 🔵 Forced stop on threaded pools: `cancelGraceMs`, the grace timer, retiring
    the worker without counting a restart, requeueing co-tenants.
 4. 🔵 `AGENTS.md` and `README.md`, docs tests, scale tests (50K cancels), browser
@@ -87,7 +97,7 @@ into `main` once all four are done:
 Until stage 4, the docs test "AGENTS.md Covers Every Export" fails on the
 branch: `CancelledError` and `CancelOptions` are exported but not documented.
 
-**Status**: 🟡 Implementation - stage 1 of 4 done on `task-cancellation`
+**Status**: 🟡 Implementation - stages 1 and 2 of 4 done on `task-cancellation`
 
 #### 🟢 A log channel from workers (#2, P1)
 Requested as `context.log(level, message, data?)` and `task.log`. Answered with

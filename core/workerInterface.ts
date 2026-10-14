@@ -154,6 +154,13 @@ export interface TaskWorkerContext extends BaseWorkerContext {
      * after it settles is delivered. Otherwise as {@link BaseWorkerContext.emit}.
      */
     emit: (name: string, data?: unknown) => void;
+    /**
+     * Aborted when the task is cancelled. Pass it on - `fetch(url, { signal })`
+     * - or check `signal.aborted`. Its `reason` is the one given to `cancel()`,
+     * or an `AbortError` if none was given (or, on a thread, it could not be
+     * cloned). Whatever `run()` does next, the task ends cancelled.
+     */
+    readonly signal: AbortSignal;
 }
 
 /**
@@ -286,8 +293,24 @@ export interface WorkerInstanceExtensions {
      * lives until its teardown is acknowledged - and anything it reports from
      * now on (result, failure, progress, spawn) belongs to no live attempt, so
      * it must be dropped here rather than reach the scheduler.
+     *
+     * Returns the reject of the task's pending promise where the run cannot
+     * settle it any more - a thread's promise is settled only by its messages,
+     * which a forgotten task no longer receives. The pool rejects it once the
+     * worker is dead, which is how a task being cancelled settles after its
+     * worker failed. An inline run settles its own promise when `run()` returns.
      */
-    forgetTask(taskId: string): void;
+    forgetTask(taskId: string): ((reason?: any) => void) | void;
+
+    /** True while the task is assigned here: waiting to start, or running. */
+    hasTask(taskId: string): boolean;
+
+    /**
+     * Ask the task's attempt to stop: abort its `context.signal`, or, if it has
+     * not started, see that it never does and reject its promise. Never settles
+     * the task itself - cancel wins in the scheduler does.
+     */
+    cancelTask(taskId: string, reason?: unknown): void;
 }
 
 // Worker Status for inspection APIs

@@ -1,6 +1,7 @@
 import { ThreadWrapper } from "./threadWrapper.ts";
 import { InlineWrapper } from "./inlineWrapper.ts";
 import type { TaskMessageDetail, WorkerStatus } from "./workerInterface.ts";
+import { CancelledError } from "./workerInterface.ts";
 import { resolveMessageOptions } from "./messageChannel.ts";
 import type { ChannelEvent, MessageOptions } from "./messageChannel.ts";
 
@@ -188,6 +189,13 @@ export class WorkerManager extends EventTarget {
 
   // Track initializing threads
   private initializingThreads = new Set<WorkerInstance>();
+
+  /**
+   * Tasks between dispatch and their wrapper: `enqueueNoQueue` awaiting a new
+   * thread, the only path with an await before `runTask`. A cancel arriving
+   * here is recorded, and the task never reaches the wrapper.
+   */
+  private enqueuing = new Map<string, { cancelled: boolean; reason?: unknown }>();
 
   /** Group id -> units one worker of this pool holds while it exists. */
   residentGroups: Record<string, number>;
@@ -386,6 +394,8 @@ export class WorkerManager extends EventTarget {
         this.initializingThreads.delete(newThread);
         targetThread = newThread;
       } else {
+        const entry: { cancelled: boolean; reason?: unknown } = { cancelled: false };
+        this.enqueuing.set(taskId, entry);
         // For threaded workers, wait for initialization
         await new Promise<void>((resolve) => {
           const checkInit = () => {
@@ -398,6 +408,10 @@ export class WorkerManager extends EventTarget {
           };
           checkInit();
         });
+        if (this.enqueuing.get(taskId) === entry) this.enqueuing.delete(taskId);
+        // Cancelled meanwhile: it never reaches the thread, which stays, idle,
+        // for the next task. The rejection settles it as cancelled.
+        if (entry.cancelled) throw new CancelledError(taskId, entry.reason);
         targetThread = newThread;
       }
     }
@@ -411,6 +425,30 @@ export class WorkerManager extends EventTarget {
 
     // Execute task directly on thread
     return targetThread.runTask(taskId, payload);
+  }
+
+  /**
+   * Called by the scheduler for a task it has dispatched to this pool and
+   * accepted a cancel for. Finds where the attempt is - on its way to a worker,
+   * or on one - and asks it to stop. Settles nothing: the attempt's promise
+   * does, once it has stopped. `token` and `graceMs` are for the forced stop.
+   */
+  _cancelTask(taskId: string, _token?: number, options: { reason?: unknown; graceMs?: number } = {}): void {
+    const enqueuing = this.enqueuing.get(taskId);
+    if (enqueuing) {
+      enqueuing.cancelled = true;
+      enqueuing.reason = options.reason;
+      return;
+    }
+    // A scan of at most maxThreads, at cancel time only, rather than a
+    // task -> worker map that every dispatch would pay for. A worker that
+    // failed under the task has forgotten it, so only the live attempt matches.
+    for (const worker of this.threads) {
+      if (worker.hasTask(taskId)) {
+        worker.cancelTask(taskId, options.reason);
+        return;
+      }
+    }
   }
 
   /** Every worker is created here, so each one gets the message options and the current gate. */
@@ -610,11 +648,14 @@ export class WorkerManager extends EventTarget {
 
     // CRITICAL: Requeue any in-progress tasks (Worker failure ≠ Task failure)
     const runningTaskIds = failedWorker.getRunningTaskIds();
+    // Promises that only this worker's thread could settle, rejected once it is dead
+    const released: ((reason?: any) => void)[] = [];
     runningTaskIds.forEach(taskId => {
       // Before reporting anything: the run on this worker may still be going,
       // and once the task is requeued and dispatched again, its late outcome
       // would otherwise settle the new attempt
-      failedWorker.forgetTask(taskId);
+      const reject = failedWorker.forgetTask(taskId);
+      if (reject) released.push(reject);
 
       // Only requeue if both manager allows requeuing AND worker can be restarted
       if (this.requeueFailedTasks && canRestart !== false) {
@@ -636,7 +677,16 @@ export class WorkerManager extends EventTarget {
     });
 
     // CRITICAL: Mark as failed but keep maxThreads slot (don't remove immediately)
-    this._markWorkerAsFailed(workerId, error, metadata);
+    const stopped = this._markWorkerAsFailed(workerId, error, metadata);
+
+    // The scheduler has already settled every task reported above, so for them
+    // this rejection is stale and ignored. It matters for a task being
+    // cancelled, which the scheduler deliberately did not settle: it settles,
+    // as cancelled, only now that its run has really stopped.
+    if (released.length > 0) {
+      const failure = new Error(`Worker failed: ${error.message}`);
+      stopped.then(() => { for (const reject of released) reject(failure); });
+    }
 
     // CRITICAL: Release group resources immediately (can't process tasks)
     this._releaseWorkerGroupResources(workerId);
@@ -670,8 +720,10 @@ export class WorkerManager extends EventTarget {
   }
 
   // Resource allocation implementation methods (as specified in task)
-  private _markWorkerAsFailed(workerId: string, error: Error, metadata: any) {
+  /** Resolves once the worker has been terminated, or at once if there was nothing to terminate. */
+  private _markWorkerAsFailed(workerId: string, error: Error, metadata: any): Promise<void> {
     const worker = this.threads.find(w => w.id === workerId);
+    let stopped: Promise<void> = Promise.resolve();
     if (worker) {
       // Check if worker is already terminated to avoid double termination
       const alreadyTerminated = (worker as any).state === 'terminated';
@@ -682,7 +734,7 @@ export class WorkerManager extends EventTarget {
 
       // Terminate the actual worker process/thread but keep tracking (if not already terminated)
       if (!alreadyTerminated) {
-        worker.terminate().catch(() => {
+        stopped = worker.terminate().catch(() => {
           // Worker may already be terminated - ignore errors
         });
       }
@@ -690,6 +742,7 @@ export class WorkerManager extends EventTarget {
       // Worker can no longer accept tasks but stays in pool count
       // This is handled by the updated canAcceptTask() method in wrappers
     }
+    return stopped;
   }
 
   private _releaseWorkerGroupResources(workerId: string) {

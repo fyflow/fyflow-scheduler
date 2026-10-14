@@ -1,5 +1,5 @@
 import type { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, TaskWorkerContext } from "./workerInterface.ts";
-import { WorkerTerminationError, isWorkerTerminationError } from "./workerInterface.ts";
+import { CancelledError, WorkerTerminationError, isWorkerTerminationError } from "./workerInterface.ts";
 import { WorkerMessageChannel } from "./messageChannel.ts";
 import { MessageStream } from "./messageChannel.ts";
 import type { ChannelEvent, MessageOptions, MessageSink } from "./messageChannel.ts";
@@ -38,6 +38,14 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     private deliveryScheduled = false;
     /** Set by the pool. Receives each batch, already filtered. */
     messageSink?: MessageSink;
+
+    /**
+     * Each running attempt's controller, behind `context.signal`, and whether a
+     * cancel has been asked for. Recorded synchronously, while the abort itself
+     * is deferred: an attempt still waiting for the worker instance checks the
+     * record and never starts.
+     */
+    private attempts = new Map<string, { controller: AbortController; cancelled: boolean; reason?: unknown }>();
 
     // WorkerInstanceState implementation
     state: 'initializing' | 'healthy' | 'busy' | 'failed' | 'terminated' = 'initializing';
@@ -126,6 +134,21 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         if (!this.runningTaskIds.delete(taskId)) return;
         this.runningTasks--;
         this.runningTaskData.delete(taskId);
+    }
+
+    hasTask(taskId: string): boolean {
+        return this.runningTaskIds.has(taskId);
+    }
+
+    cancelTask(taskId: string, reason?: unknown): void {
+        const attempt = this.attempts.get(taskId);
+        if (!attempt || attempt.cancelled) return;
+        attempt.cancelled = true;
+        attempt.reason = reason;
+        // Deferred: aborting here would run the worker's abort handlers inside
+        // the caller's cancel(), re-entrantly. A thread receives it as a message.
+        // No reason gives the standard AbortError.
+        queueMicrotask(() => attempt.controller.abort(reason));
     }
 
     /**
@@ -428,6 +451,12 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         this.runningTasks++;
         this.runningTaskIds.add(taskId);
         this.runningTaskData.set(taskId, {id: taskId, payload}); // Track task data for requeuing
+        // Created eagerly with the attempt: about 28 ns, against a lazy getter
+        // that would need its own record of a cancel arriving before first use
+        const attempt: { controller: AbortController; cancelled: boolean; reason?: unknown } = { controller: new AbortController(), cancelled: false };
+        this.attempts.set(taskId, attempt);
+        // Cancelled before run() was called: nothing ran, so nothing to report
+        let notStarted = false;
         
         // Emit task started event when task actually begins execution
         this.dispatchEvent(new CustomEvent('task.started', {
@@ -440,6 +469,12 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // asking for the worker to be torn down does that. The task now
             // belongs to another worker, so it must not run here as well.
             if (!this.runningTaskIds.has(taskId)) return undefined;
+            // Cancelled while the instance was being created: run() is never
+            // called, and the rejection settles the task as cancelled
+            if (attempt.cancelled) {
+                notStarted = true;
+                throw new CancelledError(taskId, attempt.reason);
+            }
             fullExecutionStart = performance.now();
 
             // Created on the first emit(), so a task that never emits costs
@@ -487,7 +522,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                         }
                     }));
                 },
-                emit: (name, data) => this.messages.emitTask(streamFor(), name, data)
+                emit: (name, data) => this.messages.emitTask(streamFor(), name, data),
+                signal: attempt.controller.signal
             };
 
             // The attempt's emits close when run() ends, either way, so a stray
@@ -525,8 +561,9 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             return result;
             
         } catch (error) {
-            // Forgotten while running: as for a result above, nothing to report
-            if (!this.runningTaskIds.has(taskId)) throw error;
+            // Forgotten while running: as for a result above, nothing to report.
+            // Nor for an attempt cancelled before it started: it did not fail.
+            if (notStarted || !this.runningTaskIds.has(taskId)) throw error;
 
             // As for a result: its emitted events precede its task.failed
             if (this.messageStreams.delete(taskId)) this._deliverNow(taskId);
@@ -573,6 +610,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
             // unconditionally drove runningTasks below zero
             if (this.runningTaskIds.delete(taskId)) this.runningTasks--;
             this.runningTaskData.delete(taskId); // Also clean up task data
+            if (this.attempts.get(taskId) === attempt) this.attempts.delete(taskId);
 
             // Update task stats
             this.tasksCompleted++;

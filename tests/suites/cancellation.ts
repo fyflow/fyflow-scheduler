@@ -26,6 +26,7 @@ class CancellationTestSuite {
   private startTime = 0;
   private inlineWorkerUrl = "";
   private spawningWorkerUrl = "";
+  private cancelWorkerUrl = "";
   private schedulers: FyflowScheduler[] = [];
 
   async cleanup(): Promise<void> {
@@ -43,11 +44,14 @@ class CancellationTestSuite {
     if (typeof Deno !== "undefined") {
       this.inlineWorkerUrl = new URL("../workers/testInlineWorker.ts", import.meta.url).href;
       this.spawningWorkerUrl = new URL("../workers/spawningWorker.ts", import.meta.url).href;
+      this.cancelWorkerUrl = new URL("../workers/cancelWorker.ts", import.meta.url).href;
     } else {
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       this.inlineWorkerUrl = new URL((await import('../workers/testInlineWorker.ts?worker-direct')).default).href;
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       this.spawningWorkerUrl = new URL((await import('../workers/spawningWorker.ts?worker-direct')).default).href;
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      this.cancelWorkerUrl = new URL((await import('../workers/cancelWorker.ts?worker-direct')).default).href;
     }
 
     const platform = typeof globalThis !== 'undefined' && 'Deno' in globalThis ? 'Deno' : 'Node.js';
@@ -72,6 +76,15 @@ class CancellationTestSuite {
     this.results.push(await this.runTest('scheduler.completed Without A Success', () => this.testCompletion()));
     this.results.push(await this.runTest('Spawns From A Cancelled Task Are Refused', () => this.testSpawnRefused()));
     this.results.push(await this.runTest('onCompleteDescendants Rejects For A Cancelled Root', () => this.testDescendants()));
+    this.results.push(await this.runTest('Cancelled Before Reaching A New Thread', () => this.testBeforeThread()));
+    this.results.push(await this.runTest('Cancelled While Its Thread Initialises', () => this.testThreadInitialising()));
+    this.results.push(await this.runTest('Cancelled Before An Inline run()', () => this.testBeforeInlineRun()));
+    this.results.push(await this.runTest('Cooperative Cancel: The Worker Sees The Signal', () => this.testCooperative()));
+    this.results.push(await this.runTest('A Worker Ignoring The Signal Keeps The Task Cancelling', () => this.testIgnored()));
+    this.results.push(await this.runTest('Worker Failure While Cancelling: Threaded', () => this.testFailureThreaded()));
+    this.results.push(await this.runTest('Worker Failure While Cancelling: Inline', () => this.testFailureInline()));
+    this.results.push(await this.runTest('A Stale Outcome Does Not Settle A Cancelling Attempt', () => this.testCheckOrder()));
+    this.results.push(await this.runTest('Capacity Race: A Cancelling Task Is Not Requeued', () => this.testCapacityRace()));
     this.results.push(await this.runTest('Shutdown Resolves A Pending Inline Cancel', () => this.testShutdownInline()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -140,6 +153,34 @@ class CancellationTestSuite {
       return error;
     }
     return undefined;
+  }
+
+  /** task.progress from cancelWorker, as `id:message`, with each 'stopped' detail kept by id. */
+  private progress(scheduler: FyflowScheduler) {
+    const log: string[] = [];
+    const stopped = new Map<string, any>();
+    const at = new Map<string, number>();
+    scheduler.addEventListener('task.progress', (e: any) => {
+      log.push(`${e.detail.id}:${e.detail.message}`);
+      at.set(`${e.detail.id}:${e.detail.message}`, performance.now());
+      if (e.detail.message === 'stopped') stopped.set(e.detail.id, e.detail.details);
+    });
+    return { log, stopped, at };
+  }
+
+  /** When each task.cancelled fired, by task id. */
+  private cancelledAt(scheduler: FyflowScheduler) {
+    const at = new Map<string, number>();
+    scheduler.addEventListener('task.cancelled', (e: any) => at.set(e.detail.id, performance.now()));
+    return at;
+  }
+
+  /** The value, or a throw if it has not settled within `ms`. */
+  private async within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    return await Promise.race([
+      promise,
+      sleep(ms).then((): never => { throw new Error(`${what}: not settled within ${ms} ms`); })
+    ]);
   }
 
   private async until(predicate: () => boolean, ms = 3000) {
@@ -234,11 +275,16 @@ class CancellationTestSuite {
 
   private async testRunningResultDiscarded(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
-    const { scheduler } = this.make({ groups: ['g'] }, { g: group });
+    const { pool, scheduler } = this.make({ groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
     const log = this.events(scheduler);
-    const task = this.task('runner', { delay: 80 });
+    const { log: progress } = this.progress(scheduler);
+    // The pool's own event: the attempt really did produce a result
+    let produced = false;
+    pool.addEventListener('task.completed', () => { produced = true; });
+    const task = this.task('runner', { mode: 'ignore', delay: 80 });
     const promise = scheduler.addTask(task, { createPromise: true });
-    await this.until(() => log.includes('running:runner'));
+    // Inside run(): cancelled any earlier, it would never start
+    await this.until(() => progress.includes('runner:entered'));
 
     let resolvedAt = 0;
     const cancelled = scheduler.cancel('runner', { reason: 'stop' }).then(v => { resolvedAt = performance.now(); return v; });
@@ -247,6 +293,7 @@ class CancellationTestSuite {
     if (group.running !== 1) throw new Error('Released its resources at the request');
 
     if (await cancelled !== true || await again !== true) throw new Error('cancel() did not resolve true');
+    if (!produced) throw new Error('Precondition: the attempt never produced its result');
     // Read through calls: the checks above narrowed both
     const state = (): string => task.state;
     const held = (): number => group.running;
@@ -260,15 +307,19 @@ class CancellationTestSuite {
   }
 
   private async testRunningFailureNotRetried(): Promise<void> {
-    const { scheduler } = this.make();
+    const { pool, scheduler } = this.make({}, {}, this.cancelWorkerUrl);
     const log = this.events(scheduler);
+    const { log: progress } = this.progress(scheduler);
+    let threw = false;
+    pool.addEventListener('task.failed', () => { threw = true; });
     // Cancelled while its first attempt runs; that attempt then throws
-    scheduler.addEventListener('task.running', (e: any) => {
-      if (e.detail.id === 'thrower') scheduler.cancel('thrower');
-    });
-    const task = this.task('thrower', { shouldThrow: true }, { retryPolicy: { maxRetries: 3, backoffMs: 5 } });
-    await this.rejection(scheduler.addTask(task, { createPromise: true }));
+    const task = this.task('thrower', { mode: 'throw', delay: 50 }, { retryPolicy: { maxRetries: 3, backoffMs: 5 } });
+    const promise = scheduler.addTask(task, { createPromise: true });
+    await this.until(() => progress.includes('thrower:entered'));
+    scheduler.cancel('thrower');
+    await this.rejection(promise);
     await sleep(50);
+    if (!threw) throw new Error('Precondition: the attempt never threw');
     if (task.state !== 'cancelled') throw new Error(`Ended ${task.state}`);
     if (log.some(e => e.startsWith('retrying') || e.startsWith('failed'))) throw new Error(`Events: ${log}`);
     this.assertAccounted(scheduler, 1, 'end');
@@ -462,14 +513,292 @@ class CancellationTestSuite {
     if (!(await this.rejection(wait) instanceof CancelledError)) throw new Error('The wait did not reject with CancelledError');
   }
 
+
+  // --- places 4-7: dispatched ------------------------------------------------
+
+  // Place 4. addTask runs the dispatch synchronously, and on a threaded pool
+  // with no worker yet, enqueueNoQueue awaits the new thread before calling
+  // runTask - so a cancel in the same turn lands in between
+  private async testBeforeThread(): Promise<void> {
+    const group = new ConcurrentLimitGroup(1);
+    const { pool, scheduler } = this.make({ inline: false, groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
+    const { log } = this.progress(scheduler);
+    let started = 0;
+    pool.addEventListener('task.started', () => started++);
+    let acquired = 0, released = 0;
+    scheduler.addEventListener('resource.acquired', () => acquired++);
+    scheduler.addEventListener('resource.released', () => released++);
+
+    const task = this.task('p4');
+    const promise = scheduler.addTask(task, { createPromise: true });
+    if (!(pool as any).enqueuing.has('p4')) throw new Error('Precondition: not between dispatch and its thread');
+    if (await this.within(scheduler.cancel('p4'), 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+
+    if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error('Promise did not reject with CancelledError');
+    // Long enough for the thread to have started it, had it been handed over
+    await sleep(400);
+    if (started !== 0 || log.includes('p4:entered')) throw new Error('It reached the thread');
+    if (acquired !== 1 || released !== 1 || group.running !== 0) throw new Error(`acquired ${acquired}, released ${released}, held ${group.running}`);
+    this.assertAccounted(scheduler, 1, 'end');
+  }
+
+  // Place 5. Handed to a fresh thread, waiting in its queue for it to initialise
+  private async testThreadInitialising(): Promise<void> {
+    const { pool, scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
+    const { log } = this.progress(scheduler);
+    let started = 0;
+    pool.addEventListener('task.started', () => started++);
+
+    const promise = scheduler.addTask(this.task('p5'), { createPromise: true });
+    await sleep(0);
+    const wrapper = pool.threads[0] as any;
+    if (!wrapper || wrapper.initialized || !wrapper.taskQueue.some((t: any) => t.taskId === 'p5')) {
+      throw new Error('Precondition: not waiting for its thread to initialise');
+    }
+    if (await this.within(scheduler.cancel('p5'), 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error('Promise did not reject with CancelledError');
+
+    await this.until(() => wrapper.initialized);
+    await sleep(100);
+    if (started !== 0 || log.includes('p5:entered')) throw new Error('It ran once the thread was ready');
+    this.assertAccounted(scheduler, 1, 'end');
+  }
+
+  // Place 6. On an inline pool the task is running from the start of runTask,
+  // before the worker instance exists
+  private async testBeforeInlineRun(): Promise<void> {
+    const { pool, scheduler } = this.make({}, {}, this.cancelWorkerUrl);
+    const { log } = this.progress(scheduler);
+    let poolFailed = 0;
+    pool.addEventListener('task.failed', () => poolFailed++);
+
+    const task = this.task('p6');
+    const promise = scheduler.addTask(task, { createPromise: true });
+    if (task.state !== 'running' || (pool.threads[0] as any)?.workerInstance) {
+      throw new Error('Precondition: not waiting for the worker instance');
+    }
+    if (await this.within(scheduler.cancel('p6'), 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error('Promise did not reject with CancelledError');
+    await sleep(50);
+    if (log.includes('p6:entered')) throw new Error('run() was called');
+    if (poolFailed !== 0) throw new Error('The pool reported it failed');
+
+    // The worker instance is fine: the next task runs on it
+    await this.within(scheduler.addTask(this.task('next', { delay: 1 }), { createPromise: true }) as Promise<any>, 3000, 'next task');
+    this.assertAccounted(scheduler, 2, 'end');
+  }
+
+  // Place 7, on both pool types: a worker honouring the signal stops at once
+  private async testCooperative(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const { scheduler } = this.make({ inline }, {}, this.cancelWorkerUrl);
+      const log = this.events(scheduler);
+      const { log: progress, stopped } = this.progress(scheduler);
+
+      // With a reason, which reaches the worker's signal
+      const id = `coop-${kind}`;
+      const promise = scheduler.addTask(this.task(id, { delay: 10_000 }), { createPromise: true });
+      await this.until(() => progress.includes(`${id}:entered`));
+      // The worker's abort handler reports synchronously; it must not run
+      // inside the caller's cancel() - deferred inline, a message on a thread
+      let insideCancel = false;
+      let handlerRanInside: boolean | undefined;
+      scheduler.addEventListener('task.progress', (e: any) => {
+        if (e.detail.id === id && e.detail.message === 'abort-handler') handlerRanInside = insideCancel;
+      });
+      const start = performance.now();
+      insideCancel = true;
+      const request = scheduler.cancel(id, { reason: 'user stop' });
+      insideCancel = false;
+      if (await this.within(request, 3000, `${kind} cancel()`) !== true) {
+        throw new Error(`${kind}: cancel() resolved false`);
+      }
+      if (performance.now() - start > 2000) throw new Error(`${kind}: took ${performance.now() - start} ms`);
+      const seen = stopped.get(id);
+      if (!seen?.aborted || seen.reason !== 'user stop') throw new Error(`${kind}: the worker saw ${JSON.stringify(seen)}`);
+      if (handlerRanInside !== false) throw new Error(`${kind}: abort handler ${handlerRanInside ? 'ran inside cancel()' : 'never reported'}`);
+      const order = log.filter(e => e.endsWith(`:${id}`)).join(' ');
+      if (order !== `running:${id} cancelling:${id} cancelled:${id}`) throw new Error(`${kind}: ${order}`);
+      if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error(`${kind}: not a CancelledError`);
+
+      // Without one - or, on a thread, with one that cannot be cloned - the
+      // worker sees the standard AbortError, and the host keeps the reason
+      const bare = `bare-${kind}`;
+      const unclonable = () => 'not cloneable';
+      const barePromise = scheduler.addTask(this.task(bare, { delay: 10_000 }), { createPromise: true });
+      await this.until(() => progress.includes(`${bare}:entered`));
+      await this.within(scheduler.cancel(bare, inline ? {} : { reason: unclonable }), 3000, `${kind} bare cancel()`);
+      if (stopped.get(bare)?.reasonName !== 'AbortError') throw new Error(`${kind}: the worker saw ${JSON.stringify(stopped.get(bare))}`);
+      const error = await this.rejection(barePromise);
+      if (!inline && error?.reason !== unclonable) throw new Error('The host lost the reason');
+      this.assertAccounted(scheduler, 2, kind);
+    }
+  }
+
+  // A worker that does not look at its signal keeps the task cancelling, with
+  // its resources held, until run() returns. On a thread this is also the
+  // protocol check: a 'cancel' answered as an invalid action would reject the
+  // task's promise and settle it at once
+  private async testIgnored(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const group = new ConcurrentLimitGroup(1);
+      const { scheduler } = this.make({ inline, groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
+      const { log: progress, at } = this.progress(scheduler);
+      const cancelledAt = this.cancelledAt(scheduler);
+      const id = `deaf-${kind}`;
+      const task = this.task(id, { mode: 'ignore', delay: 600 });
+      scheduler.addTask(task);
+      await this.until(() => progress.includes(`${id}:entered`));
+
+      const cancelled = scheduler.cancel(id, { graceMs: Infinity });
+      await sleep(300);
+      if (task.state !== 'running' || !task.cancellation) throw new Error(`${kind}: ${task.state} while its run was still going`);
+      if (group.running !== 1) throw new Error(`${kind}: resources released while its run was still going`);
+      if (await this.within(cancelled, 3000, `${kind} cancel()`) !== true) throw new Error(`${kind}: cancel() resolved false`);
+      const ranFor = cancelledAt.get(id)! - at.get(`${id}:entered`)!;
+      if (ranFor < 550) throw new Error(`${kind}: settled ${ranFor.toFixed(0)} ms after entering, before run() returned`);
+      const ended = (): string => task.state;
+      const held = (): number => group.running;
+      if (ended() !== 'cancelled' || held() !== 0) throw new Error(`${kind}: ended ${ended()}, holding ${held()}`);
+      this.assertAccounted(scheduler, 1, kind);
+    }
+  }
+
+  // A co-tenant fails the worker while the task is cancelling. It settles as
+  // cancelled - never requeued, never failed - and only once its run has
+  // stopped: on a thread, when the thread is dead. Before the release, its
+  // promise was dropped with the thread and it never settled at all.
+  private async testFailureThreaded(): Promise<void> {
+    for (const requeueFailedTasks of [true, false]) {
+      const group = new ConcurrentLimitGroup(2);
+      const { pool, scheduler } = this.make(
+        { inline: false, maxConcurrentTasks: 2, requeueFailedTasks, groups: ['g'] }, { g: group }, this.cancelWorkerUrl
+      );
+      const log = this.events(scheduler);
+      const { log: progress } = this.progress(scheduler);
+      const cancelledAt = this.cancelledAt(scheduler);
+      let teardownAt = 0;
+      for (const ev of ['worker.teardown.completed', 'worker.teardown.failed']) {
+        pool.addEventListener(ev, () => { teardownAt ||= performance.now(); });
+      }
+
+      const victim = this.task('victim', { mode: 'ignore', delay: 4000 });
+      scheduler.addTask(victim);
+      await this.until(() => progress.includes('victim:entered'));
+      scheduler.addTask(this.task('cotenant', { mode: 'terminate', delay: 150 }, { optional: true }));
+      const cancelled = scheduler.cancel('victim', { graceMs: Infinity });
+
+      if (await this.within(cancelled, 3000, `requeue ${requeueFailedTasks}: cancel()`) !== true) throw new Error('cancel() resolved false');
+      if (victim.state !== 'cancelled') throw new Error(`Ended ${victim.state}`);
+      if (!teardownAt || cancelledAt.get('victim')! < teardownAt) throw new Error('Settled before its thread was torn down');
+      if (log.filter(e => e.endsWith(':victim')).some(e => !/^(running|cancelling|cancelled):/.test(e))) throw new Error(`Events: ${log}`);
+      await this.until(() => scheduler.stats.running === 0);
+      if (group.running !== 0) throw new Error(`Group holds ${group.running}`);
+      this.assertAccounted(scheduler, 2, `requeue ${requeueFailedTasks}`);
+    }
+  }
+
+  // The inline case: the worker fails at once, but the cancelling run goes on,
+  // and the task must not settle - or give back its resources - until it ends
+  private async testFailureInline(): Promise<void> {
+    for (const requeueFailedTasks of [true, false]) {
+      const group = new ConcurrentLimitGroup(2);
+      const { scheduler } = this.make({ maxConcurrentTasks: 2, requeueFailedTasks, groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
+      const log = this.events(scheduler);
+      const { log: progress, at } = this.progress(scheduler);
+      const cancelledAt = this.cancelledAt(scheduler);
+
+      const victim = this.task('victim', { mode: 'ignore', delay: 500 });
+      scheduler.addTask(victim);
+      await this.until(() => progress.includes('victim:entered'));
+      scheduler.addTask(this.task('cotenant', { mode: 'terminate', delay: 50 }, { optional: true }));
+      const cancelled = scheduler.cancel('victim');
+
+      await sleep(250);
+      if (victim.state !== 'running') throw new Error(`requeue ${requeueFailedTasks}: ${victim.state} while its run was still going`);
+      if (group.running < 1) throw new Error(`requeue ${requeueFailedTasks}: its resources were released while its run was still going`);
+      if (await this.within(cancelled, 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+      const ranFor = cancelledAt.get('victim')! - at.get('victim:entered')!;
+      if (ranFor < 450) throw new Error(`requeue ${requeueFailedTasks}: settled ${ranFor.toFixed(0)} ms after entering`);
+      if (log.filter(e => e.endsWith(':victim')).some(e => !/^(running|cancelling|cancelled):/.test(e))) throw new Error(`Events: ${log}`);
+      await this.until(() => scheduler.stats.running === 0);
+      this.assertAccounted(scheduler, 2, `requeue ${requeueFailedTasks}`);
+    }
+  }
+
+  // Attempt 1 is requeued off a failed worker and keeps running there; attempt
+  // 2 is cancelled on a new worker. Attempt 1 ends first, and its outcome is
+  // stale: the token check must come before the cancel marker, or that
+  // outcome settles attempt 2 while it still runs
+  private async testCheckOrder(): Promise<void> {
+    const { scheduler } = this.make({ maxThreads: 2, maxConcurrentTasks: 2 }, {}, this.cancelWorkerUrl);
+    const entered: number[] = [];
+    scheduler.addEventListener('task.progress', (e: any) => {
+      if (e.detail.id === 'twice' && e.detail.message === 'entered') entered.push(performance.now());
+    });
+    const cancelledAt = this.cancelledAt(scheduler);
+
+    const task = this.task('twice', { mode: 'ignore', delay: 400 });
+    scheduler.addTask(task);
+    await this.until(() => entered.length === 1);
+    // Fails the first worker 150 ms in: 'twice' is requeued onto a second one
+    scheduler.addTask(this.task('breaker', { mode: 'terminate', delay: 150 }, { optional: true }));
+    await this.until(() => entered.length === 2);
+    const cancelled = scheduler.cancel('twice');
+
+    if (await this.within(cancelled, 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    const ranFor = cancelledAt.get('twice')! - entered[1];
+    if (ranFor < 350) throw new Error(`Settled ${ranFor.toFixed(0)} ms into attempt 2 - by attempt 1's outcome`);
+    this.assertAccounted(scheduler, 2, 'end');
+  }
+
+  // _dispatchTask's capacity-race branch puts a task back in the ready queue.
+  // Being cancelled, it ends there instead. A real race cannot reach it any
+  // more, so the pool's enqueue is replaced for one call
+  private async testCapacityRace(): Promise<void> {
+    const group = new ConcurrentLimitGroup(1);
+    const { pool, scheduler } = this.make({ groups: ['g'] }, { g: group });
+    let acquired = 0;
+    scheduler.addEventListener('resource.acquired', () => acquired++);
+    const real = pool.enqueueNoQueue.bind(pool);
+    let raced = false;
+    let redispatched = 0;
+    pool.enqueueNoQueue = (taskId: string, payload: any) => {
+      if (raced) {
+        redispatched++;
+        return real(taskId, payload);
+      }
+      raced = true;
+      return new Promise((_, reject) => setTimeout(() => reject(new Error('Worker at maximum concurrent task capacity')), 30));
+    };
+    const task = this.task('racer', { delay: 1 });
+    const promise = scheduler.addTask(task, { createPromise: true });
+    if (!raced || task.state !== 'running') throw new Error('Precondition: not in the raced enqueue');
+    const cancelled = scheduler.cancel('racer');
+    if (await this.within(cancelled, 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
+    if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error('Promise did not reject with CancelledError');
+    await sleep(50);
+    const state = (): string => task.state;
+    if (state() !== 'cancelled') throw new Error(`Ended ${state()}`);
+    // Cancel wins, or the marker check at dispatch, would still end it
+    // cancelled after going round again - the point is that it does not
+    if (redispatched !== 0 || acquired !== 1) throw new Error(`Dispatched again after the cancel: ${acquired} acquisitions`);
+    if (group.running !== 0) throw new Error(`Group holds ${group.running}`);
+    this.assertAccounted(scheduler, 1, 'end');
+  }
+
   // An inline run cannot be stopped. At shutdown its cancel() resolves false,
   // and when the run ends later, nothing is emitted
   private async testShutdownInline(): Promise<void> {
-    const { scheduler } = this.make();
+    const { scheduler } = this.make({}, {}, this.cancelWorkerUrl);
     const log = this.events(scheduler);
-    const task = this.task('stubborn', { delay: 6000 });
+    const { log: progress } = this.progress(scheduler);
+    const task = this.task('stubborn', { mode: 'ignore', delay: 6000 });
     scheduler.addTask(task);
-    await this.until(() => task.state === 'running');
+    // Inside run(): cancelled any earlier, it would never start, and settle
+    await this.until(() => progress.includes('stubborn:entered'));
     const cancelled = scheduler.cancel('stubborn');
     // shutdown() waits up to 5 s for running tasks; this one outlasts it
     await scheduler.shutdown();
