@@ -1,5 +1,14 @@
 # Queue Persistence Analysis
 
+> **Status: abandoned (2026-10-14). Do not build from this.** It was written
+> against an architecture that no longer exists - `scheduler.readyQueue`, a
+> `dispatched` state - and it predates per-key blocked queues, retry backoff
+> outside the ready queue, attempt accounting and cancellation, all of which a
+> persisted queue would now have to carry. Nothing asks for persistence:
+> `AGENTS.md` lists it as not implemented, and fyflow-app said in its pass 1
+> requests that it does not want it. For resuming after a restart, the
+> supported route is re-adding tasks with `attemptsSpent` (`AGENTS.md` §10).
+
 This document analyzes the complexity, approaches, and implementation strategies for making the FyFlow scheduler queue persistent across system restarts.
 
 ## Complexity Assessment: **Medium to High**
