@@ -20,6 +20,11 @@
  * `length`, `shift()`, iteration, `includes()` - and costs nothing until the
  * head reaches it.
  *
+ * Several queues can share a **live count**, kept by every operation, so the
+ * scheduler can ask "is any task blocked?" in O(1) rather than visiting every
+ * blocked queue - a keyed group has one per key, thousands of them, and the
+ * question is asked on every cancel.
+ *
  * Internal: not exported from the package. Keeps the array-like surface the
  * scheduler and `examples/test-deadlock.ts` read (`length`, iteration).
  */
@@ -29,9 +34,12 @@ export class TaskQueue<T> implements Iterable<T> {
   private readonly members?: Set<T>;
   /** Items tombstoned but not yet passed by the head. Created on first use. */
   private dead?: Set<T>;
+  /** Shared with other queues: their live items, together. */
+  private readonly counter?: { live: number };
 
-  constructor(options: { trackMembership?: boolean } = {}) {
+  constructor(options: { trackMembership?: boolean; counter?: { live: number } } = {}) {
     if (options.trackMembership) this.members = new Set<T>();
+    this.counter = options.counter;
   }
 
   /** Live items: tombstones are not counted. */
@@ -57,6 +65,7 @@ export class TaskQueue<T> implements Iterable<T> {
   push(item: T): void {
     this.items.push(item);
     this.members?.add(item);
+    if (this.counter) this.counter.live++;
   }
 
   shift(): T | undefined {
@@ -68,6 +77,7 @@ export class TaskQueue<T> implements Iterable<T> {
       this._compact();
       if (this.dead?.delete(item)) continue;
       this.members?.delete(item);
+      if (this.counter) this.counter.live--;
       return item;
     }
     return undefined;
@@ -96,6 +106,7 @@ export class TaskQueue<T> implements Iterable<T> {
       this.head = 0;
     }
     if (this.members) for (const item of items) this.members.add(item);
+    if (this.counter) this.counter.live += items.length;
   }
 
   /**
@@ -107,6 +118,7 @@ export class TaskQueue<T> implements Iterable<T> {
   tombstone(item: T): void {
     (this.dead ??= new Set<T>()).add(item);
     this.members?.delete(item);
+    if (this.counter) this.counter.live--;
   }
 
   /** O(1) with membership tracking, otherwise a linear scan. */
@@ -134,12 +146,14 @@ export class TaskQueue<T> implements Iterable<T> {
       if (this.items[i] !== item) continue;
       this.items.splice(i, 1);
       this.members?.delete(item);
+      if (this.counter) this.counter.live--;
       return true;
     }
     return false;
   }
 
   clear(): void {
+    if (this.counter) this.counter.live -= this.length;
     this.items = [];
     this.head = 0;
     this.members?.clear();

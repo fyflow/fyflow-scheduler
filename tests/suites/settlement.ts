@@ -27,6 +27,7 @@ class SettlementTestSuite {
   private crashWorkerUrl = "";
   private selfTerminatingWorkerUrl = "";
   private requeueWorkerUrl = "";
+  private returnWorkerUrl = "";
   private schedulers: FyflowScheduler[] = [];
 
   private track(scheduler: FyflowScheduler): FyflowScheduler {
@@ -50,6 +51,7 @@ class SettlementTestSuite {
       this.crashWorkerUrl = new URL("../workers/crashingWorker.ts", import.meta.url).href;
       this.selfTerminatingWorkerUrl = new URL("../workers/selfTerminatingWorker.ts", import.meta.url).href;
       this.requeueWorkerUrl = new URL("../workers/requeueWorker.ts", import.meta.url).href;
+      this.returnWorkerUrl = new URL("../workers/returnWorker.ts", import.meta.url).href;
     } else {
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       this.crashWorkerUrl = new URL((await import('../workers/crashingWorker.ts?worker-direct')).default).href;
@@ -57,6 +59,8 @@ class SettlementTestSuite {
       this.selfTerminatingWorkerUrl = new URL((await import('../workers/selfTerminatingWorker.ts?worker-direct')).default).href;
       // @ts-expect-error - esbuild resolves ?worker-direct at build time
       this.requeueWorkerUrl = new URL((await import('../workers/requeueWorker.ts?worker-direct')).default).href;
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      this.returnWorkerUrl = new URL((await import('../workers/returnWorker.ts?worker-direct')).default).href;
     }
 
     const platform = typeof globalThis !== 'undefined' && 'Deno' in globalThis ? 'Deno' : 'Node.js';
@@ -99,6 +103,7 @@ class SettlementTestSuite {
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Result', () => this.testRequeueAbandonedResultIgnored()));
     this.results.push(await this.runTest('Requeue Ignores The Abandoned Run\'s Failure', () => this.testRequeueAbandonedFailureIgnored()));
     this.results.push(await this.runTest('Requeue Drops The Abandoned Run\'s Progress And Spawns', () => this.testRequeueAbandonedSideEffectsDropped()));
+    this.results.push(await this.runTest('Any Returned Value Settles, null And undefined Included', () => this.testFalsyResults()));
 
     const totalDuration = performance.now() - this.startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -1106,6 +1111,28 @@ class SettlementTestSuite {
   // re-dispatch belong to no live attempt and must be dropped, or the live
   // attempt reports another run's progress and the task spawns its children
   // twice.
+  // A threaded run returning null or undefined - a run() with no return - used
+  // to throw in the host's message handler, which read a field off the result
+  // before checking it was an object: an uncaught error that took the host
+  // process down
+  private async testFalsyResults(): Promise<void> {
+    for (const inline of [true, false]) {
+      const kind = inline ? 'inline' : 'threaded';
+      const pool = new WorkerManager(this.returnWorkerUrl, { maxThreads: 1, inline, idleTimeout: 0 });
+      const scheduler = this.track(new FyflowScheduler({ ReturnWorker: pool }));
+      for (const value of [null, undefined, 0, '', false]) {
+        const task = new FyflowTask({ id: `returns-${kind}-${String(value)}`, workerType: 'ReturnWorker', payload: { value } });
+        const result = await Promise.race([
+          scheduler.addTask(task, { createPromise: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('never settled')), 3000))
+        ]);
+        if (result !== value || task.state !== 'done') {
+          throw new Error(`${kind}: returning ${String(value)} gave ${String(result)}, ${task.state}`);
+        }
+      }
+    }
+  }
+
   private async testRequeueAbandonedSideEffectsDropped(): Promise<void> {
     for (const inline of [true, false]) {
       const kind = inline ? 'inline' : 'threaded';

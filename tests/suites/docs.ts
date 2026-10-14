@@ -14,7 +14,8 @@ import {
   ConcurrentLimitGroup,
   RateLimitGroup,
   KeyedRateLimitGroup,
-  WorkerTerminationError
+  WorkerTerminationError,
+  CancelledError
 } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 import type { WorkerStatus } from '../../index.ts';
@@ -133,6 +134,10 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
     this.results.push(await this.runTest('Doc: A Failed Setup Still Tears The Worker Down', () => this.docSetupFailureTearsDown()));
     this.results.push(await this.runTest('Doc: A Typed .ts Worker Runs Under Node Type Stripping', () => this.docTypeScriptWorkerOnNode()));
+    this.results.push(await this.runTest('Doc: Cancelling Tasks', () => this.docCancel()));
+    this.results.push(await this.runTest('Doc: Cancelling A Run', () => this.docCancelRun()));
+    this.results.push(await this.runTest('Doc: The Forced Stop', () => this.docForcedStop()));
+    this.results.push(await this.runTest('Doc: Cancelled Tasks In Events And Descendants', () => this.docCancelEvents()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -1486,6 +1491,250 @@ class DocsTestSuite {
   }
 
   // --- helpers -------------------------------------------------------------
+
+  // RECIPE: README "Cancelling Tasks", and the AGENTS.md section 5 contract of
+  // cancel(): a waiting task never runs, a running one sees its signal - here
+  // passed to fetch(), against a server that never answers
+  private async docCancel(): Promise<void> {
+    const server = await this.hangingServer();
+    try {
+      const scheduler = this.makeScheduler({ maxThreads: 1, maxConcurrentTasks: 1 });
+      const events: string[] = [];
+      for (const name of ['task.running', 'task.cancelling', 'task.cancelled']) {
+        scheduler.addEventListener(name, (e: any) => events.push(`${name.slice(5)}:${e.detail.id}`));
+      }
+
+      const task = new FyflowTask({ id: 'doc-cancel', workerType: 'DocsWorker', payload: { url: server.url } });
+      const promise = scheduler.addTask(task, { createPromise: true }) as Promise<any>;
+      const waiting = new FyflowTask({ id: 'doc-cancel-waiting', workerType: 'DocsWorker', payload: { value: 1 } });
+      const waitingPromise = scheduler.addTask(waiting, { createPromise: true }) as Promise<any>;
+      await this.waitFor(() => task.state === 'running', 2000, 'the fetch to start');
+      await new Promise(r => setTimeout(r, 50));
+
+      // A waiting task: removed at once, never runs, no task.cancelling
+      if (await scheduler.cancel('doc-cancel-waiting') !== true) throw new Error('Waiting task: cancel() resolved false');
+      const waitingError = await waitingPromise.then(() => undefined, (e) => e);
+      if (!(waitingError instanceof CancelledError)) throw new Error(`Waiting task rejected with ${waitingError}`);
+
+      // As published
+      const cancelled = await scheduler.cancel(task.id, { reason: 'stopped by the user' });
+      let caught: unknown;
+      try {
+        await promise;
+      } catch (error) {
+        if (error instanceof CancelledError) caught = error;
+      }
+
+      if (cancelled !== true) throw new Error('cancel() resolved false');
+      if (!(caught instanceof CancelledError) || caught.taskId !== task.id || caught.reason !== 'stopped by the user') {
+        throw new Error(`Rejected with ${caught}`);
+      }
+      const order = events.join(' ');
+      if (order !== 'running:doc-cancel cancelled:doc-cancel-waiting cancelling:doc-cancel cancelled:doc-cancel') {
+        throw new Error(`Events: ${order}`);
+      }
+      if (task.state !== 'cancelled' || task.cancellation?.reason !== 'stopped by the user' || task.cancellation.forced !== false) {
+        throw new Error(`Task: ${task.state}, ${JSON.stringify(task.cancellation)}`);
+      }
+      if (scheduler.stats.cancelled !== 2 || scheduler.stats.running !== 0) throw new Error(`Stats: ${JSON.stringify(scheduler.stats)}`);
+
+      // true again when already cancelled; false when unknown or finished first
+      if (await scheduler.cancel(task.id) !== true) throw new Error('A repeat cancel() resolved false');
+      if (await scheduler.cancel('no-such-task') !== false) throw new Error('An unknown id resolved true');
+      const finished = new FyflowTask({ id: 'doc-cancel-finished', workerType: 'DocsWorker', payload: { value: 2 } });
+      await scheduler.addTask(finished, { createPromise: true });
+      if (await scheduler.cancel(finished.id) !== false) throw new Error('A finished task resolved true');
+
+      // A bad graceMs throws synchronously, rather than rejecting
+      for (const [graceMs, kind] of [['1', TypeError], [-1, RangeError], [NaN, RangeError]] as const) {
+        let thrown: unknown;
+        try { scheduler.cancel(task.id, { graceMs: graceMs as any }); } catch (error) { thrown = error; }
+        if (!(thrown instanceof kind)) throw new Error(`graceMs ${String(graceMs)}: threw ${thrown}`);
+      }
+
+      // The object cannot be added again; a new one may reuse the id
+      let readded = '';
+      try { scheduler.addTask(task); } catch (error: any) { readded = error.message; }
+      if (readded !== `Task "doc-cancel" was cancelled - create a new FyflowTask to run it again`) {
+        throw new Error(`Re-adding: "${readded}"`);
+      }
+      const again = new FyflowTask({ id: 'doc-cancel', workerType: 'DocsWorker', payload: { value: 3 } });
+      const result = await scheduler.addTask(again, { createPromise: true });
+      if (result?.value !== 3) throw new Error(`The new task returned ${JSON.stringify(result)}`);
+
+      // An optional task rejects too, rather than resolving null
+      const optional = new FyflowTask({
+        id: 'doc-cancel-optional', workerType: 'DocsWorker', payload: { url: server.url }, optional: true
+      });
+      const optionalPromise = scheduler.addTask(optional, { createPromise: true }) as Promise<any>;
+      await this.waitFor(() => optional.state === 'running', 2000, 'the optional task to start');
+      await scheduler.cancel(optional.id);
+      const optionalOutcome = await optionalPromise.then(v => `resolved ${v}`, e => e);
+      if (!(optionalOutcome instanceof CancelledError)) throw new Error(`Optional task: ${optionalOutcome}`);
+    } finally {
+      await server.close();
+    }
+  }
+
+  // RECIPE: AGENTS.md section 10 - cancelling a run, with nothing left
+  // running once the cancels have resolved
+  private async docCancelRun(): Promise<void> {
+    const server = await this.hangingServer();
+    try {
+      const scheduler = this.makeScheduler({ maxThreads: 1, maxConcurrentTasks: 2 });
+      const quick = new FyflowTask({ id: 'run-0', workerType: 'DocsWorker', payload: { value: 1 } });
+      const tasks = [quick, ...Array.from({ length: 5 }, (_, i) =>
+        new FyflowTask({ id: `run-${i + 1}`, workerType: 'DocsWorker', payload: { url: server.url } }))];
+
+      // As published
+      const ids = tasks.map(t => t.id);
+      const promises = scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[];
+
+      await this.waitFor(() => quick.state === 'done', 2000, 'the quick task');
+      await this.waitFor(() => scheduler.stats.running === 2, 2000, 'two fetches in flight');
+
+      const answers = await Promise.all(ids.map(id => scheduler.cancel(id, { reason: 'stopped by the user' })));
+
+      // "after the await nothing from the run is still running"
+      if (scheduler.stats.running !== 0) throw new Error(`${scheduler.stats.running} still running`);
+      if (answers.join() !== 'false,true,true,true,true,true') throw new Error(`cancel() answered ${answers}`);
+
+      const cancelledIds: string[] = [];
+      for (const outcome of await Promise.allSettled(promises)) {
+        if (outcome.status === 'rejected' && outcome.reason instanceof CancelledError) {
+          cancelledIds.push(outcome.reason.taskId);
+          if (outcome.reason.reason !== 'stopped by the user') throw new Error(`Reason: ${outcome.reason.reason}`);
+        }
+      }
+      if (cancelledIds.join() !== ids.slice(1).join()) throw new Error(`Cancelled: ${cancelledIds}`);
+    } finally {
+      await server.close();
+    }
+  }
+
+  // AGENTS.md sections 4 and 8: a CPU-bound threaded worker that yields sees
+  // its signal and stops by itself; one that never yields is force-stopped,
+  // without counting a restart. An inline run is never forced.
+  private async docForcedStop(): Promise<void> {
+    // Yields: stops by itself, well inside the default grace period
+    {
+      const scheduler = this.makeScheduler({ inline: false, maxThreads: 1, maxConcurrentTasks: 1 });
+      const task = new FyflowTask({ id: 'doc-yields', workerType: 'DocsWorker', payload: { n: 1e12 } });
+      scheduler.addTask(task);
+      await this.waitFor(() => task.state === 'running', 5000, 'the loop to start');
+      await new Promise(r => setTimeout(r, 100));
+      const start = performance.now();
+      await scheduler.cancel(task.id);
+      const took = performance.now() - start;
+      if (task.cancellation?.forced !== false || took > 1000) {
+        throw new Error(`A yielding loop: forced ${task.cancellation?.forced} after ${took.toFixed(0)} ms`);
+      }
+    }
+
+    // Never yields: retired after graceMs. Its co-tenant is requeued with
+    // requeueFailedTasks false, and no restart is counted - with
+    // maxWorkerRestarts 0, one would emit worker.restart_limit_exceeded
+    {
+      const scheduler = this.makeScheduler({
+        inline: false, maxThreads: 1, maxConcurrentTasks: 2, requeueFailedTasks: false, maxWorkerRestarts: 0
+      });
+      const pool = scheduler.workerPools.DocsWorker;
+      const failures: string[] = [];
+      for (const name of ['worker.failed', 'worker.restart_limit_exceeded']) {
+        pool.addEventListener(name, () => failures.push(name));
+      }
+      const cotenant = new FyflowTask({ id: 'doc-cotenant', workerType: 'DocsWorker', payload: { awaitMs: 300, value: 7 } });
+      const cotenantResult = scheduler.addTask(cotenant, { createPromise: true }) as Promise<any>;
+      await this.waitFor(() => cotenant.state === 'running', 5000, 'the co-tenant to start');
+      const spinner = new FyflowTask({ id: 'doc-spins', workerType: 'DocsWorker', payload: { spinMs: 10_000 } });
+      scheduler.addTask(spinner);
+      await this.waitFor(() => spinner.state === 'running', 5000, 'the spin to start');
+      await new Promise(r => setTimeout(r, 100));
+      const firstWorker = pool.getWorkerIds()[0];
+
+      await scheduler.cancel(spinner.id, { graceMs: 100 });
+      if (spinner.state !== 'cancelled' || spinner.cancellation?.forced !== true) {
+        throw new Error(`Spinner: ${spinner.state}, forced ${spinner.cancellation?.forced}`);
+      }
+      const value = (await cotenantResult)?.value;
+      if (value !== 7) throw new Error(`The co-tenant returned ${value}`);
+      if (failures.length > 0) throw new Error(`Reported as a failure: ${failures}`);
+      if (pool.getWorkerIds().includes(firstWorker)) throw new Error('The retired worker is still in the pool');
+    }
+
+    // Inline: never forced, even with a grace period of 0
+    {
+      const scheduler = this.makeScheduler({ maxThreads: 1, maxConcurrentTasks: 1 });
+      const task = new FyflowTask({ id: 'doc-inline', workerType: 'DocsWorker', payload: { awaitMs: 400 } });
+      scheduler.addTask(task);
+      await this.waitFor(() => task.state === 'running', 2000, 'the inline task to start');
+      // Inside run(): an inline task cancelled before run() starts never runs
+      await new Promise(r => setTimeout(r, 100));
+      const cancelled = scheduler.cancel(task.id, { graceMs: 0 });
+      await new Promise(r => setTimeout(r, 200));
+      const midway = (): string => task.state;
+      if (midway() !== 'running') throw new Error(`Inline: ${midway()} while run() was still going`);
+      await cancelled;
+      if (task.state !== 'cancelled' || task.cancellation?.forced !== false) throw new Error(`Inline: ${task.state}`);
+    }
+  }
+
+  // AGENTS.md sections 6 and 7: the 'cancelled' unblock reason, a cancelled
+  // root's descendant wait, and scheduler.completed for a run that was all
+  // cancelled
+  private async docCancelEvents(): Promise<void> {
+    const scheduler = this.makeScheduler({ maxThreads: 1, maxConcurrentTasks: 2, groups: ['one'] },
+      { one: new ConcurrentLimitGroup(1) });
+    const reasons: string[] = [];
+    scheduler.addEventListener('resource.unblocked', (e: any) => reasons.push(e.detail.reason));
+    let completed = 0;
+    scheduler.addEventListener('scheduler.completed', () => completed++);
+
+    const holder = new FyflowTask({ id: 'doc-holder', workerType: 'DocsWorker', payload: { awaitMs: 200 } });
+    scheduler.addTask(holder);
+    const blocked = new FyflowTask({ id: 'doc-blocked', workerType: 'DocsWorker', payload: { value: 1 } });
+    scheduler.addTask(blocked);
+    // Blocked once the pool has a worker to offer it, and the holder has the group
+    await this.waitFor(() => scheduler.getAdmissionQueue('one').one?.[0]?.holderId === 'doc-blocked', 2000, 'the task to block');
+    const descendants = blocked.onCompleteDescendants();
+
+    await scheduler.cancel(blocked.id);
+    if (reasons.join() !== 'cancelled') throw new Error(`Unblocked reasons: ${reasons}`);
+    const error = await descendants.then(() => undefined, e => e);
+    if (!(error instanceof CancelledError)) throw new Error(`onCompleteDescendants rejected with ${error}`);
+
+    await scheduler.cancel(holder.id);
+    await this.waitFor(() => completed > 0, 2000, 'scheduler.completed');
+    if (scheduler.stats.done !== 0 || scheduler.stats.cancelled !== 2) throw new Error(`Stats: ${JSON.stringify(scheduler.stats)}`);
+  }
+
+  /** An HTTP server that takes requests and never answers them. */
+  private async hangingServer(): Promise<{ url: string; close: () => Promise<void> }> {
+    if (typeof Deno !== 'undefined') {
+      const controller = new AbortController();
+      const server = Deno.serve(
+        { port: 0, hostname: '127.0.0.1', signal: controller.signal, onListen() {} },
+        // Answers only once the client has gone, so the server can close
+        (request) => new Promise<Response>(resolve => {
+          request.signal.addEventListener('abort', () => resolve(new Response(null)));
+        })
+      );
+      return {
+        url: `http://127.0.0.1:${server.addr.port}/`,
+        close: async () => { controller.abort(); await server.finished; }
+      };
+    }
+    const http = await import('node:http');
+    const server = http.createServer(() => {});
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return {
+      url: `http://127.0.0.1:${(server.address() as any).port}/`,
+      close: () => new Promise<void>(resolve => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      })
+    };
+  }
 
   private async waitFor(predicate: () => boolean, timeoutMs: number, what: string): Promise<void> {
     const start = performance.now();

@@ -1,14 +1,17 @@
 // Task cancellation: scheduler.cancel().
 //
-// A task can be in seven places when a cancel arrives (doc/design/
-// task-cancellation.md): waiting in the ready queue, a blocked queue, or a retry
-// backoff; or dispatched, from just handed to the pool to inside run(). These
-// tests pin each, the events a listener can cancel from mid-transition, and the
-// counters. The counter check is exact - queued + running + done + failed +
+// A task can be in seven places when a cancel arrives. Waiting, and removed at
+// once: 1. the ready queue, 2. a blocked queue, 3. a retry backoff. Dispatched,
+// and settled once its attempt stops: 4. on its way to a new thread
+// (enqueueNoQueue awaiting it), 5. in a thread's start-up queue, 6. inline,
+// before run(), 7. inside run() - the only one where the worker sees its
+// signal, and on a thread the only one that can need a forced stop. These
+// tests pin each, the events a listener can cancel from mid-transition, the
+// forced stop, and the counters. The counter check is exact - queued + running + done + failed +
 // cancelled + blocked equals the tasks added - because the counters are clamped
 // at 0, which hides a wrong decrement from a "never exceeds" check.
 
-import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, CancelledError } from '../../index.ts';
+import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, KeyedRateLimitGroup, CancelledError } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 
 // Node.js process declaration for cross-platform compatibility
@@ -20,6 +23,9 @@ interface TestSuiteResult {
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Cancelling 50,000 tasks: milliseconds when linear, seconds when not. */
+const SCALE_BOUND_MS = 1000;
 
 class CancellationTestSuite {
   private results: TestResult[] = [];
@@ -93,6 +99,7 @@ class CancellationTestSuite {
     this.results.push(await this.runTest('Forced Stop: During Shutdown', () => this.testForcedDuringShutdown()));
     this.results.push(await this.runTest('Shutdown Forces A Pending Threaded Cancel', () => this.testShutdownThreaded()));
     this.results.push(await this.runTest('Grace Period: Edge Cases', () => this.testGraceEdges()));
+    this.results.push(await this.runTest('Cancel At Scale', () => this.testAtScale()));
 
     const totalDuration = performance.now() - this.startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -151,6 +158,9 @@ class CancellationTestSuite {
     if (total !== added) {
       throw new Error(`${where}: ${JSON.stringify({ ...s, blocked })} accounts for ${total} of ${added}`);
     }
+    // The count the drained check reads, kept by the queues themselves
+    const live = (scheduler as any).blockedLive.live;
+    if (live !== blocked) throw new Error(`${where}: live blocked count ${live}, ${blocked} actually blocked`);
   }
 
   private async rejection(promise: Promise<any> | void): Promise<any> {
@@ -1102,6 +1112,85 @@ class CancellationTestSuite {
       try { new WorkerManager(this.cancelWorkerUrl, { cancelGraceMs: bad as any }); } catch (error) { thrown = error; }
       if (!(thrown instanceof kind)) throw new Error(`cancelGraceMs ${String(bad)}: threw ${thrown}`);
     }
+  }
+
+  // --- at scale -----------------------------------------------------------------
+
+  /**
+   * Cancels every task of `tasks`, through the real cancel() with a
+   * task.cancelled listener attached, and returns the ms it took.
+   */
+  private cancelAll(scheduler: FyflowScheduler, ids: string[], label: string): number {
+    let seen = 0;
+    scheduler.addEventListener('task.cancelled', () => { seen++; });
+    const start = performance.now();
+    for (const id of ids) scheduler.cancel(id);
+    const took = performance.now() - start;
+    if (seen !== ids.length) throw new Error(`${label}: ${seen} of ${ids.length} task.cancelled`);
+    return took;
+  }
+
+  // Cancelling every task of a large queue is linear. A cancel tombstones the
+  // task where it sits, in O(1), and checks only whether the scheduler has
+  // drained - a splice per cancel, or the full completion check, makes these
+  // seconds rather than milliseconds.
+  private async testAtScale(): Promise<void> {
+    const N = 50_000;
+    const timings: string[] = [];
+    const bound = (label: string, took: number, ms: number) => {
+      timings.push(`${label} ${took.toFixed(0)} ms`);
+      if (took > ms) throw new Error(`${label}: ${took.toFixed(0)} ms to cancel ${N} tasks`);
+    };
+
+    // A ready queue behind one running task, cancelled in creation order and in
+    // reverse
+    for (const reverse of [false, true]) {
+      const label = reverse ? 'ready, reversed' : 'ready';
+      const { scheduler } = this.make({}, {}, this.cancelWorkerUrl);
+      scheduler.addTask(this.task('front', { delay: 60_000 }));
+      const tasks = Array.from({ length: N }, (_, i) => this.task(`r${i}`));
+      scheduler.addTasks(tasks);
+      if (scheduler.stats.queued !== N) throw new Error(`${label}: ${scheduler.stats.queued} queued`);
+      const ids = tasks.map(t => t.id);
+      if (reverse) ids.reverse();
+      bound(label, this.cancelAll(scheduler, ids, label), SCALE_BOUND_MS);
+      this.assertAccounted(scheduler, N + 1, label);
+      await scheduler.cancel('front');
+    }
+
+    // A blocked queue, with nothing running: the group is held from outside
+    {
+      const group = new ConcurrentLimitGroup(1);
+      const { scheduler } = this.make({ groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
+      group.onStart();
+      const tasks = Array.from({ length: N }, (_, i) => this.task(`b${i}`));
+      scheduler.addTasks(tasks);
+      // A pass blocks one task and stops, as a blocked head gates the rest
+      for (let i = 0; i < N && scheduler.stats.queued > 0; i++) (scheduler as any)._dispatchLoop();
+      const blocked = scheduler.getAdmissionQueue('g').g?.length ?? 0;
+      if (blocked !== N) throw new Error(`blocked: ${blocked} blocked`);
+      bound('blocked', this.cancelAll(scheduler, tasks.map(t => t.id), 'blocked'), SCALE_BOUND_MS);
+      this.assertAccounted(scheduler, N, 'blocked');
+      group.onFinish();
+    }
+
+    // A keyed group with many keys, each saturated from outside, nothing
+    // running; tasks made key by key, so cancelling in order empties the
+    // blocked queues one after another
+    {
+      const KEYS = 5_000;
+      const group = new KeyedRateLimitGroup([{ limit: 1, windowMs: 60_000 }], { id: 'k', keyFrom: (t: any) => t.payload.key });
+      const { scheduler } = this.make({ groups: ['k'] }, { k: group }, this.cancelWorkerUrl);
+      for (let k = 0; k < KEYS; k++) group.onStart(`key${k}`);
+      const tasks = Array.from({ length: N }, (_, i) => this.task(`k${i}`, { key: `key${Math.floor(i / (N / KEYS))}` }));
+      scheduler.addTasks(tasks);
+      for (let i = 0; i < N && scheduler.stats.queued > 0; i++) (scheduler as any)._dispatchLoop();
+      const blocked = Object.values(scheduler.getAdmissionQueue('k')).reduce((n, q) => n + q.length, 0);
+      if (blocked !== N) throw new Error(`keyed: ${blocked} blocked`);
+      bound('keyed', this.cancelAll(scheduler, tasks.map(t => t.id), 'keyed'), SCALE_BOUND_MS);
+      this.assertAccounted(scheduler, N, 'keyed');
+    }
+    console.log(`   ${timings.join(', ')}`);
   }
 }
 

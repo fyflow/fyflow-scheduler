@@ -97,7 +97,7 @@ cheaper pools overtake it.
 # Deno
 deno task check          # type check (includes scripts/)
 deno task test           # all suites
-deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages
+deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation
 deno task examples       # run every example on Deno, then the bundled ones on Node
 deno task jsr:smoke      # stage only the publishable files and run a real worker against them
 deno lint .
@@ -115,18 +115,19 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Eight suites, 177 tests, all in the default `deno task test` run:
+Nine suites, 215 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
 | core | 26 | scheduling, groups, pooling, retention, queue scaling, limits at scale |
 | error-handling | 12 | worker failure, restart, requeue |
 | spawning | 13 | dynamic spawning, `onCompleteDescendants()`, draining on shutdown |
-| settlement | 33 | exactly-once settlement, counter cardinality, requeue, self-termination, attempts and backoff |
+| settlement | 34 | exactly-once settlement, counter cardinality, requeue, self-termination, attempts and backoff |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 25 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
-| docs | 37 | **executes every snippet in README.md and AGENTS.md** |
+| cancellation | 33 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
+| docs | 41 | **executes every snippet in README.md and AGENTS.md** |
 
 `deno task test:scripts` is separate and not included in `deno task test` — it
 unit-tests `scripts/publishOutput.ts`.

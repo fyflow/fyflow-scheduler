@@ -73,6 +73,7 @@ is resolved - it differs between Deno, Node and the browser.
 - **Worker Pools**: Thread-based and inline execution modes
 - **Progress Reporting**: Real-time task progress and event monitoring
 - **Worker Messages**: Workers `emit()` named events - logs, metrics, partial results - to the host, batched, bounded and sent only while someone listens
+- **Cancellation**: Stop a waiting or running task; workers see an `AbortSignal`, and a threaded worker that ignores it is stopped for them
 - **Zero Dependencies**: Self-contained with no external requirements
 - **In-Memory**: Fast coordination with extensible persistence APIs
 
@@ -241,6 +242,41 @@ must exist; all three are rejected at construction.
 
 See `examples/resident-groups.ts` for a runnable walkthrough.
 
+### Cancelling Tasks
+
+```typescript
+import { CancelledError } from 'fyflow-scheduler';
+
+const promise = scheduler.addTask(task, { createPromise: true });
+
+// true once the task has stopped; false if it had already finished
+const cancelled = await scheduler.cancel(task.id, { reason: 'stopped by the user' });
+
+try {
+  await promise;
+} catch (error) {
+  if (error instanceof CancelledError) { /* error.taskId, error.reason */ }
+}
+```
+
+A task still waiting - queued, blocked on a resource group, or in a retry
+backoff - is removed and never runs. A running one has its `context.signal`
+aborted, which the worker passes on or checks:
+
+```typescript
+async run(payload, context) {
+  const response = await fetch(payload.url, { signal: context?.signal });
+  return await response.json();
+}
+```
+
+Either way it ends `cancelled`, whatever its run produced, and is never retried
+or requeued. A threaded worker that has not stopped within the pool's
+`cancelGraceMs` (default 2000) is terminated, and its other tasks are requeued;
+an inline run cannot be interrupted, and is waited for. `cancel()` never throws
+for a task's state, so cancelling a whole run is a loop. See `AGENTS.md` §5 and
+§8.
+
 ### Event Monitoring
 
 ```typescript
@@ -275,6 +311,9 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   `{ createPromise: true }` to get a promise back
 - `addTasks(tasks, options?)`: Batch version, optimised for bulk additions.
   Throws on an unknown `workerType`, validating the batch before queueing any of it
+- `cancel(taskId, options?)`: Stop a task, waiting or running. Resolves `true`
+  once it is cancelled, `false` if it had already finished. `options.reason`,
+  `options.graceMs` for a threaded worker
 - `stats`: Current execution statistics
 - `getResourceMetrics()` / `getResourceStats()`: Per-group utilisation and lifetime counters
 - `describeResources()`: The gauges every group presents. Schema, not state -
@@ -312,6 +351,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `idleTimeout`: Ms before an idle worker is terminated (0 = never, default 5000)
 - `idleCheckIntervalMs`: How often idle workers are swept (default 5000). This is
   the floor on how promptly a resident group is handed over
+- `cancelGraceMs`: Ms a threaded worker gets to stop a cancelled task before it
+  is terminated (default 2000). A forced stop is not counted as a restart
 
 **ConcurrentLimitGroup(limit, id?)**
 - Resource constraint with a concurrent execution limit. Optimistic: may briefly
@@ -372,7 +413,8 @@ worker that cannot be built and one that keeps dying.
 ### Events
 
 On the **scheduler**: `task.running`, `task.retrying`, `task.completed`,
-`task.failed`, `task.progress`, `task.message`, `task.user_action`,
+`task.failed`, `task.cancelling`, `task.cancelled`, `task.progress`,
+`task.message`, `task.user_action`,
 `task.spawn_request`, `task.spawn_failed`, `scheduler.completed`, `resource.acquired`, `resource.released`,
 `resource.blocked`, `resource.unblocked`. Every one carries a `timestamp`.
 
@@ -380,7 +422,7 @@ The four `resource.*` events let a resource view be a fold of a stream rather
 than a poll of four accessors that describe four different instants. They fire
 on the **scheduler only** - a `WorkerManager` never dispatches them, so a
 consumer subscribing to both cannot double-count. See `AGENTS.md` section 6 for
-the payload, the four ways a blocked task leaves its queue, and the two
+the payload, the five ways a blocked task leaves its queue, and the two
 conservation invariants worth folding against.
 
 On a **WorkerManager**: `task.started`, `task.completed`, `task.failed`,
@@ -390,7 +432,8 @@ plus the worker lifecycle events `worker.initialization.started|completed|failed
 `worker.setup.started|completed` and `worker.teardown.started|completed|failed`.
 
 > An event `detail` is a **live object, not a snapshot**. For `task.running`,
-> `task.retrying`, `task.completed`, `task.failed` and `task.user_action` it *is* the
+> `task.retrying`, `task.completed`, `task.failed`, `task.user_action`,
+> `task.cancelling` and `task.cancelled` it *is* the
 > `FyflowTask` the scheduler keeps mutating, so `arr.push(e.detail)` gives you
 > entries that all read the terminal state later. Listeners run synchronously -
 > project the fields you need inside the listener instead. `task.progress`,
@@ -402,8 +445,9 @@ Lifecycle events carry `{ workerId, workerType, timestamp }`, plus `duration` on
 set. They fire on every worker creation and idle-timeout teardown, so keep those
 listeners cheap.
 
-`scheduler.completed` fires whenever the scheduler drains, so it can fire more
-than once if tasks arrive in waves.
+`scheduler.completed` fires whenever the scheduler drains - whether its tasks
+completed, failed or were cancelled - so it can fire more than once if tasks
+arrive in waves.
 
 ### Worker Interface
 

@@ -42,7 +42,7 @@ message has to be added to both. Each such feature therefore needs a test on a
 threaded pool (`inline: false`) in the shared suites, which exercises each
 wrapper on its own runtime, plus a browser spec.
 
-#### 🟡 Cancel a task, queued or running (#1, P1)
+#### 🟢 Cancel a task, queued or running (#1, P1)
 `scheduler.cancel(taskId, options?)`, a terminal `task.cancelled` that is not a
 `task.failed`, and resource holdings released. Reaches all seven places a task
 can wait, including a new thread still initialising. Cooperative through an
@@ -65,7 +65,7 @@ sites; a cancelling task whose worker fails settles only once its attempt has
 stopped; re-adding a cancelled task object throws. `descendants: true` and pause
 groundwork are deferred. Depends on the requeue, re-entrancy and queue known
 issues below. Includes the `scheduler.completed` fix below. Plan:
-`doc/design/task-cancellation.md`, no open questions.
+`doc/design/task-cancellation.md`, deleted once built (`git log` keeps it).
 
 Built in four stages on branch `task-cancellation`, each committed there, merged
 into `main` once all four are done:
@@ -100,13 +100,42 @@ into `main` once all four are done:
    worker twice. 7 new tests, among them a worker spinning synchronously and
    results posted during the teardown handshake; 18 mutations caught on Deno,
    the timing-dependent ones on Node too.
-4. 🔵 `AGENTS.md` and `README.md`, docs tests, scale tests (50K cancels), browser
-   spec, `jsr:smoke`, benchmark against `main`, delete the plan.
+4. 🟢 The contract in `AGENTS.md` - §1, §4 (`context.signal`, a CPU-bound
+   recipe), §5 (`cancel()`, `CancelOptions`, `cancelGraceMs`,
+   `task.cancellation`, the state, `stats.cancelled`), §6 (the two events,
+   their order, the `'cancelled'` unblock reason and not switching on it), §7,
+   §8 (the forced stop), §9 and §10 (cancelling a run) - and a `README.md`
+   section. 4 docs tests, one a `fetch()` aborted against a server that never
+   answers; a "Cancel At Scale" test (50,000 tasks in a ready queue both ways,
+   a blocked queue and 5,000 keys, each 30-40 ms against a 1 s bound); a
+   Playwright spec on three engines, cooperative and forced. Shutdown's drain
+   warning now names tasks still being cancelled separately from tasks stuck in
+   a pool. Two bugs found on the way, each its own entry below: a threaded
+   `run()` returning `null` or `undefined` crashed the host, and "is any task
+   blocked?" visited every blocked queue. The plan's mutation "the full
+   `_checkCompletion` per cancel" no longer fails anything: with the live
+   blocked count that check is O(1) on every path a cancel reaches, and the
+   cost it guarded against is now caught through the count instead.
 
-Until stage 4, the docs test "AGENTS.md Covers Every Export" fails on the
-branch: `CancelledError` and `CancelOptions` are exported but not documented.
+Benchmark (`benchmark:quick --runs 3`, three rounds alternated with `main`
+from a worktree, nine runs each), medians: 1K -10.8%, 10K +30.9%, 50K +0.5%,
+100K -5.1%, threaded -2.8% to 0.0%. 1K is the usual bimodal scenario - every
+run lands near 1,150 or near 1,300 - and this branch drew five low runs to the
+base's two. 10K's spread is 31K-84K on both sides. 100K is inside the ±10%
+band, with overlapping ranges (base 74,948-86,234, branch 67,693-79,626), but
+the branch's best run sits just under the base's median, so it may be a small
+real cost: every dispatch now allocates an `AbortController` (inline) and
+writes `_queuedIn`. Not investigated further.
 
-**Status**: 🟡 Implementation - stages 1 to 3 of 4 done on `task-cancellation`
+Release notes, all on this item: `signal` is a new required member of
+`TaskWorkerContext` (source-breaking for a hand-built context, like `emit`);
+`'cancelled'` widens `ResourceUnblockReason` - a minor, with the reasoning in
+the release commit, as for `ResourceGroup.type` in 0.3.0; `stats.cancelled` is
+new; `scheduler.completed` now fires for runs with no successes;
+`onCompletePromise()` now settles for a task that has already settled; and the
+two fixes below.
+
+**Status**: 🟢 Completed - on `task-cancellation` (stages `fdf8cdf`, `7634328`, `bd45ad6` and stage 4), Deno and Node 22 215/215, browser 3 engines, `jsr:smoke` (Node 24); merge into `main` pending
 
 #### 🟢 A log channel from workers (#2, P1)
 Requested as `context.log(level, message, data?)` and `task.log`. Answered with
@@ -672,16 +701,57 @@ nothing run. Mutation scripts run Deno directly, never through a shell.
 
 **Status**: 🟢 Completed - `7cc93ca`, Deno 177/177 on that commit, Node 22, Chromium
 
+#### 🟢 A threaded `run()` returning `null` or `undefined` crashed the host
+`ThreadWrapper`'s message handler read `data.isWorkerTerminationRequest` off
+every result before checking it was an object. A threaded `run()` that returned
+`null` or `undefined` - so any `run()` with no `return` - threw inside the
+handler, uncaught, and took the host process down. Inline pools were not
+affected. No test returned either from a threaded worker; #1's CPU-bound recipe,
+which returns `null` once aborted, is what hit it.
+
+**Outcome**: optional chaining on both reads. "Any Returned Value Settles, null
+And undefined Included" (settlement) returns `null`, `undefined`, `0`, `''` and
+`false` from both pool types; without the fix it crashes the run.
+
+**Status**: 🟢 Completed - with #1 stage 4, on `task-cancellation` until #1 merges
+
+#### 🟢 "Is any task blocked?" visited every blocked queue
+`_hasBlockedTasks()` walked `blockedQueues` until it found a non-empty one. A
+keyed group has one queue per key, and every cancel asks the question when
+nothing is running, so cancelling 50,000 tasks blocked across 5,000 keys - key
+by key, each emptying a queue the next walk has to pass - took 1.8 s. Found by
+#1's scale test.
+
+**Outcome**: the blocked queues share one live count, kept by `TaskQueue`
+itself on every push, shift, unshift, tombstone, remove and clear, so the
+question is O(1). The same case takes 29 ms. The cancellation suite's exact
+accounting check now also compares the count with the admission queue after
+every scenario. Mutation checks: walking the queues again fails "Cancel At
+Scale" (3.3 s); a tombstone that does not decrement the count fails "Cancel A
+Blocked Task".
+
+**Status**: 🟢 Completed - with #1 stage 4, on `task-cancellation` until #1 merges
+
+#### 🔵 A browser performance spec asserts a timing order
+"should measure Web Worker vs inline performance" expects a Web Worker run to
+take at least as long as the same work inline (`overhead >= 0`). That is a
+race, not a property: it failed once on WebKit in a full three-engine run
+(2026-10-14, the #1 stage 4 checks), then passed 3/3 alone and 27/27 in a full
+WebKit run. Assert the two runs completed, and report the overhead rather than
+bound it.
+
+**Status**: 🔵 Not Started
+
 #### 🔵 `doc/design/pause-resume.md` is stale
 Written against an older architecture: `readyQueue`, a `dispatched` state,
 `pool.workers` and `_processQueue` no longer exist. Its immediate mode fails
 tasks without going through `_settleTask`, which is the double-settle and
 resource-leak class fixed in 2026. It is neither current nor marked abandoned,
-which `CLAUDE.md` does not allow. Rewrite it as an open note once cancellation
-(#1) has shipped: interrupting a running attempt (signal, grace period, forced
-stop) is the hard part of an "interrupt" pause, and #1 builds it. #1
-deliberately does not add a requeue outcome for pause; that belongs to the
-rewrite.
+which `CLAUDE.md` does not allow. Rewrite it as an open note, now that
+cancellation (#1) has been built: interrupting a running attempt (signal, grace
+period, forced stop) is the hard part of an "interrupt" pause, and #1 provides
+it. #1 deliberately does not add a requeue outcome for pause; that belongs to
+the rewrite.
 
 **Status**: 🔵 Not Started
 

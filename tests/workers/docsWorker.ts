@@ -4,6 +4,9 @@
 import { BaseWorker } from '../../index.ts';
 import type { WorkerConfig, BaseWorkerContext, TaskWorkerContext } from '../../index.ts';
 
+// Stands in for real work in the CPU-bound recipe
+const crunch = (i: number) => Math.sqrt(i) % 1;
+
 export default class DocsWorker extends BaseWorker {
   private multiplier: number;
 
@@ -21,6 +24,31 @@ export default class DocsWorker extends BaseWorker {
   async teardown(): Promise<void> {}
 
   async run(payload: any, context?: TaskWorkerContext): Promise<any> {
+    // README "Cancelling Tasks": pass the signal on
+    if (payload.url) {
+      const response = await fetch(payload.url, { signal: context?.signal });
+      return await response.json();
+    }
+
+    // AGENTS.md section 4: a CPU-bound loop that yields to see its signal
+    if (payload.n !== undefined) {
+      let sum = 0;
+      for (let i = 0; i < payload.n; i++) {
+        sum += crunch(i);
+        if (i % 10_000 === 0) {
+          await new Promise(resolve => setTimeout(resolve));   // let the cancel in
+          if (context?.signal.aborted) return null;             // discarded anyway
+        }
+      }
+      return sum;
+    }
+
+    // The same loop without the yield: only a forced stop ends it
+    if (payload.spinMs) {
+      const end = Date.now() + payload.spinMs;
+      while (Date.now() < end) { /* never yields */ }
+    }
+
     // Lets a test observe overlapping awaits
     if (payload.awaitMs) {
       await new Promise(resolve => setTimeout(resolve, payload.awaitMs));

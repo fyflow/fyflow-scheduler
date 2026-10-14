@@ -393,8 +393,10 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
 
           case 'result':
           case 'error':{
-            // Check if this is a worker termination request (either explicit or during task execution)
-            if (data.isWorkerTerminationRequest) {
+            // Check if this is a worker termination request (either explicit or during task execution).
+            // A result can be any value, null and undefined included: reading
+            // the flag off a null one threw here, uncaught, and took the host down
+            if (data?.isWorkerTerminationRequest) {
               // A task that threw the request fails, as on an inline pool and as
               // AGENTS.md documents, and it does so BEFORE the termination is
               // handled. Handling it first made the pool requeue this task along
@@ -496,7 +498,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
               this.dispatchEvent(new CustomEvent('task.failed', {
                 detail: { taskId, workerId: this.id, workerType: 'thread', error: data, timestamp: Date.now(), executionTime }
               }));
-              cb.reject(new Error(data.message || data));
+              cb.reject(new Error(data?.message || data));
             } else {
               this.dispatchEvent(new CustomEvent('task.completed', {
                 detail: { taskId, workerId: this.id, workerType: 'thread', result: data, timestamp: Date.now(), executionTime }

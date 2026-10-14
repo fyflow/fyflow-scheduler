@@ -34,7 +34,7 @@ A", either await A and then add B, or have A spawn B (§7).
 | `DagScheduler`, `DagTask` | `FyflowScheduler`, `FyflowTask` |
 | Priorities, cron/scheduled tasks, persistence | Not implemented |
 | `context.log()`, `task.log`, log levels | `context.emit('log', ...)` and `task.message` (§6, recipe in §10) |
-| Cancelling a queued task | Not implemented |
+| Cancelling a whole run, or a task's descendants, in one call | `scheduler.cancel(id)` per task (§5, recipe in §10) |
 
 Both group types are **optimistic**: a limit can be briefly exceeded by up to
 `maxThreads × maxConcurrentTasks` under race conditions. Nothing here guarantees
@@ -229,6 +229,34 @@ export default class MyWorker extends BaseWorker {
   and delivers asynchronously. `data` is copied with `structuredClone` at the
   call, on inline pools too, so it must be cloneable and changing it afterwards
   has no effect. Nothing is sent while nobody listens (§6).
+- `context.signal` is an `AbortSignal`, aborted when `scheduler.cancel()` is
+  called for the task (§5). Pass it on to anything that takes one -
+  `fetch(url, { signal: context.signal })` - or check `signal.aborted` between
+  steps. Its `reason` is the one given to `cancel()`, or the standard
+  `AbortError` `DOMException` if none was, or if it could not be cloned onto a
+  thread. What `run()` does once it is aborted does not change the outcome -
+  returning, throwing an `AbortError`, throwing anything else all end the task
+  `cancelled` - but stopping promptly frees its slot and its resources sooner,
+  and on a threaded pool keeps the worker alive (§8).
+
+  **A CPU-bound threaded worker must yield to see it.** The cancel reaches a
+  thread as a message, which its event loop reads only between turns: a
+  synchronous loop that never awaits cannot see `aborted` change, and is
+  stopped only by the forced stop. Yield every so often:
+
+  ```typescript
+  async run(payload: any, context?: TaskWorkerContext): Promise<any> {
+    let sum = 0;
+    for (let i = 0; i < payload.n; i++) {
+      sum += crunch(i);
+      if (i % 10_000 === 0) {
+        await new Promise(resolve => setTimeout(resolve));   // let the cancel in
+        if (context?.signal.aborted) return null;             // discarded anyway
+      }
+    }
+    return sum;
+  }
+  ```
 - One instance is created per worker, lazily, and reused across tasks. Instance
   state persists between tasks — do not assume a fresh object per task.
 - Throwing from `run()` fails that task. Throwing from `setup()` fails the
@@ -244,11 +272,12 @@ export default class MyWorker extends BaseWorker {
 import {
   FyflowScheduler, FyflowTask, WorkerManager,   // core
   ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup,
-  BaseWorker, WorkerTerminationError            // worker authoring
+  BaseWorker, WorkerTerminationError,           // worker authoring
+  CancelledError                                // what a cancelled task rejects with
 } from 'fyflow-scheduler';
 
 import type {
-  FyflowSchedulerOptions, AddTaskOptions,
+  FyflowSchedulerOptions, AddTaskOptions, CancelOptions,
   WorkerManagerOptions, WorkerConfig, WorkerInterface, WorkerStatus,
   WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerContext,
   SpawnTaskConfig, ProgressData,
@@ -281,13 +310,52 @@ worker wrappers the pool manages for you - you should not construct them.
 |---|---|---|
 | `addTask` | `(task, opts?) => Promise<any> \| void` | Returns a promise only with `{ createPromise: true }`. **Throws** on unknown `workerType` |
 | `addTasks` | `(tasks, opts?) => Promise<any>[] \| void` | Batched dispatch for bulk adds. **Throws** on unknown `workerType`, validating the whole batch before queueing any of it |
-| `stats` | `{ queued, running, done, failed }` | Counts **tasks**, not attempts - a task that fails after two retries counts once. Includes evicted tasks |
+| `cancel` | `(taskId, options?) => Promise<boolean>` | Stop a task, waiting or running — see below |
+| `stats` | `{ queued, running, done, failed, cancelled }` | Counts **tasks**, not attempts - a task that fails after two retries counts once. Includes evicted tasks. A task being cancelled still counts as `running` until it has stopped |
 | `tasks` | `Map<string, FyflowTask>` | Live and completed tasks (see `maxCompletedTasks`) |
 | `getResourceMetrics()` | `Record<string, { limit, running, available, utilization }>` | `utilization` is 0–1 |
 | `getResourceStats()` | `Record<string, { totalAcquired, totalReleased }>` | Lifetime counters |
 | `describeResources()` | `Record<string, { gauges: GaugeSpec[] }>` | The gauges every group presents. **Schema, not state** — it cannot change over a group's lifetime, so read it once and cache it |
 | `getAdmissionQueue(groupId?)` | `Record<string, AdmissionWaiter[]>` | Everything currently waiting on a resource group, in admission order — see below |
 | `shutdown()` | `Promise<void>` | Always call when finished |
+
+#### `cancel(taskId, options?)`
+
+```typescript
+const cancelled = await scheduler.cancel('task-1', { reason: 'stopped by the user' });
+```
+
+| `CancelOptions` | Default | Notes |
+|---|---|---|
+| `reason` | none | Kept as given on `task.cancellation.reason` and the `CancelledError`, and passed to the worker's `signal.reason` |
+| `graceMs` | the pool's `cancelGraceMs` | Threaded pools: ms the worker gets to stop by itself before it is forced (§8). `0` forces at once, `Infinity` never. Ignored by inline pools |
+
+What happens depends on where the task is:
+
+| The task is | Then |
+|---|---|
+| waiting: queued, blocked on a group, or in a retry backoff | removed at once, and never runs. `task.cancelled` fires with no `task.cancelling` before it |
+| running | `task.cancelling` fires and its `context.signal` aborts (§4). It ends once its run has stopped: by itself, by a forced stop on a threaded pool (§8), or, inline, when `run()` returns - an inline run cannot be interrupted |
+
+Either way it ends in state `'cancelled'` with `task.cancelled`, **whatever its
+run produced** - a result, an error, a dead worker. It is not retried or
+requeued, its resources are released only once its run has stopped, and its
+promise rejects with a `CancelledError` (`taskId`, `reason`) - an `optional`
+task's too.
+
+- **Resolves `true`** once the task is cancelled, including when it already
+  was; **`false`** if the id is unknown or the task finished first (`done`,
+  `failed`, `user_action`). With `maxCompletedTasks` a cancelled task that has
+  been evicted is unknown, so a later call returns `false`.
+- **Never rejects because of a task's state**, so cancelling every task of a run
+  in a loop needs no guards. A bad `graceMs` is a programming error and throws
+  synchronously: `TypeError` for a non-number, `RangeError` for a negative
+  number or `NaN`.
+- **A repeat call** while the task is still stopping returns the same promise.
+  A shorter `graceMs` on it shortens the wait - pressing Cancel twice
+  escalates; a longer one changes nothing.
+- **At `shutdown()`**, a threaded task still stopping ends `cancelled` with its
+  worker. An inline one cannot be stopped, so its `cancel()` resolves `false`.
 
 ### `new FyflowTask(config)`
 
@@ -310,7 +378,8 @@ Readable after the run: `state`, `result`, `error`, `attempts`, `attemptNumber`,
 |---|---|
 | `attempts` | Retries used, counted against `maxRetries`. Starts at `attemptsSpent`, so 0 on a first attempt unless one was given |
 | `attemptNumber` | 1-based number of the current attempt, or of the last one once settled; 0 before the first dispatch. Always `attempts + 1` at dispatch |
-| `error` | The most recent failed attempt's message. Set on a failure that will be retried too, cleared when the next attempt starts: a task that succeeds on a retry ends with none |
+| `error` | The most recent failed attempt's message. Set on a failure that will be retried too, cleared when the next attempt starts: a task that succeeds on a retry ends with none. Cleared by a cancel |
+| `cancellation` | Set once `cancel()` is accepted, otherwise `undefined`: `{ reason?, requestedAt, forced }`. `forced` is `true` if a forced stop ended it (§8). While it is set and `state` is `'running'`, the task is stopping |
 
 | `maxRetries` | `attemptsSpent` | Attempts this run | `attemptNumber` values |
 |---:|---:|---:|---|
@@ -322,11 +391,17 @@ A **requeue is not an attempt.** When a worker dies under a task and the pool
 requeues it (§8), the re-run repeats the same `attemptNumber` and `attempts` is
 unchanged.
 
-States: `pending` → `running` → `done` | `failed`. A **non-optional** task that
+States: `pending` → `running` → `done` | `failed` | `cancelled`, and
+`cancelled` straight from `pending` for a task cancelled while waiting. A
+**non-optional** task that
 fails with no retries left ends in **`user_action`**, not `failed`; an
 **optional** one ends in `failed` and resolves `null`. Each attempt settles
 exactly once, so `task.failed` fires once per failed task and the terminal state
 does not change afterwards.
+
+A cancelled task object cannot be added again: `addTask` throws
+`Task "<id>" was cancelled - create a new FyflowTask to run it again`. A new
+`FyflowTask` may reuse the id.
 
 Methods: `onCompletePromise()` — this task only; `onCompleteDescendants()` —
 this task plus everything it spawns (§7).
@@ -345,6 +420,7 @@ this task plus everything it spawns (§7).
 | `idleCheckIntervalMs` | `5000` | How often idle workers are swept |
 | `requeueFailedTasks` | `true` | Requeue in-flight tasks when a worker dies |
 | `maxWorkerRestarts` | `3` | Then `worker.restart_limit_exceeded` |
+| `cancelGraceMs` | `2000` | Threaded pools: ms a cancelled task's worker gets to stop it before it is forced (§8). `0` forces at once, `Infinity` never. Accepted and ignored by inline pools. `TypeError`/`RangeError` at construction, as for `graceMs` |
 | `messages` | `{ flushIntervalMs: 20, maxBuffered: 100 }` | Bounds on `emit()`, per buffer (one per running attempt, one per worker): events are batched for up to `flushIntervalMs`, and emits beyond `maxBuffered` between flushes are discarded and counted. `RangeError` if either is not positive (`maxBuffered` must be an integer) |
 
 Management: `getWorkerIds()`, `getWorkerStatus(id)`, `getAllWorkerStatuses()`,
@@ -557,6 +633,8 @@ Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
 | `task.retrying` | the task, after an attempt failed and a retry was decided: `state` `'pending'`, `attemptNumber` the attempt that failed, `attempts` already incremented, `error` its message. Never for the last attempt, which ends in `task.failed`. The next attempt starts no earlier than `timestamp + retryPolicy.backoffMs` |
 | `task.completed` | the `FyflowTask` (with `result`, `executionTime`) |
 | `task.failed` | the task, plus `error` |
+| `task.cancelling` | the task — a cancel was accepted while it was running: `state` still `'running'`, `cancellation` set |
+| `task.cancelled` | the task, `state` `'cancelled'` — whether it ran or not |
 | `task.progress` | the task's fields **spread flat** (so the id is `id`, **not** `taskId`), plus `{ workerId, workerType, progress (0–1), message, details, timestamp }` |
 | `task.message` | `TaskMessageDetail`: `{ taskId, workerId, attemptNumber, name, data, seq, timestamp, dropped?, error? }` - a task's `context.emit()`. **Scheduler only**; see below |
 | `task.user_action` | the task — failed, out of retries, not optional. Fires once, only after the retry budget is spent |
@@ -572,6 +650,15 @@ Per task, in order: `task.running`, then for each failed attempt that will be
 retried `task.retrying` and, after the backoff, `task.running` again; finally
 `task.completed`, or `task.failed` (plus `task.user_action`).
 
+A cancelled task ends with `task.cancelled` instead: after `task.cancelling` if
+it was running, alone if it was still waiting. Once `task.cancelling` has
+fired, none of `task.completed`, `task.failed`, `task.user_action` or
+`task.retrying` follows, and it is not requeued; `task.progress` and
+`task.message` keep arriving until its run stops, and all of them before
+`task.cancelled`. A fold must accept `task.cancelling` with no `task.running`
+before it: a threaded attempt cancelled before its thread picked it up has had
+none.
+
 Every event above carries a `timestamp` (`Date.now()` at emit). On the
 lifecycle events that is a field on the task itself — see the live-reference
 warning immediately below.
@@ -582,8 +669,9 @@ snapshot — are fresh objects.** A transition describes the task; a stream item
 describes a moment, which a consumer keeps, so it has to be a copy.
 
 > ⚠️ **An event `detail` is a live object, not a snapshot.** For every lifecycle
-> event — `task.running`, `task.retrying`, `task.completed`, `task.failed` and
-> `task.user_action` — `detail` **is** the `FyflowTask`, the same object the
+> event — `task.running`, `task.retrying`, `task.completed`, `task.failed`,
+> `task.user_action`, `task.cancelling` and `task.cancelled` — `detail` **is**
+> the `FyflowTask`, the same object the
 > scheduler keeps mutating. Listeners run
 > synchronously, so reading it inside the listener is correct; keeping it is not:
 >
@@ -653,8 +741,9 @@ and `data` is any value `structuredClone` can copy.
 - **`data` that cannot be cloned** (a function, a class instance with methods)
   arrives as an event with `data` undefined and `error` set to the clone error,
   at its own `seq`. `emit()` itself never throws.
-- **Lost only with the worker**: a worker that crashes, or a thread killed for
-  not acknowledging teardown in time, loses what it had not yet sent.
+- **Lost only with the worker**: a worker that crashes, a thread killed for
+  not acknowledging teardown in time, or a worker force-stopped after a cancel
+  (§8), loses what it had not yet sent.
 
 **Worker lifecycle, on a `WorkerManager`:**
 
@@ -702,7 +791,8 @@ partially-initialised state: it can run against an instance whose `setup()` neve
 finished. A `teardown()` that throws there is reported as
 `worker.teardown.failed` and does not replace the setup error.
 
-> `scheduler.completed` fires **every time the scheduler drains**, so it can fire
+> `scheduler.completed` fires **every time the scheduler drains** - whether its
+> tasks completed, failed or were cancelled - so it can fire
 > more than once when tasks arrive in waves. It does account for tasks blocked on
 > a resource group, so it will not fire while work is still waiting for capacity.
 
@@ -752,7 +842,7 @@ resident acquire twice and see conservation drift by exactly the resident share.
 > the task spread flat, so `workerType` *looks* like the task's own field and is
 > not.
 
-**A blocked task leaves its queue four ways**, and `unblocked.reason` says which:
+**A blocked task leaves its queue five ways**, and `unblocked.reason` says which:
 
 | `reason` | What happened |
 |---|---|
@@ -760,6 +850,11 @@ resident acquire twice and see conservation drift by exactly the resident share.
 | `superseded` | Admitted via a *different* group and spliced out of this one |
 | `orphaned` | Its worker pool no longer exists. The task is **failed terminally** — `task.failed`, then `user_action` unless it is optional, and its promise rejects. Retries are skipped: the pool is gone |
 | `shutdown` | The scheduler tore down and discarded every remaining waiter |
+| `cancelled` | It was cancelled while it waited (§5) |
+
+**Do not switch exhaustively on `reason`.** `cancelled` was added after the
+first four, and the union may grow again - the same rule as for `groupType`.
+Treat a reason you do not recognise as an exit.
 
 Two invariants worth folding against, because a fold can stay internally
 consistent while being wrong:
@@ -853,11 +948,16 @@ await task.onCompleteDescendants();   // rejects if called before addTask
 - Resolves with the tracked task's own result once every descendant is terminal.
 - A **descendant** failing does **not** reject — watch `task.failed` for those.
 - The **tracked task** failing **does** reject, matching `onCompletePromise()`.
+- The **tracked task** being cancelled rejects with a `CancelledError`; a
+  cancelled **descendant** does not reject, as a failed one does not.
 - Safe to call more than once, and after the workflow already finished.
 - `shutdown()` drains outstanding work first, so a workflow that can still finish
   does, and the wait resolves. It rejects only for work that can no longer run
 
-This is lineage, not a dependency: spawning never changes dispatch order.
+This is lineage, not a dependency: spawning never changes dispatch order, and
+cancelling a task does not cancel what it spawned - cancel those by id (§10).
+A task being cancelled, or already cancelled, cannot spawn: the spawn is
+refused, reported as `task.spawn_failed` with a `CancelledError`.
 
 ---
 
@@ -907,6 +1007,40 @@ pool.addEventListener('worker.initialization.failed', (e) => {
 > something* - it fires for a pool that cannot build a worker as well as one whose
 > workers keep dying. Everything above it is recoverable noise.
 
+A task being **cancelled** is the exception to the table: a worker failing under
+it neither requeues nor fails it. It ends `cancelled` once its run has really
+stopped - on a threaded pool when the dead thread is gone, inline when `run()`
+returns.
+
+### The forced stop
+
+A threaded worker that has not stopped a cancelled task `graceMs` after the
+cancel - by default its pool's `cancelGraceMs`, 2000 - is **retired**:
+
+1. Every task on it is detached at once, so nothing it sends from then on
+   counts - not even a result posted during its teardown.
+2. Its other tasks are requeued at once and run again on another worker,
+   **whatever `requeueFailedTasks` says** - they did nothing wrong. Like any
+   requeue, that is not an attempt. Another task on it that is being cancelled
+   too is not requeued; it ends with this one.
+3. The worker is terminated: `teardown()` gets its usual 500 ms, then the
+   thread is killed.
+4. Only once the thread is dead does the cancelled task settle -
+   `cancelled`, with `cancellation.forced` `true` - and are its resources and
+   the worker's resident units released.
+
+It is not a failure: no `worker.failed`, nothing counted against
+`maxWorkerRestarts`, and no replacement started in advance - the next task gets
+a new worker. The worker's teardown events fire as for any teardown.
+
+The cost is real: the other tasks lose their progress, and whatever `setup()`
+loaded is loaded again. A pool holding something expensive should make its
+worker honour the signal (§4), or raise `cancelGraceMs`.
+
+**Inline pools are never forced.** An inline `run()` cannot be interrupted, so a
+cancelled inline task that ignores its signal stays `running`, holding its
+resources, until `run()` returns.
+
 ## 9. Common mistakes
 
 | Symptom | Cause |
@@ -927,6 +1061,10 @@ pool.addEventListener('worker.initialization.failed', (e) => {
 | Limit briefly exceeded | Groups are optimistic by design (§1) |
 | A resource group has no effect at all | The pool never declared it. Registering a group on the scheduler is not enough - add it to the pool's `groups` or the task's `workerGroups` |
 | `Missing limit key for group "x"` | The task belongs to a `KeyedRateLimitGroup` but has no `limitKey`, and the group's `keyFrom` returned nothing |
+| `Task "x" was cancelled - create a new FyflowTask to run it again` | `addTask` with a task object that was cancelled. A new `FyflowTask` may reuse the id |
+| `Promise.all` over a run rejects with `CancelledError` | One of its tasks was cancelled, and a cancelled task's promise rejects. Use `Promise.allSettled`, or catch `CancelledError` |
+| A cancelled threaded task ends `forced`, and its worker is replaced | The worker did not stop within `cancelGraceMs`: check `context.signal`, and yield in CPU-bound loops (§4) |
+| A cancelled inline task stays `running` | Inline runs cannot be interrupted; it ends when `run()` returns. Check `context.signal` in the worker |
 | `Worker pool "x" no longer exists` | A task was waiting on a resource group when its pool was removed from `workerPools`. The library never does this, so something outside it mutated the map |
 
 ---
@@ -974,6 +1112,31 @@ const api = new KeyedRateLimitGroup(
 // Each endpoint gets its own 10/sec bucket, and a saturated one does not
 // delay tasks belonging to the others
 ```
+
+**Cancelling a run**
+
+The scheduler has no notion of a run, so keep its task ids - including any it
+spawns, from `task.spawn_request` - and cancel each:
+
+```typescript
+import { CancelledError } from 'fyflow-scheduler';
+
+const ids = tasks.map(t => t.id);
+const promises = scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[];
+
+// The user pressed Stop. No guards needed: a task that already finished
+// resolves false, and nothing throws
+await Promise.all(ids.map(id => scheduler.cancel(id, { reason: 'stopped by the user' })));
+
+for (const outcome of await Promise.allSettled(promises)) {
+  if (outcome.status === 'rejected' && outcome.reason instanceof CancelledError) {
+    // outcome.reason.taskId was cancelled, with outcome.reason.reason
+  }
+}
+```
+
+The `cancel()` promises resolve once each task has actually stopped, so after
+the `await` nothing from the run is still running.
 
 **Monitoring**
 

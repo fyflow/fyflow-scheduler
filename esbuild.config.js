@@ -159,6 +159,7 @@ if (buildType === 'development') {
       "tests/workers/crashingWorker.ts",
       "tests/workers/selfTerminatingWorker.ts",
       "tests/workers/messageWorker.ts",
+      "tests/workers/cancelWorker.ts",
       "groups/concurrentLimitGroup.ts",
       "groups/rateLimitGroup.ts"
     ],

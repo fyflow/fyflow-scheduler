@@ -414,7 +414,7 @@ export class FyflowTask {
       // Queue against the first group without room. Its release wakes the task.
       const short = entries.find(({ group, cost }) => !group.canRun(undefined, cost)) ?? entries[0];
       const queueId = this._blockedQueueId(short.id);
-      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, new TaskQueue<FyflowTask>({ trackMembership: true }));
+      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, this._newBlockedQueue());
       const queue = this.blockedQueues.get(queueId)!;
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
@@ -498,11 +498,20 @@ export class FyflowTask {
     // Any task waiting on a resource group. Blocked tasks are subtracted from
     // stats.queued when they leave the ready queue, so they are invisible to the
     // stats alone.
+    //
+    // O(1): every blocked queue keeps one shared live count. Visiting each queue
+    // instead cost O(keys) per call, and a cancel asks on every call - so
+    // cancelling every task of a keyed group with thousands of keys, nothing
+    // running, took seconds.
     private _hasBlockedTasks(): boolean {
-      for (const queue of this.blockedQueues.values()) {
-        if (queue.length > 0) return true;
-      }
-      return false;
+      return this.blockedLive.live > 0;
+    }
+
+    /** Tasks in every blocked queue together, kept by the queues themselves. */
+    private blockedLive = { live: 0 };
+
+    private _newBlockedQueue(): TaskQueue<FyflowTask> {
+      return new TaskQueue<FyflowTask>({ trackMembership: true, counter: this.blockedLive });
     }
 
     _checkCompletion() {
@@ -770,7 +779,7 @@ export class FyflowTask {
           // Blocked on this group - and on this key, when the group is keyed
           const queueId = this._blockedQueueId(id, key);
           if (!this.blockedQueues.has(queueId)) {
-            this.blockedQueues.set(queueId, new TaskQueue<FyflowTask>({ trackMembership: true }));
+            this.blockedQueues.set(queueId, this._newBlockedQueue());
           }
           const blockedQueue = this.blockedQueues.get(queueId)!;
           // It has left the ready queue: count it out of `queued` before
@@ -2247,10 +2256,25 @@ export class FyflowTask {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
       if (this.stats.running > 0) {
-        console.warn(
-          `⚠️ Shutdown proceeding with ${this.stats.running} task(s) still marked running - ` +
-          `they were dispatched to a pool that could not complete them`
-        );
+        // A task being cancelled is not stuck in a broken pool: it is a worker
+        // that has not stopped yet, and the shutdown is what ends it
+        let stopping = 0;
+        for (const task of this.tasks.values()) {
+          if (task.state === 'running' && task.cancellation) stopping++;
+        }
+        const stuck = this.stats.running - stopping;
+        if (stuck > 0) {
+          console.warn(
+            `⚠️ Shutdown proceeding with ${stuck} task(s) still marked running - ` +
+            `they were dispatched to a pool that could not complete them`
+          );
+        }
+        if (stopping > 0) {
+          console.warn(
+            `⚠️ Shutdown proceeding with ${stopping} task(s) still being cancelled - ` +
+            `a threaded one ends cancelled with its worker, an inline one's cancel() resolves false`
+          );
+        }
       }
 
       // 2. Stop retrying, and stop listening to the pools before they are torn
@@ -2288,6 +2312,7 @@ export class FyflowTask {
         }
       }
       this.blockedQueues.clear();
+      this.blockedLive.live = 0;
       for (const task of this.tasks.values()) task._queuedIn = undefined;
 
       // 4. Shutdown all WorkerManager instances

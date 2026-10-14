@@ -350,6 +350,69 @@ test.describe('FyFlow Web Worker Functionality', () => {
     expect(inline).toContain('c:log:2:{"i":2} c:failed');
   });
 
+  // The cancel reaches a Web Worker as a message its signal aborts on; one
+  // that never yields cannot read it, and is terminated after its grace period
+  test('should cancel a task running in a Web Worker', async ({ page }) => {
+    const outcome = await page.evaluate(async () => {
+      const { FyflowScheduler, FyflowTask, WorkerManager, CancelledError } = await import('/dev-dist/browser/index.js');
+      const pool = new WorkerManager('/dev-dist/browser/tests/workers/cancelWorker.js', {
+        maxThreads: 1, maxConcurrentTasks: 1, inline: false, idleTimeout: 0
+      });
+      const scheduler = new FyflowScheduler({ W: pool }, {});
+      const events: string[] = [];
+      for (const name of ['task.cancelling', 'task.cancelled']) {
+        scheduler.addEventListener(name, (e: any) => events.push(`${name.slice(5)}:${e.detail.id}`));
+      }
+      const progress: string[] = [];
+      let seen: any;
+      scheduler.addEventListener('task.progress', (e: any) => {
+        progress.push(`${e.detail.id}:${e.detail.message}`);
+        if (e.detail.message === 'stopped') seen = e.detail.details;
+      });
+      const entered = async (id: string) => {
+        const deadline = performance.now() + 5000;
+        while (!progress.includes(`${id}:entered`) && performance.now() < deadline) {
+          await new Promise(r => setTimeout(r, 10));
+        }
+      };
+
+      // Honours its signal: stops by itself, seeing the reason
+      const polite = new FyflowTask({ id: 'polite', workerType: 'W', payload: { delay: 10_000 } });
+      const politePromise = (scheduler.addTask(polite, { createPromise: true }) as Promise<any>).catch((e: any) => e);
+      await entered('polite');
+      const politeCancelled = await scheduler.cancel('polite', { reason: 'user stop' });
+      const politeError = await politePromise;
+
+      // Never yields: forced
+      const spinner = new FyflowTask({ id: 'spinner', workerType: 'W', payload: { mode: 'spin', delay: 10_000 } });
+      scheduler.addTask(spinner);
+      await entered('spinner');
+      const start = performance.now();
+      const spinnerCancelled = await scheduler.cancel('spinner', { graceMs: 100 });
+      const forcedAfter = performance.now() - start;
+
+      const result = {
+        politeCancelled, spinnerCancelled, forcedAfter,
+        rejectedWith: politeError instanceof CancelledError ? politeError.reason : String(politeError),
+        workerSaw: seen,
+        politeForced: polite.cancellation?.forced,
+        spinnerForced: spinner.cancellation?.forced,
+        events: events.join(' ')
+      };
+      await scheduler.shutdown();
+      return result;
+    });
+
+    expect(outcome.politeCancelled).toBe(true);
+    expect(outcome.rejectedWith).toBe('user stop');
+    expect(outcome.workerSaw).toEqual({ aborted: true, reason: 'user stop' });
+    expect(outcome.politeForced).toBe(false);
+    expect(outcome.spinnerCancelled).toBe(true);
+    expect(outcome.spinnerForced).toBe(true);
+    expect(outcome.forcedAfter).toBeLessThan(3000);
+    expect(outcome.events).toBe('cancelling:polite cancelled:polite cancelling:spinner cancelled:spinner');
+  });
+
   test('should handle mixed inline and Web Worker execution', async ({ page }) => {
     const result = await page.evaluate(async () => {
       try {
