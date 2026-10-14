@@ -184,6 +184,15 @@ threaded task. `deno task jsr:smoke` exists to catch exactly this — it stages
 only the publishable files and runs a real threaded worker against them. **A
 green dry run is not evidence the package works.**
 
+**There are two worker bootstraps, and a protocol change goes in both.** Deno
+and the browser run `core/workerWrapper.ts`, Node runs
+`core/workerWrapper.node.ts`; they stay separate because worker threads differ
+between runtimes. A new message added to one and not the other passes every
+test on the runtime that does not use it - `deno task test` exercises one file,
+`pnpm test` the other. So each such feature needs a test on a threaded pool
+(`inline: false`) in the shared suites, run on both, plus a browser spec, as
+`emit()` and cancellation have.
+
 **No typechecker in this repo can see a type imported as a value.** Node runs
 TypeScript by *erasing* types, not compiling them, so `import { SomeInterface }`
 survives erasure as a real named import and throws

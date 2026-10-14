@@ -9,623 +9,67 @@
 
 ## Current Development Tasks
 
-### Core Framework Improvements
+No feature work is open. fyflow-app's pass 1 requests are answered: #1
+(cancellation), #2 (a worker event channel, in place of a log API) and #4
+(attempts already spent) are built, and #3 (`meta` on tasks) was declined in the
+reply. Their summaries are in the archive below.
 
-#### 🟢 Strict Resource Limits with Token-Based Allocation (Opt-in)
-**Goal**: Guarantee hard limits for physical resources (GPU memory, API quotas,
-file handles) that must never be exceeded, via async token-based allocation.
+### Unreleased: notes for the next release
 
-**Outcome**: Implemented as `StrictLimitGroup` (commit `564d822`), then removed
-again (commit `a035e45`) along with `groups/strictLimitGroup.ts` and
-`examples/strict-limits.ts`. Both remaining group types are optimistic, so a
-limit can still be briefly exceeded by up to `maxThreads × maxConcurrentTasks`
-during race conditions.
+Everything on `main` since `v0.5.2`. A minor release (0.6.0) by the 0.3.0
+precedent: the source-breaking items below are narrow, and the release commit
+should give the reasoning for each.
 
-The full design - token acquisition, FIFO wait queues, deadlock prevention
-strategies and the unified `ResourceGroup` interface - is preserved in the git
-history of this file if the work is ever picked up again. The unified interface
-part of it did survive, as `groups/resourceGroup.ts`.
+**New**
+- `scheduler.cancel(taskId, options?)`, `CancelOptions`, `CancelledError`,
+  `task.cancelling` / `task.cancelled`, the `'cancelled'` state,
+  `task.cancellation`, `stats.cancelled`, `context.signal`, and the pool option
+  `cancelGraceMs` (`AGENTS.md` §4, §5, §6, §8).
+- `emit()` on both worker contexts, `task.message` on the scheduler,
+  `worker.message` on the pool, and the pool option `messages` (§4, §6).
+- `attemptsSpent`, `task.attemptNumber` and `task.retrying` (§5, §6).
 
-**Status**: 🟢 Closed - implemented and deliberately reverted
+**Source-breaking**
+- `emit` is a new required member of `BaseWorkerContext` and
+  `TaskWorkerContext`, and `signal` of `TaskWorkerContext`: code that builds a
+  context object literal, typically to unit-test a worker, must add them.
+- `ResourceUnblockReason` gains `'cancelled'`, which breaks an exhaustive
+  `switch` - the same call as `ResourceGroup.type` in 0.3.0. `AGENTS.md` now says
+  not to switch exhaustively on it.
+- `readyQueuesByWorker` and `blockedQueues` hold a `TaskQueue`, not an array.
+  Public fields, never documented.
 
-### Requests from fyflow-app, pass 1 (2026-10-13)
+**Behaviour changes**
+- `terminateWithError()` is a request and never throws, on both pool types;
+  code after it runs. Called on a task's context on a threaded pool, that task
+  now fails instead of being requeued. Called from `setup()`, it fires
+  `worker.setup.completed`, not `.failed`.
+- A retry waits out its `backoffMs` however busy the scheduler is, so retries
+  start later under load than before.
+- `scheduler.completed` fires for a run with no successes - all failed, or all
+  cancelled.
+- `onCompletePromise()` settles for a task that has already settled.
+- `shutdown()` keeps listening to its pools during its drain, so a spawn or
+  requeue reported then is no longer lost.
+- A threaded worker's progress and spawns for a task it is not running are
+  dropped.
 
-Arrived as a specification from fyflow-app, which drives the scheduler through
-fyflow-orchestration 0.7.0. Item numbers are theirs and stay stable, so replies
-cite them as "scheduler pass 1 #N". Plans go to `doc/design/`, contracts to
-`AGENTS.md`. None of the four was already on `main` at 0.5.2.
+**Fixed**
+- A requeued task could be settled by the run it abandoned.
+- A threaded self-terminating task was requeued forever instead of failing, and
+  in the browser a termination was not recognised at all.
+- One worker failure spent two restarts.
+- A retried task blocked when its pool disappeared vanished without settling.
+- A listener re-entering the dispatch loop could lose a task.
+- A threaded `run()` returning `null` or `undefined` crashed the host process.
 
-Applies to every protocol change below: Deno and the browser run
-`core/workerWrapper.ts`, Node runs `core/workerWrapper.node.ts`. They stay
-separate files because of runtime differences in worker threads, so a new
-message has to be added to both. Each such feature therefore needs a test on a
-threaded pool (`inline: false`) in the shared suites, which exercises each
-wrapper on its own runtime, plus a browser spec.
-
-#### 🟢 Cancel a task, queued or running (#1, P1)
-`scheduler.cancel(taskId, options?)`, a terminal `task.cancelled` that is not a
-`task.failed`, and resource holdings released. Reaches all seven places a task
-can wait, including a new thread still initialising. Cooperative through an
-`AbortSignal` on the context; forced after a grace period on threaded pools
-only. `'cancelled'` on `ResourceUnblockReason` is a widening, so the release
-commit needs the reasoning, as for 0.3.0.
-
-Decided: the promise rejects with a new `CancelledError`, optional or not; while
-cancelling, `state` stays `'running'` with `task.cancellation` as the marker,
-and only the terminal `'cancelled'` is new; an inline worker ignoring the signal
-keeps the task cancelling until `run()` returns; cancel wins over a late outcome;
-`task.cancelling` then `task.cancelled` for dispatched tasks, with resources
-released at the second, and after a forced stop only once the thread is dead; an
-eagerly created `context.signal`; a forced stop does not count against
-`maxWorkerRestarts` and always requeues co-tenants; `cancelGraceMs` defaults to
-2000, with per-call `graceMs` that a repeat call can only shorten; `cancel()` is
-constant-time through tombstones in head-indexed queues and live counts, with no
-bulk API; every state and queue transition completes before its event, at four
-sites; a cancelling task whose worker fails settles only once its attempt has
-stopped; re-adding a cancelled task object throws. `descendants: true` and pause
-groundwork are deferred. Depends on the requeue, re-entrancy and queue known
-issues below. Includes the `scheduler.completed` fix below. Plan:
-`doc/design/task-cancellation.md`, deleted once built (`git log` keeps it).
-
-Built in four stages on branch `task-cancellation`, each committed there, merged
-into `main` once all four are done:
-1. 🟢 Undispatched tasks (ready, blocked, backoff) and scheduler-side settlement
-   of a running one: `cancel()`, `CancelledError`, `task.cancelling` /
-   `task.cancelled`, `stats.cancelled`, queue tombstones, transitions before
-   events in `_dispatchTask`, cancel wins in `_settleTask` (`fdf8cdf`). The new
-   `cancellation` suite has 16 tests; all 12 mutations of the stage are caught.
-2. 🟢 Cooperative cancel: `context.signal` (one `AbortController` per attempt,
-   aborted in a microtask inline, by a never-replying `cancel` message on a
-   thread), routing through the pool to the wrapper holding the attempt, the
-   three dispatched-but-not-running places (enqueue in flight,
-   `ThreadWrapper.taskQueue`, inline before `run()`), and the release: a
-   forgotten threaded promise is rejected once its worker is dead, so a
-   cancelling task whose worker fails settles then instead of hanging.
-   `ThreadWrapper.terminate()` now awaits Node's exit promise. 10 new tests,
-   among them the check order and capacity race left from stage 1; two stage-1
-   tests had become vacuous - they cancelled before `run()`, which now never
-   starts - and cancel from inside it again. 15 mutations caught, the worker
-   side on Deno and Node.
-   Not covered: a cancelling task that itself calls `terminateWithError()` on a
-   thread settles at the request, while its run may go on until the worker is
-   torn down - as any task failing itself that way does today.
-3. 🟢 Forced stop on threaded pools: `cancelGraceMs` (default 2000, validated
-   at construction), a grace timer per cancelled attempt, cleared at settle and
-   by `pool.shutdown()`, with a repeat `cancel()` only shortening it; `Infinity`
-   and anything over 2^31-1 arm none. Retiring the worker detaches every
-   attempt before teardown, requeues co-tenants at once whatever
-   `requeueFailedTasks` says, and settles the cancelled ones `forced: true`
-   only once the thread is dead. No `worker.failed`, no restart counted;
-   `shutdown()` waits for a retire in progress instead of terminating the
-   worker twice. 7 new tests, among them a worker spinning synchronously and
-   results posted during the teardown handshake; 18 mutations caught on Deno,
-   the timing-dependent ones on Node too.
-4. 🟢 The contract in `AGENTS.md` - §1, §4 (`context.signal`, a CPU-bound
-   recipe), §5 (`cancel()`, `CancelOptions`, `cancelGraceMs`,
-   `task.cancellation`, the state, `stats.cancelled`), §6 (the two events,
-   their order, the `'cancelled'` unblock reason and not switching on it), §7,
-   §8 (the forced stop), §9 and §10 (cancelling a run) - and a `README.md`
-   section. 4 docs tests, one a `fetch()` aborted against a server that never
-   answers; a "Cancel At Scale" test (50,000 tasks in a ready queue both ways,
-   a blocked queue and 5,000 keys, each 30-40 ms against a 1 s bound); a
-   Playwright spec on three engines, cooperative and forced. Shutdown's drain
-   warning now names tasks still being cancelled separately from tasks stuck in
-   a pool. Two bugs found on the way, each its own entry below: a threaded
-   `run()` returning `null` or `undefined` crashed the host, and "is any task
-   blocked?" visited every blocked queue. The plan's mutation "the full
-   `_checkCompletion` per cancel" no longer fails anything: with the live
-   blocked count that check is O(1) on every path a cancel reaches, and the
-   cost it guarded against is now caught through the count instead.
-
-Benchmark (`benchmark:quick --runs 3`, three rounds alternated with `main`
-from a worktree, nine runs each), medians: 1K -10.8%, 10K +30.9%, 50K +0.5%,
-100K -5.1%, threaded -2.8% to 0.0%. 1K is the usual bimodal scenario - every
-run lands near 1,150 or near 1,300 - and this branch drew five low runs to the
-base's two. 10K's spread is 31K-84K on both sides. 100K is inside the ±10%
-band, with overlapping ranges (base 74,948-86,234, branch 67,693-79,626), but
-the branch's best run sits just under the base's median, so it may be a small
-real cost: every dispatch now allocates an `AbortController` (inline) and
-writes `_queuedIn`. Not investigated further.
-
-Release notes, all on this item: `signal` is a new required member of
-`TaskWorkerContext` (source-breaking for a hand-built context, like `emit`);
-`'cancelled'` widens `ResourceUnblockReason` - a minor, with the reasoning in
-the release commit, as for `ResourceGroup.type` in 0.3.0; `stats.cancelled` is
-new; `scheduler.completed` now fires for runs with no successes;
-`onCompletePromise()` now settles for a task that has already settled; and the
-two fixes below.
-
-**Status**: 🟢 Completed - on `task-cancellation` (stages `fdf8cdf`, `7634328`, `bd45ad6` and stage 4), Deno and Node 22 215/215, browser 3 engines, `jsr:smoke` (Node 24); merge into `main` pending
-
-#### 🟢 A log channel from workers (#2, P1)
-Requested as `context.log(level, message, data?)` and `task.log`. Answered with
-a general worker-to-host event channel instead, with logging as one use of it,
-so the scheduler does not define log levels or formats: `context.emit()` to
-`task.message` on the scheduler, and `workerContext.emit()` to `worker.message`
-on the pool. Nothing is sent while nobody listens. The gate, buffers, cap,
-clone and flush live once, in a new runtime-neutral `core/messageChannel.ts`
-used by both worker wrappers and `InlineWrapper` (it needs its own line in the
-`deno.json` publish allowlist). Plan: `doc/design/task-messages.md`, no open
-questions. Its prerequisites, #4's `task.attemptNumber` and the requeue known
-issue below, have shipped. Defaults decided from a prototype benchmark:
-`flushIntervalMs: 20`, `maxBuffered: 100`, i.e. 5K events/s per buffer, at which
-16 workers flooding left the main thread at its idle floor in the prototype;
-see the outcome below.
-
-`node:diagnostics_channel` was considered and rejected: it is per-thread, so it
-cannot carry worker output to the main thread, and the browser does not have it.
-
-**Outcome**: built as planned; the plan is deleted and its contract is in
-`AGENTS.md` §4 (`emit` on both contexts), §5 (exports, the `messages` option),
-§6 (`task.message`, `worker.message` and their guarantees) and §10 (a log
-recipe). `core/messageChannel.ts` holds the gate, buffers, cap, clone and flush
-once, for both worker wrappers and `InlineWrapper`; 18 files now ship.
-
-Additions to the plan, found while building it:
-- **A stream ending over the cap lost its `dropped` count**, since nothing
-  later carried it. Its last discarded emit is now delivered as a marker, with
-  `data` undefined and `error: 'Discarded at the message cap'`, so delivered
-  plus `dropped` always equals emits made while someone listened.
-- **Closing an attempt's context is not redundant with the host's filter.** The
-  host drops events for a task no longer running on that worker, but a retry on
-  the same worker runs the same task id again, and only the closed context keeps
-  attempt 1's stray emit out of attempt 2. Found by a mutation that the planned
-  "nothing after settle" test did not catch; it has its own test now.
-- **Inline delivery is deferred to a microtask** and drained synchronously
-  (`_deliverNow()`) before every settle and lifecycle event, so a host listener
-  never runs inside the worker's `emit()` call, yet ordering still holds.
-- `jsr:smoke` caught parameter properties in the new module, which Node's type
-  stripping rejects and no typechecker here flags.
-
-Tests: a new `messages` suite (19), each test on both pool types unless the
-behaviour is thread-specific; the settlement requeue harness now also asserts
-an abandoned run's emits are dropped; a docs test for the log recipe; a
-Playwright spec on three engines asserting inline and threaded deliver the same
-stream. Mutation checks, each failing a test: no flush before `result`
-(threaded); no delivery before an inline `task.failed`; the context never
-closing; no time check in `emit()`; the gate forced open; cloning at the flush
-instead of `emit()`; no trailing-drop marker; the pool also dispatching
-`task.message`; gated emits not using a `seq`; inline delivering synchronously.
-`jsr:smoke` fails without the allowlist line.
-
-Defaults (from the plan's prototype benchmark, Deno 2.9.6, Windows): 16
-threaded workers flooding, worst main-thread stall over three runs, and latency
-at 16 x 1,000 events/s; the idle floor was 17 ms.
-
-| Interval / cap | Per buffer | 16 workers | Latency p50 / p99 |
-|---|---:|---:|---:|
-| 10 ms / 100 | 10K/s | 164 ms | 16 / 17 ms |
-| 20 ms / 200 | 10K/s | 74 ms | 18 / 34 ms |
-| **20 ms / 100** | **5K/s** | **16 ms** | **21 / 36 ms** |
-| 50 ms / 250 | 5K/s | 20 ms | 39 / 69 ms |
-
-Caps of 1,000 or more stalled it for seconds: a delivered batch is one
-uninterrupted main-thread task. Rerun against the real implementation, 16
-workers each emitting over 100,000/s in a loop that never yields: ~70,000
-events/s delivered to a listener formatting a log line, every emit accounted for
-(delivered plus `dropped`), worst stall 16-47 ms against 16 ms idle - about the
-host's limit. A first version dispatched each message twice on the way (an
-internal event per message, then the scheduler's); wrappers now hand the pool a
-batch through a callback, so each message is one object and one dispatch.
-
-Benchmark: a first `benchmark:quick` comparison showed 50K inline -8.5% with
-every run below the base's, because every inline task allocated a message
-stream and flushed before settling even when it never emitted. Streams are now
-created on the first `emit()`, and an empty flush returns before reading the
-clock. Six alternated rounds of the inline volume scenarios after that: 1K
-+0.4%, 10K -5.1%, 50K -3.6%, 100K +3.9%, each within the other's spread.
-Threaded scenarios -2.4% to +2.4% in the quick suite, within spread.
-
-Release notes: `emit` is a new required member of `BaseWorkerContext` and
-`TaskWorkerContext`, which is source-breaking for code that builds a context
-object literal (typically to unit-test a worker's `run()`).
-
-**Status**: 🟢 Completed - Deno and Node 22 177/177, browser 78/78, `jsr:smoke` (Node 24)
-
-#### 🟢 Start a task with attempts already spent (#4, P2)
-A config field so a resumed task does not get a fresh retry budget, and an event
-when a retry starts. Decided: `attemptsSpent` sets the starting `attempts`, and a
-task whose spent attempts already use up the budget runs once anyway; a new
-1-based `task.attemptNumber` (not `attempt`, which is one letter away from the
-0-based `attempts`); a requeue after worker death is not an attempt; a
-`task.retrying` event whose detail is the live task, like the other lifecycle
-transitions. Includes the backoff fix below. Depends on the requeue known issue
-below. Plan: `doc/design/attempt-accounting.md`, no open questions.
-
-**Outcome**: built as planned; the plan is deleted and its contract is in
-`AGENTS.md` §5 (`attemptsSpent`, `attemptNumber`, `attempts` as retries used,
-`error` per attempt, requeue is not an attempt), §6 (`task.retrying`, per-task
-ordering, and the lifecycle-versus-stream rule replacing "the four `task.*`
-events") and §10 (the Resume recipe). A retrying task waits in a
-`retryWaiting` map rather than the ready queue, still counted in
-`stats.queued`; `shutdown()` clears those timers once its drain ends. One
-addition to the plan: the retry branch now runs the dispatch loop at once, so the
-failed attempt's slot goes to other work - it used to wait for the backoff timer.
-
-Tests (settlement, 8 new plus an extension): the budget continuing from
-`attemptsSpent`; a spent budget running once, optional or not; validation;
-`task.retrying` once per retry with its fields; `error` cleared by a successful
-retry; backoff under load; no `scheduler.completed` during a backoff; shutdown
-during a backoff, one ending inside the drain and one outlasting it; the requeue
-tests assert one `attemptNumber` across both runs, inline and threaded. Docs:
-"Resuming Keeps The Retry Budget". Mutation checks, each failing its test:
-`task.retrying` on the final failure; the old immediate push; a backoff not
-counted in `stats.queued`; waiting tasks not discarded at shutdown;
-`attemptNumber` counting requeues; `error` not reset at dispatch; `attemptsSpent`
-ignored. Clearing the timers alone is not observable in-process - the timer
-callback already ignores a discarded waiter - so it only stops a dead timer
-holding the process open until it fires.
-
-Benchmark (`benchmark:quick`, alternated with the previous commit, three runs
-each), medians: 1K -0.5%, 10K +8.3%, 50K -2.2%, 100K -2.7%, threaded -2.9% to
-+4.2%. Every head median lies inside the base runs' range, so the extra write
-per dispatch is not measurable.
-
-**Status**: 🟢 Completed - Deno and Node 22 157/157, browser 75/75, `jsr:smoke` (Node 24, type stripping included)
+**Performance**
+- Head-indexed queues: 50K inline tasks 5.9x faster, 100K 10.9x; throughput is
+  flat from 10K to 100K. Cancelling is O(1) wherever a task waits.
 
 ## Known Issues / Follow-ups
 
-The first six below were found by the two review rounds of the pass 1 plans.
-They exist today, independently of that work. All three plans depend on the
-first one, and cancellation (#1) also depends on the two marked as its
-prerequisites, so they ship first.
-
-#### 🟢 A requeued task can be settled by its abandoned run
-When a worker fails, its other running tasks are requeued and dispatched again,
-but the old run keeps executing: an inline `run()` cannot be interrupted, and a
-threaded one keeps running through the 500 ms teardown handshake, because
-`terminate()` keeps `callbacks` until the end. When the old run finished, its
-outcome settled the **new** attempt: `_settling` had been cleared by the new
-dispatch, and the wrapper still listed the task. The live attempt's real result
-was discarded, and its resources were released while still in use. On an inline
-pool, the old run's failure also reached the scheduler as a wrapper
-`task.failed` event and failed the live attempt; its progress and spawns were
-attributed to the live attempt too.
-
-**Outcome**: the assumption that a task id runs at most once at a time is false
-after a requeue, so attempts are now told apart explicitly, in two places:
-- `_dispatchTask` stamps `task._dispatchToken` and captures it in the promise
-  handlers; `_settleTask` ignores an outcome whose token is stale, checked
-  before `_settling`.
-- Before reporting a requeue (or a failure), `_handleWorkerFailure` calls the
-  failed wrapper's new `forgetTask()`, so nothing that worker reports about the
-  task afterwards reaches the scheduler: result, failure, progress or spawn. This
-  covers the event path, which carries no token.
-
-Fixing it exposed an ordering bug that the old code hid. `_handleWorkerFailure`
-reported requeues before marking the worker failed, and the scheduler settles a
-requeue synchronously and runs its dispatch loop. The forgotten task no longer
-occupied the dying worker's slot, so it was re-dispatched straight back onto
-that worker. The worker is now marked failed first.
-
-Two smaller behaviour changes come with it. A threaded worker's progress and
-spawn messages for a task it is not running are dropped (previously
-dispatched unconditionally). And `InlineWrapper` no longer drives `runningTasks`
-negative when a run ends after `terminate()` cleared its tracking.
-
-Not done here, and moved to the plans that need it: rejecting a forgotten task's
-pending promise with an internal requeue error, so that a requeue no longer
-depends on the `task.requeue_required` event. Cancellation's forced stop needs
-that, and so does the shutdown-drain issue below; on its own it would add a
-second requeue path to the scheduler with nothing yet using it. It is now part
-of #1 stage 2.
-
-"One worker failure is handled twice" below is partly mitigated as a side
-effect: the second handling finds no running tasks left, so tasks are no longer
-requeued twice. The doubled restart count and replacement remain.
-
-Tests: three settlement tests on both pool types, with a worker failure injected
-after a second worker has been warmed up, and a test worker that ends the
-abandoned run 50 ms after its worker's teardown starts, so the timing is fixed
-rather than guessed. Each test refuses to pass if the re-dispatch did not happen
-before the abandoned run ended, or went to the same worker. Mutation checks:
-- token check removed: the old run's result, failure and spawn decide the outcome;
-- `forgetTask` call removed: the old run's failure and progress leak through;
-- worker not marked failed first: re-dispatch onto the dying worker, which also
-  breaks the existing "Unconstructable Worker Follows The Requeue Contract" test.
-
-Benchmark, run back to back against the previous commit from a worktree
-(`benchmark:quick --runs 3`), with the two scenarios that looked lower then
-rerun in reverse order, 5 runs each:
-- **1K inline**: bimodal on both commits (~1150 or ~1320 tasks/sec per run).
-  The −12% median in the first comparison was which mode each run landed in;
-  in reverse order the medians were 1317 (fix) and 1304 (base).
-- **200 tasks, 2 threads**: lower in both orders, about −7% by median (59.9 vs
-  64.7), but with a 50–67 spread and one 125 run on each commit. The only new
-  work on that path is one counter increment per dispatch and one integer
-  comparison per settle, about 400 operations a run against ~33 ms tasks, so it
-  cannot account for 7%. The other two threaded scenarios, on the same path,
-  measured −4.6% and +4.2%. Treated as noise.
-- The remaining scenarios moved +4% to +12% (all in the fix's favour) with CVs of
-  8–41%, as the process document warns.
-
-Browser tests: Chromium and WebKit pass. Firefox fails 6–9 tests per run on this
-machine, with or without this change, and the failing set differs between runs;
-the logs point at the Playwright Firefox driver (`juggler` errors).
-
-**Status**: 🟢 Completed - Deno 137/137, Node 22 137/137, `jsr:smoke`, lint
-
-#### 🟢 A threaded self-terminating task was requeued instead of failed
-Found while fixing the next issue. `AGENTS.md` §4 says that when a worker
-self-terminates, the task running at the time rejects with a
-`WorkerTerminationError`, and inline pools did that. A threaded pool handled the
-termination request **before** failing the task that threw it, so the pool
-requeued that task with the worker's others. It then ran again on the
-replacement worker, terminated that one too, and so on until the pool gave up,
-leaving the task `pending` forever. When it did reject, it rejected with a plain
-`Error`, so the documented `instanceof WorkerTerminationError` check failed.
-
-The inline pool also reported the failed task as requeued on the pool
-(`task.requeue_required`), which the scheduler ignored but a pool listener saw.
-
-A third problem surfaced on Node: `InlineWrapper` and `workerWrapper.ts`
-recognised a termination with `instanceof`. A worker bundled separately from the
-scheduler has its own copy of the class, so its error failed the check and the
-termination became an ordinary task failure; the worker was never torn down.
-This repository's Node test build bundles workers that way, and so does the
-browser build, which inlines the worker bootstrap with its own copy of
-`workerInterface.ts`. `workerWrapper.node.ts` already matched by name, with a
-comment explaining why.
-
-**Outcome**: both pool types now fail the calling task first, stop counting it
-as a running task, and only then handle the termination. The threaded pool
-rejects with a `WorkerTerminationError`. A new internal
-`isWorkerTerminationError()` matches by name as well as identity, and
-`InlineWrapper` re-creates a foreign copy from its own class, so a caller's
-`instanceof` holds.
-
-Tested on both pool types (task fails once, ran once, never requeued, rejects
-with `WorkerTerminationError`). Mutation checks: handling the termination before
-failing the task leaves it `pending`; not forgetting it on inline reports it
-requeued. Before the name check, the test failed on Node only.
-
-The browser case got its own Playwright spec afterwards, "should tear down a
-self-terminating worker and fail its task", on both pool types in all three
-browsers. With matching by identity only, it fails in the browser on both pool
-types - the worker is never torn down and the caller does not receive a
-`WorkerTerminationError` - confirming that the browser build was affected, not
-just this repository's Node test build.
-
-**Status**: 🟢 Completed - Deno and Node 22 138/138
-
-#### 🟢 A stale hand-written `ThreadWrapper` declaration in the build script
-`esbuild.config.js` wrote a hand-written `dist/types/core/threadWrapper.d.ts`
-("the Worker types do not survive the round trip"), then ran `tsc`, which
-overwrote it on every build. It never shipped, but it had drifted from the
-class - constructor arguments in the wrong order, missing methods - and read as
-the source of truth. A second block patched a `ThreadWrapper` export into
-`index.d.ts` that `tsc` already emits, and logged "already present" every time.
-
-**Outcome**: both removed; all 28 declaration files are byte-identical before
-and after. The same block overwrote the source file `core/workerWrapperUrl.ts`
-with a stub for `tsc` and restored it afterwards, but a failing `tsc` exited the
-build without restoring it, leaving the stub in the working tree to be committed
-by accident. The restore is now in a `finally`, verified by forcing a type error.
-
-**Status**: 🟢 Completed
-
-#### 🟢 Browser tests fail at random when run locally
-On a 20-core Windows machine `pnpm run test:browser` failed 6-9 Firefox tests
-per run, a different set each time, with or without code changes, and
-occasionally one WebKit test. Almost all were timeouts in `beforeEach` (the page
-load) or in context teardown, with Playwright's Firefox driver logging
-`cannot find session`; one was a timing assertion in "should handle resource
-contention performance" (`expected > 254`), failing under the same load.
-
-The cause was parallelism, not the library: Playwright's local default is half
-the cores, here 10 browsers each running scheduler threads. Run serially,
-Firefox passed 24/24 twice. CI was unaffected, because it already runs one
-worker.
-
-**Outcome**: local runs use one worker, as CI does. A first fix capped them at 2:
-1 failure in 4 full runs at ~1.5 min, against ~7 per run at 4.7 min before, but
-a later run at 2 failed 6 Firefox tests, the same page-load timeouts. Serial has
-not failed on this machine: Firefox alone 25/25 three times, the full suite 72/72
-in ~2 min. No local retries were added, so a real hang still fails the run.
-
-**Status**: 🟢 Completed - local browser runs are serial
-
-#### 🟢 `terminateWithError()` behaves differently inline and threaded
-Called through the task context, inline `terminateWithError()` threw a
-`WorkerTerminationError` synchronously, so the calling task failed and every
-other task was requeued. Threaded, it posted a message and returned: the run kept
-going, and the pool requeued every running task **including the caller**, which
-then ran again. Inline, a call from outside the task's own stack - a timer, an
-interval, the worker-level `this.workerContext` - threw where nothing caught it:
-an uncaught exception that crashed the host process (Node, Deno) or silently did
-nothing (browser). `tests/workers/selfTerminatingWorker.ts` does exactly this.
-The documentation disagreed with itself too: `AGENTS.md` said the task running
-at the time rejects, the `BaseWorkerContext` JSDoc said in-flight tasks are
-requeued.
-
-**Outcome**: one contract, chosen with the maintainer, documented in `AGENTS.md`
-§4, the README and the JSDoc:
-- It is a request and **never throws**, on both pool types and from any call
-  site. Code after it keeps running; the calling task's later result is
-  discarded.
-- **Attributed by context.** Called on a task's `context`, that task fails with a
-  `WorkerTerminationError` and the worker's others are requeued. Called on
-  `this.workerContext`, no task is blamed and every in-flight task is requeued.
-  Throwing a `WorkerTerminationError` out of `run()` behaves like the task-context
-  call. "Requeued" is subject to `requeueFailedTasks` and `canRestart`, as before.
-
-Inline, the request marks the worker failed at once (so nothing is dispatched to
-it) and reports in a microtask, so no scheduler or listener code runs inside the
-worker's own call - matching a thread, where it is a message. A request made in
-`setup()` used to throw and fail the setup; now setup completes and the worker is
-torn down, and the wrapper tears the instance down itself, because the pool's
-teardown runs before the instance is stored and found nothing (verified: without
-it, the instance is never torn down). Both wrappers handle a termination once.
-Threaded, the task context now sends its task id; `ThreadWrapper`'s throwing
-`createTerminateWithError` and `pendingTerminationRequest` were never called and
-are removed.
-
-Behaviour changes for consumers: inline code after a `terminateWithError()` call
-now runs; a task that terminates through its own context on a threaded pool now
-fails instead of being requeued; `worker.setup.completed` (not `.failed`) fires
-when `setup()` requests termination.
-
-Tests (both pool types): a task-context call fails only the caller and requeues
-the co-tenant; the same from a timer; a worker-context call requeues every task;
-the docs test covers both rows of the `AGENTS.md` table; the setup-termination
-test now requires the teardown. Two existing tests used a task-context call
-expecting a requeue and now use the worker-context one. Mutation checks: throwing
-again crashes the suite with `Uncaught WorkerTerminationError` from the timer
-test; a threaded task context without its task id leaves the caller unsettled;
-skipping the setup teardown fails the setup test.
-
-**Status**: 🟢 Completed - Deno and Node 22 143/143, browser 75/75, `jsr:smoke`
-
-#### 🟢 One worker failure is handled twice
-`_handleTerminationRequest` dispatches both `worker.failed` and
-`worker.termination_requested`, and both reached `_handleWorkerFailure`. One
-self-termination therefore:
-- added 2 to `poolRestartCount`, so with `maxWorkerRestarts: 1` a single
-  self-termination raised `worker.restart_limit_exceeded`, the event `AGENTS.md`
-  calls "intervention needed";
-- terminated the worker twice, so `worker.teardown.started` fired twice for one
-  worker, breaking the documented rule that lifecycle events are always paired;
-- emitted `task.requeue_required` twice per task, until the requeue fix above
-  made the second handling find no running tasks;
-- scheduled two replacements, the second a no-op.
-
-**Outcome**: `_handleWorkerFailure` handles each worker once, tracked in a
-`WeakSet` keyed by the wrapper. A failed worker is replaced, never revived, so
-one failure per wrapper object is the right unit, and the set needs no cleanup.
-Both events are still dispatched: `worker.failed` is public, and the guard
-makes the redundant route harmless rather than removing a path some failure
-might be the only report of.
-
-Tested on both pool types: one self-termination with `maxWorkerRestarts: 1`
-raises no alarm, tears the worker down once, and the next task completes on a
-replacement. Mutation check: without the guard, the alarm fires.
-
-**Status**: 🟢 Completed - Deno and Node 22 139/139, `jsr:smoke`, lint;
-browser Chromium 24/24, WebKit 24/24 (one flaky run of three)
-
-#### 🟢 An orphaned task that was retried is dropped silently
-`_failOrphanedTask` returned early if `task._settling` was set. After a retry or
-requeue decision, `_settling` stays `true` until the next dispatch, so a retried
-task that was blocked when its pool disappeared was shifted out of its queue and
-then dropped: no `task.failed`, no rejection, a promise that never settled. That
-is the phantom-task class the function exists to prevent. Reachable only through
-the same "pool removed" path as the original issue.
-
-**Outcome**: the guard is now "the task has already ended" (terminal state). An
-orphaned task is never in flight, so the per-attempt flag was the wrong
-question. Tested with a task whose first attempt fails and whose retry then
-blocks on a group before its pool is removed; it now fails terminally like any
-other orphan, and `scheduler.completed` fires. The test failed against the
-previous code with the task never settling.
-
-**Status**: 🟢 Completed - Deno and Node 22 140/140, lint
-
-#### 🟢 A listener re-entering the dispatch loop can lose a task
-`_dispatchLoop` peeked the head of a ready queue, called the blocking checks, and
-only then `shift()`ed. The blocking checks emit `resource.blocked`, and a listener
-that re-entered the scheduler (`addTask`, which runs the dispatch loop again) made
-the inner loop handle the same head task, so the outer `shift()` removed a
-different one. Traced on the previous commit: tasks `a`, `b`, `c` blocked behind a
-holder, a `resource.blocked` listener adding `late` - `c` ended up in no queue,
-never ran, never settled, and `stats` counted 4 done of 5.
-
-**Outcome**: the loop takes the task out of the ready queue before anything can
-emit, and the blocking checks move it out of `stats.queued` before they emit
-`resource.blocked`, so a listener sees consistent state. The common way out of
-the loop, a pool with no room, is checked first without touching the queue
-(`_poolHasRoom()`, the same condition under which `_canDispatchTask()` returns
-`false`); taking the head off and putting it back on every pass would copy a
-large ready queue twice per settle, given the known `shift()` cost above ~16K.
-Cancellation (#1) still needs the same rule at three more sites; see its plan.
-
-Tested with the traced scenario and the heartbeat disabled, so a lost task
-cannot be rescued by a periodic retry. Mutation check: restoring only the
-peek-then-shift order fails it.
-
-Benchmark, `benchmark:quick --runs 3` against the previous commit, alternated
-base/fix/base/fix (six runs each), medians: 50K +2.8%, 100K −2.2% - the
-large-queue scenarios the early capacity check exists for. 10K −15%, but its
-runs span 38k-76k (base) and 31k-84k (fix); 1K is bimodal as before and moved
-+12.7%; threaded −2% to −5%, within their spread. No regression read.
-
-**Status**: 🟢 Completed - Deno and Node 22 144/144
-
-#### 🟢 Ready and blocked queues are quadratic above ~16K tasks
-Both were plain arrays consumed with `shift()` (and `unshift()`). V8 makes
-`shift()` effectively free on small arrays, but above roughly 16,000 elements it
-copies the array on every call. Measured on Deno 2.9.6, per `shift()`: 0.1 µs at
-15,000 elements, 79 µs at 17,000, 232 µs at 50,000. Every dispatch from a large
-ready queue paid it. The two `!queue.includes(task)` guards before a blocked push
-were linear too: building a 100,000-task blocked queue one task at a time took
-42.7 s.
-
-**Outcome**: a small internal `TaskQueue` (`core/taskQueue.ts`, added to the
-publish allowlist; 17 files now ship) replaces both kinds of queue. The head is
-an index, and the consumed prefix is dropped once it passes half the array, so
-`shift()` is amortised O(1); putting a task straight back reuses its slot.
-Blocked queues opt into a membership `Set`, so their `includes()` guard is O(1).
-The plan's alternative for that guard - a "which queue is this task in" field on
-the task - was not used: a stale field would make the guard skip a push and lose
-the task, which is worse than slow, and membership kept inside the queue cannot
-go stale. The class keeps `length`, `push`, `shift`, `unshift` and iteration, so
-the scheduler's call sites barely changed, and so does `examples/
-test-deadlock.ts`, which reads the queues. `readyQueuesByWorker` and
-`blockedQueues` are public fields, so their element type changing from an array
-is visible to anyone reaching into them; neither is documented.
-
-Benchmark (`benchmark:quick --runs 3`, alternated with the previous commit, six
-runs each), medians: 50K inline 13,871 -> 82,115 tasks/sec (5.9x); 100K inline
-7,595 -> 82,984 (10.9x); 10K +43% with a wide spread. Throughput is now flat
-across 10K-100K. Threaded scenarios -3% to +2%, within their spread. 1K is
-bimodal (~1150 or ~1300 per run) as in every comparison so far; this time all
-six fix runs landed low (-10.8%), the previous comparison's landed high, and
-that scenario never queues enough to reach the changed code. Confirmed by the
-Benchmark workflow on ubuntu-latest (run 38482928731, `quick`, 3 runs, against
-`c36312a`): 50K +323%, 100K +695%, 10K +4.5%, 1K +0.4%, threaded within ±0.1%.
-
-The gain is not skipped work. At 50K and 100K, on this commit and its base
-alike, every task ran and settled exactly once, none failed, and concurrency
-counted inside the worker never passed the pool's 160 slots or a group's limit.
-
-Tests: FIFO order against a plain-array model over 20,000 seeded operations,
-with and without membership tracking; draining 100,000 items and building a
-100,000-item blocked queue, each bounded at 500 ms (they take tens of ms).
-"Limits Hold Past Queue Compaction" runs 3,000 tasks through a real scheduler,
-pool-only and under a group, so both queues cross the compaction threshold under
-a live limit, counting concurrency inside the worker. Mutation checks: an
-array-copying `shift()` takes 3.1 s to drain; untracked membership takes 42.7 s
-to block; a reversed `unshift` breaks the order test; ignoring the group limit,
-ignoring the pool's slot cap, and a compaction that drops or duplicates an item
-each fail the scale test. `jsr:smoke` fails without the allowlist line.
-
-**Status**: 🟢 Completed - Deno and Node 22 146/146, browser 75/75, `jsr:smoke`
-
-#### 🟢 `shutdown()` stops listening to its pools before draining them
-`shutdown()` calls `_removeAllListeners()` before its 5 s wait for running tasks.
-Settles during the wait still run the dispatch loop, so new tasks are dispatched
-into pools about to be torn down, and those tasks reach `task.completed` with no
-`task.running` before it. Requeues reported by pool events during the wait are
-lost entirely, leaving tasks counted as running until the wait gives up. Fix:
-remove listeners after the drain. Dispatching during the drain is intended, not
-part of the bug: `AGENTS.md` §7 promises that shutdown drains outstanding work so
-a workflow that can still finish does.
-
-It broke that promise outright: a child spawned during the drain was never added
-(the spawn request is a pool event), so the workflow finished short and
-`onCompleteDescendants()` resolved without it.
-
-**Outcome**: pool listeners are removed after the drain, as proposed. The
-periodic retry timer moved with them: it was cleared before the drain, but a
-full pool relies on it to dispatch the next task, and settles during the drain
-re-armed it anyway. Test "Shutdown Drain Still Hears The Pools" (spawning): a
-root spawns two children after `shutdown()` has started, with a second task
-queued behind it on a one-slot pool. All four must complete, each after its
-`task.running`, and the descendant wait must resolve. Mutation checks: removing
-listeners before the drain loses both children; suppressing `task.running` for
-tasks dispatched during shutdown fails the ordering check. Requeues during the
-drain are restored by the same change but have no test of their own.
-
-**Status**: 🟢 Completed - Deno and Node 22 148/148, browser 75/75
+Open issues, most important first. Closed ones are summarised in the archive.
 
 #### 🔵 Counting `task.running` minus `task.completed` overshoots real concurrency
 A task frees its slots before `task.completed` is emitted, and the freed slot
@@ -654,83 +98,24 @@ why a group-limited run is so much slower: 50K tasks at ~1,900 tasks/s under a
 limit-7 group, against ~114,000 pool-only. Not yet investigated; the throughput
 link is unconfirmed.
 
+Still there after #1 (2026-10-14): 300 tasks of 30 ms on a 50-slot pool behind a
+`ConcurrentLimitGroup(1)` - mid-run, `getAdmissionQueue('g')` listed 1-2
+waiters while `stats.queued` was 258. A consumer building an admission view
+from `resource.blocked`/`unblocked` - the 0.3.0 resource events, which a
+downstream library folds - sees one or two tasks waiting on a group that 258
+are waiting for.
+
 **Status**: 🔵 Not Started
 
-#### 🟢 Retry backoff is not enforced under load
-`_settleTask` pushes a retried task back onto the ready queue immediately and
-only schedules an extra `_dispatchLoop()` after `backoffMs`, so any dispatch in
-between starts the retry early. Confirmed on Deno 2.9.6 with `backoffMs: 1000`:
-gaps of ~1000 ms on an idle scheduler, but **1 ms** with 300 short tasks running
-alongside. Fixed as part of #4, which holds a retrying task outside the ready
-queue for its backoff. The test must run under load, since the idle case passes
-either way.
+#### 🔵 A cancelling threaded task that fails its own worker settles at the request
+A task being cancelled that calls `terminateWithError()` on its own `context`,
+on a threaded pool, settles `cancelled` when the request arrives - while its
+`run()` can keep going until the worker is torn down, up to about 500 ms, with
+its resources already released. Everywhere else a cancelling task settles only
+once its run has stopped. Any task failing itself this way behaves the same, so
+it is not specific to cancellation; it has no test.
 
-**Outcome**: fixed with #4; see that entry. "Backoff Holds Under Load"
-(settlement) runs 300 short tasks alongside a retried one with a 150 ms backoff;
-with the old immediate push restored, its retries started 31 and 16 ms apart.
-
-**Status**: 🟢 Completed - with #4
-
-#### 🟢 `scheduler.completed` never fires for a run with no successes
-`_checkCompletion` requires `stats.done > 0`, so a run in which every task
-fails, or (once #1 lands) every task is cancelled, never reports draining.
-
-**Outcome**: the condition is now "any task has reached a terminal state",
-`done + failed + cancelled > 0`. Tested by "scheduler.completed Without A
-Success" (cancellation suite); mutation check: restoring `done > 0` fails it.
-A behaviour change for the release notes: a run in which nothing succeeds now
-fires `scheduler.completed`.
-
-**Status**: 🟢 Completed - #1 stage 1 (`fdf8cdf`), on `task-cancellation` until #1 merges
-
-#### 🟢 A hung test stalled the whole run indefinitely
-No suite had a per-test timeout except error-handling (10 s, its own copy).
-A test awaiting a promise that never settles - which is what a mutation check
-of the cancellation suite produced - hung the run with no output naming the
-test, and would have hung CI until the job limit. The mutation script made it
-worse: it ran Deno through a shell, so its own timeout killed only the shell on
-Windows, and the run stalled for over an hour.
-
-**Outcome**: every suite runs its tests through `runTest` in `tests/harness.ts`,
-which fails a test still running after 60 s (the slowest test takes 11 s). The
-runner gained `--only <text>`, `--bail` and `--timeout <ms>`, so a mutation
-check runs the tests meant to catch it and stops at the first failure: the 12
-stage-1 cancellation mutations take 34 s in total. An `--only` that matches no
-test, and an unknown suite name, now fail the run instead of passing it with
-nothing run. Mutation scripts run Deno directly, never through a shell.
-
-**Status**: 🟢 Completed - `7cc93ca`, Deno 177/177 on that commit, Node 22, Chromium
-
-#### 🟢 A threaded `run()` returning `null` or `undefined` crashed the host
-`ThreadWrapper`'s message handler read `data.isWorkerTerminationRequest` off
-every result before checking it was an object. A threaded `run()` that returned
-`null` or `undefined` - so any `run()` with no `return` - threw inside the
-handler, uncaught, and took the host process down. Inline pools were not
-affected. No test returned either from a threaded worker; #1's CPU-bound recipe,
-which returns `null` once aborted, is what hit it.
-
-**Outcome**: optional chaining on both reads. "Any Returned Value Settles, null
-And undefined Included" (settlement) returns `null`, `undefined`, `0`, `''` and
-`false` from both pool types; without the fix it crashes the run.
-
-**Status**: 🟢 Completed - with #1 stage 4, on `task-cancellation` until #1 merges
-
-#### 🟢 "Is any task blocked?" visited every blocked queue
-`_hasBlockedTasks()` walked `blockedQueues` until it found a non-empty one. A
-keyed group has one queue per key, and every cancel asks the question when
-nothing is running, so cancelling 50,000 tasks blocked across 5,000 keys - key
-by key, each emptying a queue the next walk has to pass - took 1.8 s. Found by
-#1's scale test.
-
-**Outcome**: the blocked queues share one live count, kept by `TaskQueue`
-itself on every push, shift, unshift, tombstone, remove and clear, so the
-question is O(1). The same case takes 29 ms. The cancellation suite's exact
-accounting check now also compares the count with the admission queue after
-every scenario. Mutation checks: walking the queues again fails "Cancel At
-Scale" (3.3 s); a tombstone that does not decrement the count fails "Cancel A
-Blocked Task".
-
-**Status**: 🟢 Completed - with #1 stage 4, on `task-cancellation` until #1 merges
+**Status**: 🔵 Not Started
 
 #### 🔵 A browser performance spec asserts a timing order
 "should measure Web Worker vs inline performance" expects a Web Worker run to
@@ -755,177 +140,6 @@ the rewrite.
 
 **Status**: 🔵 Not Started
 
-#### 🟢 A blocked task whose pool is missing was dropped silently
-`_retryBlockedTasksForGroup` shifted a task out of a blocked queue and then did
-`if (!pool) continue;`, leaving it in no queue at all. It never settled - no
-`task.failed`, no `user_action`, no rejection - so a caller awaiting it waited
-forever and `stats` never accounted for it.
-
-`addTask`/`addTasks` validate worker types against `workerPools`, and the map is
-never mutated after construction, so this should be unreachable. It was silent
-when it was not.
-
-**Outcome**: the task is now failed terminally via `_failOrphanedTask` -
-`task.failed`, then `task.user_action` unless it is optional, and its promise
-rejects with `Worker pool "X" no longer exists`. Two departures from the
-ordinary failure path, both deliberate:
-
-- **Retries are skipped.** The pool is gone, so another attempt cannot succeed,
-  and `readyQueuesByWorker` keeps its entry for the type forever - a retry would
-  requeue into a queue no dispatch can drain and leave `stats.queued`
-  permanently above zero, wedging `scheduler.completed` rather than unwedging
-  it.
-- **It does not go through `_settleTask`**, which decrements `stats.running`. A
-  blocked task was never running; it gave up its `queued` count when it left the
-  ready queue, so settling it that way would decrement a count belonging to a
-  different task.
-
-The waiter is also swept out of every other blocked queue, each exit emitting
-`resource.unblocked` with `reason: 'orphaned'`, so a consumer's queue fold
-drains. Tested by deleting the pool from `workerPools` while a task is blocked -
-the only way to reach a branch that guards an impossible state. The test is
-bounded rather than awaiting the promise, because under the old behaviour it
-never settles and an unbounded await would hang CI instead of failing it.
-
-**Status**: 🟢 Completed
-
-
-#### 🟢 addTasks strands tasks with an unknown workerType
-`addTask` threw `Unknown worker type: X`, but `addTasks` skipped the queue push
-while still incrementing `stats.queued`, leaving a task that could never
-dispatch and a queued count that never returned to 0 - so `scheduler.completed`
-never fired again and a typo in a batch silently wedged the run.
-
-**Outcome**: `addTasks` now validates every task's worker type before touching
-any state, so it throws like `addTask` and the call is atomic - a rejected batch
-queues nothing and leaves no orphan entries in the task map. BREAKING for any
-caller that relied on unknown types being silently skipped, though that path
-wedged the scheduler.
-
-**Status**: 🟢 Completed
-
-#### 🟢 Worker lifecycle events are unreachable
-`worker.initialization.*`, `worker.setup.*` and `worker.teardown.*` were
-dispatched on the internal wrappers and never forwarded, so no consumer could
-observe them - despite being listed as a feature. Inline and threaded wrappers
-also emitted different subsets with different payload shapes, so forwarding them
-as-is would have shipped an API that silently stopped working when a pool
-switched to `inline: false`.
-
-**Outcome**: Normalised first, then forwarded. Both wrapper types now emit all
-eight with `{ workerId, workerType, timestamp }` plus `duration` on `*.completed`
-and `error` on `*.failed`; threaded workers report setup timing from inside the
-thread via new `setup_started` / `setup_completed` protocol messages.
-
-Three latent bugs surfaced while testing this:
-- `WorkerManager.shutdown()` removed listeners *before* terminating workers, so
-  teardown events could never be seen on the shutdown path. Listeners are now
-  dropped last, guarded by a `shuttingDown` flag so failures during teardown are
-  not mistaken for crashes worth restarting.
-- A threaded worker that threw during construction produced no event at all: the
-  error carried `taskId: 'init'`, which has no registered callback, so it was
-  dropped and initialization hung until its 30s timeout.
-- `ThreadWrapper.runTask` awaited initialization inside an async promise
-  executor, so an initialization rejection escaped as an unhandled rejection and
-  crashed the process rather than failing the task.
-
-**Status**: 🟢 Completed
-
-#### 🟢 Builds do not clean their output directory
-`dist/types/core/dagScheduler.d.ts` survived the deletion of its source in
-`dd57083` by months, and `package.json` ships `dist/**/*`, so it would have been
-published.
-
-**Outcome**: `esbuild.config.js` now clears `dist/` (library build) or
-`dev-dist/` (dev build) before writing anything. The stale declaration does not
-reappear.
-
-**Status**: 🟢 Completed
-
-#### 🟢 Intermittent failure in the error handling suite
-`Task Requeuing on Worker Failure` failed only inside a full test run, never
-standalone, and reliably on Node.
-
-**Outcome**: The test slept a fixed 200ms waiting for a worker that
-self-terminates after 50ms - but two worker threads have to start first, and
-measured Node thread startup is 50-70ms each, so under a full run's load the
-budget expired before the event arrived. It now polls for the event with a 5s
-ceiling, passing as soon as it fires. Four consecutive full Node runs and five
-Deno runs clean.
-
-Ruled out the `shuttingDown` guard added in `a74983e`, which suppresses exactly
-this event during shutdown: with the guard disabled the failure still reproduced
-3/3, so it was never the cause.
-
-**Status**: 🟢 Completed
-
-#### 🟢 worker.restart_limit_exceeded missed construction failures
-`_handleWorkerFailure` decided whether to requeue a worker's tasks with
-`canRestart !== false`, but decided whether to replace the worker with
-`canRestart === true`. Construction failures set no `canRestart` at all, so they
-fell through both branches of the second decision: no replacement was scheduled
-and `worker.restart_limit_exceeded` was never emitted. A pool that could not build
-a worker kept the dead one in its `maxThreads` slot forever and stayed silent to
-anyone monitoring that event.
-
-The two wrappers also disagreed. InlineWrapper reported a construction failure as
-`worker.failed`; ThreadWrapper emitted only `worker.initialization.failed`, so the
-same fault produced different task outcomes - inline stranded its tasks, threaded
-failed them.
-
-**Outcome**: ThreadWrapper now reports construction failures as `worker.failed`
-too, and the replacement decision uses `canRestart !== false`, matching the
-requeue decision beside it. Both wrappers now behave identically: tasks are
-requeued, the pool retries up to `maxWorkerRestarts`, then emits
-`worker.restart_limit_exceeded`. Covered by a settlement test asserting the alarm
-fires for both pool types.
-
-**Status**: 🟢 Completed
-
-#### 🟢 A task could be settled twice
-An outcome reaches the scheduler from two directions - the pool's `task.failed`
-event and the settling of the pool's task promise - and each was a full,
-near-duplicate settle. Measured on an ordinary task that simply throws:
-`task.failed` emitted twice, `stats.failed` counted 2 (and **5** for one task
-with `maxRetries: 2`), the terminal state raced from `user_action` to `failed`
-milliseconds later, `task.user_action` fired while retries still remained so the
-same task was requeued and rejected at once, and `stats.done` double-counted a
-task that succeeded after a retry.
-
-Worse, the event path never released resources: a worker dying with
-`requeueFailedTasks: false` settled only through it, so the task's resource group
-slot was never returned - measured as `running=1/2` still held after the task had
-settled. A pool losing workers slowly drained group capacity until it stopped
-dispatching.
-
-**Outcome**: One `_settleTask` routine, idempotent per attempt via a flag cleared
-on each dispatch. Both paths delegate to it; neither could be removed, since each
-is the only settle path in some scenario (ordinary throw reaches both, a worker
-dying with requeue off reaches only the event, a worker that cannot be
-constructed reaches only the promise). Resources are released there and nowhere
-else. `stats.failed` and `stats.done` now count tasks rather than attempts.
-
-Covered by `tests/suites/settlement.ts` - 14 tests, 10 of which failed against
-the old code.
-
-**Status**: 🟢 Completed
-
-#### 🟢 A requeued task could also be counted as failed
-`_settleTask` made settlement idempotent per attempt, but requeue was still a
-separate handler that cleared the settle flag, so the same failure could requeue a
-task AND settle it as failed. Three tasks against an unstartable pool reported
-`queued: 3` alongside `failed: 2` - five outcomes for three tasks - which cannot
-both be true.
-
-**Outcome**: Requeue is now a third outcome of `_settleTask`, alongside retry and
-terminal, so one decision covers all three and the counters move once. The settle
-flag stays set until the next dispatch clears it, so a late outcome from the
-abandoned attempt cannot settle the new one. Two tests assert that
-`queued + running + done + failed` never exceeds the task count, for both pool
-types.
-
-**Status**: 🟢 Completed
-
 #### 🔵 Browser specs are not type checked
 `deno task check` now covers the library, tests, examples and benchmarks, but
 `tests/browser/*.spec.ts` is excluded. Those specs carry ~43 pre-existing errors,
@@ -947,54 +161,12 @@ running each scenario in a fresh process would make the numbers comparable.
 
 **Status**: 🔵 Not Started
 
-#### 🟢 Benchmark "dependencies" category is misnamed
-`SCENARIO_CATEGORIES.DEPENDENCIES` held three scenarios named "Deep Chain",
-"Wide Tree" and "Mixed Dependencies", named after DAG workloads the framework
-cannot express. `dependencyConfig` was declared on `BenchmarkConfig`, set on
-those three, and never read - the task generator always produced independent
-tasks.
-
-**Outcome**: "Wide Tree" was byte-identical to
-"Large Volume - 1K Independent Tasks (Inline)" once `dependencyConfig` was
-ignored, so the suite was running the same benchmark twice under two names; it
-is deleted. The other two are renamed for what they measure
-("Inline Serial - 1K Tasks, 1 Per Instance" and
-"Large Volume - 5K Independent Tasks (Inline)"). `dependencyConfig` and its
-report-generator branches are gone.
-
-Categories were index slices, so removing a scenario would have silently
-reassigned every category after it - they are now looked up by name, which
-throws on a typo at import. That also let the 8 previously uncategorised
-scenarios be grouped: every scenario is now reachable by category, under two new
-ones, VOLUME and CONCURRENCY.
-
-**Status**: 🟢 Completed
-
 #### 🔵 Performance suite is not part of the default test run
 `tests/performance/contention-scaling.ts` is reachable via `test:performance`
 but not included in `runAllSuites()`, so contention regressions are not caught
 by `npm test` / `deno task test`.
 
 **Status**: 🔵 Not Started
-
-#### 🟢 Unbounded task retention
-Completed tasks were never evicted from `FyflowScheduler.tasks`, so a long-lived
-scheduler grew without limit - measured at ~7MB per 1,000 completed tasks with
-8KB payloads, since each entry pins its payload and result.
-
-**Outcome**: Added the opt-in `maxCompletedTasks` scheduler option (default
-unset = retain everything, since most workloads have bounded task counts and
-want completed tasks inspectable). With it set, growth flattens instead of
-climbing: 8 batches of 2,000 tasks grew 210MB unset versus 102MB and flat from
-batch 4 with a limit of 1,000.
-
-Also removed a dead recovery scan in `_checkCompletion()` that walked every task
-ever created looking for a `'dispatched'` state. That state stopped being
-assigned in `dd57083` but its recovery block was left behind, so the scan always
-found nothing while costing O(tasks) per call - 12ms at a million retained tasks.
-
-**Status**: 🟢 Completed
-
 
 ## Task Lifecycle Process
 
@@ -1172,6 +344,23 @@ another day does not.
 The following tasks have been completed and verified:
 
 ### ✅ Recently Completed (2026)
+- **Cancel a task, queued or running (fyflow-app #1)** - `scheduler.cancel()` reaches all seven places a task can be: waiting tasks are removed at once, running ones see `context.signal`, and a threaded worker that ignores it is retired after `cancelGraceMs` (default 2000) - detached before teardown, co-tenants requeued, settled `forced` only once the thread is dead, not counted as a restart. Cancel wins over any late outcome; `task.cancelling` then `task.cancelled`, with resources released at the second. Built in four stages with 33 tests in a new `cancellation` suite, 4 docs tests and a three-engine browser spec; 49 mutations checked. Cancelling 50,000 tasks takes 30-40 ms. Found and fixed on the way: `scheduler.completed` never fired for a run with no successes; a threaded `run()` returning `null` or `undefined` crashed the host; "is any task blocked?" walked every blocked queue (1.8 s to cancel 50,000 tasks over 5,000 keys, now 29 ms via a live count kept by `TaskQueue`). Benchmark against `main`: 50K +0.5%, 100K -5.1% (inside the band), threaded within ±3%.
+- **A worker event channel (fyflow-app #2)** - asked for as `context.log()`; built as `emit(name, data)` on both worker contexts, delivered as `task.message` on the scheduler and `worker.message` on the pool, with logging as one convention on top. Nothing is sent while nobody listens; events are batched (20 ms, cap 100 per buffer), ordered per attempt, delivered before their attempt settles, and every drop is counted. `core/messageChannel.ts` holds the logic once for both worker scripts and `InlineWrapper`. New `messages` suite (19 tests) and a browser spec.
+- **Attempts already spent (fyflow-app #4)** - `attemptsSpent` continues a resumed task's retry budget, `task.attemptNumber` numbers attempts 1-based, and `task.retrying` fires when a retry is decided. A requeue is not an attempt. Fixed with it: a retry's backoff was not enforced under load - any other dispatch started it early, 1 ms after failing where 1000 ms was asked for.
+- **Ready and blocked queues made linear** - both were arrays consumed with `shift()`, which V8 copies above ~16,000 elements, and blocked pushes were guarded by a linear `includes()` (42.7 s to build a 100,000-task blocked queue). An internal head-indexed `TaskQueue` with opt-in membership tracking: 50K inline tasks 5.9x faster, 100K 10.9x, confirmed on ubuntu-latest.
+- **A requeued task is no longer settled by the run it abandoned** - after a worker failure the old run kept going and its outcome settled the new attempt. Attempts now carry a dispatch token checked at settle, and the failed worker forgets the task before the requeue is reported.
+- **`shutdown()` hears its pools until the drain is done** - it removed its listeners before waiting for running tasks, so spawns and requeues reported during the drain were lost and `onCompleteDescendants()` resolved short.
+- **`terminateWithError()` has one contract** - inline it threw (crashing the host from a timer), threaded it requeued the caller. It is now a request on both pool types, attributed by context: a task's context fails that task and requeues the rest, the worker's context requeues everything.
+- **A threaded self-terminating task fails instead of being requeued forever** - the pool handled the termination before failing the task, so it ran again on every replacement. Termination errors are now matched by name too, which the browser build needed.
+- **One worker failure is handled once** - it arrived as two events and spent two restarts, so `maxWorkerRestarts: 1` alarmed on the first self-termination.
+- **A listener re-entering the dispatch loop no longer loses a task** - the loop peeked the head, emitted `resource.blocked`, then shifted, so a listener calling `addTask` left a task in no queue.
+- **An orphaned task that was retried fails instead of vanishing** - `_failOrphanedTask` returned early on a flag every retried task carries.
+- **Browser tests run serially locally**, as in CI - Playwright's default of half the cores made Firefox fail 6-9 tests per run on a 20-core machine.
+- **Per-test timeout and `--only` / `--bail` / `--timeout` in the test runner** - a hung test stalled a mutation check for over an hour; every test now fails after 60 s, and a mutation check runs only the tests meant to catch it.
+- **Build script stub restored on failure** - a failing `tsc` left a stubbed `core/workerWrapperUrl.ts` in the working tree; a dead hand-written `ThreadWrapper` declaration was removed.
+- **A blocked task whose pool is missing fails instead of vanishing** (0.5.2) - it was shifted out of its queue and dropped. It now fails terminally, with `resource.unblocked` reason `'orphaned'`.
+- **Intermittent error-handling test fixed** (0.5.2) - a fixed 200 ms sleep raced two Node thread startups under load; it now polls for the event.
+- **Strict resource limits, closed** - `StrictLimitGroup` was implemented and deliberately reverted; both group types remain optimistic. The design is in this file's git history; the unified `ResourceGroup` interface survived.
 - **Test suite audited against the documentation** - two documentation tests were vacuous: `Doc: Rate Limit Group` passed with the rate limit removed entirely, and `Doc: Concurrent Limit Group` asserted only that tasks completed. Both now assert the limit binds - the rate-limit run drops from 417ms to 2ms without a limit, which is what makes the assertion meaningful. Re-enabled `Concurrent Rate Limit Enforcement`, which had been commented out as needing 'complex timing synchronisation' but is stable at 5.01-5.09 against a limit of 5 across repeated runs, leaving plain rate limiting with no coverage at all. Added tests for six documented claims that had none: onCompleteDescendants on shutdown, handleRejection, periodicRetryIntervalMs, replaceWorker, updateWorkerConfig and its constructor-copy caveat, and the task.started and worker.teardown.failed events. Every documented event, method and option is now exercised.
 - **Requeue folded into the single settle path** - requeue was still a separate handler that cleared the settle flag, so a failure could requeue a task and count it failed at once; three tasks against an unstartable pool reported five outcomes. Requeue is now a third outcome of `_settleTask`, and the stats account for each task exactly once.
 - **Unstartable pools now raise the alarm** - a pool whose workers could not be constructed never emitted `worker.restart_limit_exceeded` and never replaced the dead worker, because the replacement decision required `canRestart === true` while construction failures set no `canRestart`; it also kept the dead worker in its `maxThreads` slot, wedging inline pools permanently. The two wrappers disagreed as well, inline reporting `worker.failed` and threaded not, so the same fault stranded tasks on one and failed them on the other. Both now report construction failures identically and the pool retries then alarms.
