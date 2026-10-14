@@ -117,26 +117,12 @@ it is not specific to cancellation; it has no test.
 
 **Status**: 🔵 Not Started
 
-#### 🔵 A browser performance spec asserts a timing order
-"should measure Web Worker vs inline performance" expects a Web Worker run to
-take at least as long as the same work inline (`overhead >= 0`). That is a
-race, not a property: it failed once on WebKit in a full three-engine run
-(2026-10-14, the #1 stage 4 checks), then passed 3/3 alone and 27/27 in a full
-WebKit run. Assert the two runs completed, and report the overhead rather than
-bound it.
-
-**Status**: 🔵 Not Started
-
-#### 🔵 `doc/design/pause-resume.md` is stale
-Written against an older architecture: `readyQueue`, a `dispatched` state,
-`pool.workers` and `_processQueue` no longer exist. Its immediate mode fails
-tasks without going through `_settleTask`, which is the double-settle and
-resource-leak class fixed in 2026. It is neither current nor marked abandoned,
-which `CLAUDE.md` does not allow. Rewrite it as an open note, now that
-cancellation (#1) has been built: interrupting a running attempt (signal, grace
-period, forced stop) is the hard part of an "interrupt" pause, and #1 provides
-it. #1 deliberately does not add a requeue outcome for pause; that belongs to
-the rewrite.
+#### 🔵 Rewrite `doc/design/pause-resume.md`, or delete it
+It was written against an older architecture and is now marked abandoned at
+its top, which satisfies `CLAUDE.md`'s rule that a plan is current or marked.
+A pause, if wanted, needs a new plan: cancellation (#1) provides the
+interrupt half - signal, grace period, forced stop - and deliberately added no
+requeue outcome for it. Nothing asks for pause today.
 
 **Status**: 🔵 Not Started
 
@@ -344,6 +330,7 @@ another day does not.
 The following tasks have been completed and verified:
 
 ### ✅ Recently Completed (2026)
+- **A browser performance spec no longer asserts a timing order** - "should measure Web Worker vs inline performance" required the Web Worker run to be the slower one, a race that failed once on WebKit in a full run. The overhead is now reported as a test annotation, and the spec shuts its two schedulers down, which it never did.
 - **Cancel a task, queued or running (fyflow-app #1)** - `scheduler.cancel()` reaches all seven places a task can be: waiting tasks are removed at once, running ones see `context.signal`, and a threaded worker that ignores it is retired after `cancelGraceMs` (default 2000) - detached before teardown, co-tenants requeued, settled `forced` only once the thread is dead, not counted as a restart. Cancel wins over any late outcome; `task.cancelling` then `task.cancelled`, with resources released at the second. Built in four stages with 33 tests in a new `cancellation` suite, 4 docs tests and a three-engine browser spec; 49 mutations checked. Cancelling 50,000 tasks takes 30-40 ms. Found and fixed on the way: `scheduler.completed` never fired for a run with no successes; a threaded `run()` returning `null` or `undefined` crashed the host; "is any task blocked?" walked every blocked queue (1.8 s to cancel 50,000 tasks over 5,000 keys, now 29 ms via a live count kept by `TaskQueue`). Benchmark against `main`: 50K +0.5%, 100K -5.1% (inside the band), threaded within ±3%.
 - **A worker event channel (fyflow-app #2)** - asked for as `context.log()`; built as `emit(name, data)` on both worker contexts, delivered as `task.message` on the scheduler and `worker.message` on the pool, with logging as one convention on top. Nothing is sent while nobody listens; events are batched (20 ms, cap 100 per buffer), ordered per attempt, delivered before their attempt settles, and every drop is counted. `core/messageChannel.ts` holds the logic once for both worker scripts and `InlineWrapper`. New `messages` suite (19 tests) and a browser spec.
 - **Attempts already spent (fyflow-app #4)** - `attemptsSpent` continues a resumed task's retry budget, `task.attemptNumber` numbers attempts 1-based, and `task.retrying` fires when a retry is decided. A requeue is not an attempt. Fixed with it: a retry's backoff was not enforced under load - any other dispatch started it early, 1 ms after failing where 1000 ms was asked for.

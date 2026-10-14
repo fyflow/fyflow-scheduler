@@ -1,5 +1,14 @@
 # Pause/Resume Implementation Analysis
 
+> **Status: abandoned (2026-10-14). Do not build from this.** It was written
+> against an architecture that no longer exists - `readyQueue`, a `dispatched`
+> state, `pool.workers` and `_processQueue` are gone - and its immediate mode
+> fails tasks outside `_settleTask`, the double-settle and resource-leak class
+> fixed in 2026. Kept only for its list of what a pause has to control. A
+> pause, if it is ever wanted, starts from a new plan built on cancellation
+> (`scheduler.cancel()`): its signal, grace period and forced stop are the hard half of an
+> "interrupt" pause. `TODO_CHECKLIST.md` tracks the rewrite.
+
 This document outlines the implementation strategy for adding pause/resume functionality to the FyFlow scheduler without persistence.
 
 ## Complexity Assessment: **Low to Medium**

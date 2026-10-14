@@ -544,6 +544,9 @@ test.describe('FyFlow Web Worker Performance', () => {
         await Promise.all(workerPromises);
         const workerDuration = performance.now() - workerStart;
 
+        await inlineScheduler.shutdown();
+        await workerScheduler.shutdown();
+
         return {
           success: true,
           inlineDuration,
@@ -562,8 +565,13 @@ test.describe('FyFlow Web Worker Performance', () => {
     expect(result.workerCompleted).toBe(true);
     expect(result.inlineDuration).toBeGreaterThan(0);
     expect(result.workerDuration).toBeGreaterThan(0);
-    // Web Workers typically have some overhead for small tasks
-    expect(result.overhead).toBeGreaterThanOrEqual(0);
+    // Reported, not bounded. Which run is slower depends on thread startup
+    // against machine load, so `overhead >= 0` was a race that failed once in
+    // a full three-engine run and passed on rerun.
+    test.info().annotations.push({
+      type: 'Web Worker overhead',
+      description: `${result.overhead.toFixed(1)} ms (inline ${result.inlineDuration.toFixed(1)} ms, worker ${result.workerDuration.toFixed(1)} ms)`
+    });
   });
 
   test('should handle high concurrency Web Worker tasks', async ({ page }) => {
