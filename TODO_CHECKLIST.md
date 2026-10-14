@@ -413,14 +413,24 @@ runs each), medians: 50K inline 13,871 -> 82,115 tasks/sec (5.9x); 100K inline
 across 10K-100K. Threaded scenarios -3% to +2%, within their spread. 1K is
 bimodal (~1150 or ~1300 per run) as in every comparison so far; this time all
 six fix runs landed low (-10.8%), the previous comparison's landed high, and
-that scenario never queues enough to reach the changed code.
+that scenario never queues enough to reach the changed code. Confirmed by the
+Benchmark workflow on ubuntu-latest (run 38482928731, `quick`, 3 runs, against
+`c36312a`): 50K +323%, 100K +695%, 10K +4.5%, 1K +0.4%, threaded within ±0.1%.
+
+The gain is not skipped work. At 50K and 100K, on this commit and its base
+alike, every task ran and settled exactly once, none failed, and concurrency
+counted inside the worker never passed the pool's 160 slots or a group's limit.
 
 Tests: FIFO order against a plain-array model over 20,000 seeded operations,
 with and without membership tracking; draining 100,000 items and building a
 100,000-item blocked queue, each bounded at 500 ms (they take tens of ms).
-Mutation checks: an array-copying `shift()` takes 3.1 s to drain; untracked
-membership takes 42.7 s to block; a reversed `unshift` breaks the order test.
-`jsr:smoke` fails without the allowlist line.
+"Limits Hold Past Queue Compaction" runs 3,000 tasks through a real scheduler,
+pool-only and under a group, so both queues cross the compaction threshold under
+a live limit, counting concurrency inside the worker. Mutation checks: an
+array-copying `shift()` takes 3.1 s to drain; untracked membership takes 42.7 s
+to block; a reversed `unshift` breaks the order test; ignoring the group limit,
+ignoring the pool's slot cap, and a compaction that drops or duplicates an item
+each fail the scale test. `jsr:smoke` fails without the allowlist line.
 
 **Status**: 🟢 Completed - Deno and Node 22 146/146, browser 75/75, `jsr:smoke`
 
@@ -433,6 +443,35 @@ lost entirely, leaving tasks counted as running until the wait gives up. Fix:
 remove listeners after the drain. Dispatching during the drain is intended, not
 part of the bug: `AGENTS.md` §7 promises that shutdown drains outstanding work so
 a workflow that can still finish does.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 Counting `task.running` minus `task.completed` overshoots real concurrency
+A task frees its slots before `task.completed` is emitted, and the freed slot
+can be refilled first. `_settleTask` releases resources before emitting, the
+release retries blocked tasks, and that can dispatch the next task, so its
+`task.running` arrives first. Inline wrappers also free their slot when `run()`
+returns, before the scheduler settles. Measured at 50K tasks on a 160-slot pool:
+the event count peaked at 319, the count inside `run()` at 160. Under a group
+limit of 7 the overshoot is 1. No limit is broken - releasing before emitting is
+the "transitions complete before events" rule - but a consumer gauging
+concurrency from events sees false overshoots. Several docs tests count this way
+and only pass because they run few tasks. Proposed: document it in `AGENTS.md`
+next to the events, pointing at `group.running` and `scheduler.stats.running`
+instead, with a docs test; change the docs tests that count from events.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 One release moves a whole blocked queue back to the ready queue
+`_retryBlockedTasksForGroup` loops `while (blockedTasks.length > 0 &&
+group.canRun(key))`, but nothing is acquired until dispatch, so `canRun()` stays
+true and the first release moves every waiter back - 2,997 tasks for one free
+slot. The dispatch loop then blocks one of them again and stops. No task is
+lost or reordered, but the blocked queue stops describing who is waiting
+(`getAdmissionQueue()` and `resource.blocked`/`unblocked` with it), and it may be
+why a group-limited run is so much slower: 50K tasks at ~1,900 tasks/s under a
+limit-7 group, against ~114,000 pool-only. Not yet investigated; the throughput
+link is unconfirmed.
 
 **Status**: 🔵 Not Started
 

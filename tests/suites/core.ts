@@ -129,6 +129,7 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('periodicRetryIntervalMs Is Honoured', () => this.testPeriodicRetryInterval()));
     this.results.push(await this.runTest('TaskQueue Keeps FIFO Order', () => this.testTaskQueueOrder()));
     this.results.push(await this.runTest('TaskQueue Stays Linear At Scale', () => this.testTaskQueueScales()));
+    this.results.push(await this.runTest('Limits Hold Past Queue Compaction', () => this.testLimitsHoldAtScale()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -723,6 +724,74 @@ class CrossPlatformTestSuite {
     // take seconds
     if (drainMs > 500) throw new Error(`Draining ${N} items took ${drainMs.toFixed(0)}ms`);
     if (blockMs > 500) throw new Error(`Building a ${N}-item blocked queue took ${blockMs.toFixed(0)}ms`);
+  }
+
+  // The scheduler-level counterpart of the two tests above. The other limit
+  // tests use a handful of tasks, so the ready and blocked queues never pass
+  // TaskQueue's compaction threshold (1,024 shifted) under a real limit. This
+  // runs enough tasks to cross it in both, once with only the pool capacity
+  // binding and once with a group tighter than the pool. Concurrency is counted
+  // inside the worker: event counts overshoot.
+  private async testLimitsHoldAtScale(): Promise<void> {
+    const N = 3000;
+    const counter = ((globalThis as any).__fyflowConcurrency ??= { now: 0, peak: 0 });
+
+    const runAtScale = async (label: string, limit: number, group?: ConcurrentLimitGroup) => {
+      const pool = new WorkerManager(this.testInlineWorkerUrl, {
+        maxThreads: 2, maxConcurrentTasks: 4, inline: true, idleTimeout: 0,
+        ...(group ? { groups: ['g'] } : {})
+      });
+      const scheduler = new FyflowScheduler({ TestInlineWorker: pool }, group ? { g: group } : {});
+
+      // Warm both instances first, so the pool's capacity is all there
+      await Promise.all(scheduler.addTasks(Array.from({ length: 2 }, (_, i) => new FyflowTask({
+        id: `${label}-warm-${i}`, workerType: 'TestInlineWorker', payload: { delay: 1 }
+      })), { createPromise: true }) as Promise<any>[]);
+
+      counter.now = 0;
+      counter.peak = 0;
+      const tasks = Array.from({ length: N }, (_, i) => new FyflowTask({
+        id: `${label}-${i}`, workerType: 'TestInlineWorker',
+        payload: { taskId: i, countConcurrency: true }
+      }));
+      // One addTask() each, as an application streaming work in would: each
+      // runs the dispatch loop, which moves one more task into the blocked
+      // queue. A single addTasks() batch never builds it up. Sampled straight
+      // after, before anything settles: the first release moves the whole
+      // blocked queue back to the ready queue.
+      const promises = tasks.map(t => scheduler.addTask(t, { createPromise: true }) as Promise<any>);
+      const peakBlocked = scheduler.getAdmissionQueue('g').g?.length ?? 0;
+
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      const results = await Promise.race([
+        Promise.allSettled(promises),
+        new Promise<never>((_, reject) => stallTimer = setTimeout(
+          () => reject(new Error(`${label}: stalled at ${scheduler.stats.done - 2}/${N} done`)), 15_000))
+      ]).finally(() => clearTimeout(stallTimer));
+
+      const rejected = results.filter(r => r.status === 'rejected').length;
+      const values = new Set(results.map(r => r.status === 'fulfilled' ? r.value?.taskId : undefined));
+      const done = scheduler.stats.done;
+      await scheduler.shutdown();
+
+      if (rejected > 0) throw new Error(`${label}: ${rejected} tasks rejected`);
+      if (values.size !== N) throw new Error(`${label}: ${values.size} distinct results for ${N} tasks`);
+      if (done !== N + 2) {
+        throw new Error(`${label}: stats.done is ${done}, expected ${N + 2}`);
+      }
+      if (counter.peak > limit) {
+        throw new Error(`${label}: ${counter.peak} tasks ran at once against a limit of ${limit}`);
+      }
+      // Not vacuous: the limit was actually reached, and the blocked queue
+      // passed the compaction threshold
+      if (counter.peak < limit) throw new Error(`${label}: peaked at ${counter.peak}, never reached ${limit}`);
+      if (group && peakBlocked <= 1024) {
+        throw new Error(`${label}: the blocked queue only reached ${peakBlocked}`);
+      }
+    };
+
+    await runAtScale('pool-only', 8);
+    await runAtScale('group', 3, new ConcurrentLimitGroup(3));
   }
 
   private async testPeriodicRetryInterval(): Promise<void> {
