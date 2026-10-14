@@ -41,8 +41,24 @@ export class FyflowTask {
     payload: any;
     optional: boolean;
     retryPolicy?: {maxRetries:number, backoffMs:number};
-    /** Retry attempts used so far, counted against `retryPolicy.maxRetries`. */
+    /**
+     * Retries used so far, counted against `retryPolicy.maxRetries`. Starts at
+     * `attemptsSpent`, so it is 0 on a task's first attempt unless one was given.
+     */
     attempts = 0;
+    /**
+     * Attempts made before this task was added - for example before a process
+     * restart. Only reduces the retries left: a task whose budget is already
+     * spent still runs once.
+     */
+    readonly attemptsSpent: number;
+    /**
+     * 1-based number of the current attempt, or of the most recent one once the
+     * task has settled; 0 before its first dispatch. Always `attempts + 1` at
+     * dispatch. A requeue after a worker dies is not an attempt, so the re-run
+     * repeats the same number.
+     */
+    attemptNumber = 0;
     /**
      * `pending` -> `running` -> `done` | `failed`.
      *
@@ -51,7 +67,12 @@ export class FyflowTask {
      */
     state: string = "pending";
     result?: any;
-    error?: string; // Error message if task failed
+    /**
+     * Error message of the most recent failed attempt. Set on every failure,
+     * including one that will be retried, and cleared when the next attempt is
+     * dispatched - so a task that succeeds on a retry ends with none.
+     */
+    error?: string;
     resolve?: Function;
     reject?: Function;
     workerGroups?: string[];
@@ -112,6 +133,11 @@ export class FyflowTask {
      * @param config.optional Default `false`. An optional task that fails
      *   resolves `null` instead of rejecting.
      * @param config.retryPolicy `{ maxRetries, backoffMs }`. Omitted means no retries.
+     * @param config.attemptsSpent Default `0`. Attempts already made, so a task
+     *   re-added after a restart continues its retry budget instead of starting
+     *   a fresh one.
+     * @throws TypeError if `attemptsSpent` is not a number, RangeError if it is
+     *   negative, fractional, `NaN` or infinite.
      * @param config.workerGroups Resource groups for this task, *in addition* to
      *   the groups its WorkerManager declares.
      * @param config.handleRejection Default `true`. Attaches a silent catch so a
@@ -121,7 +147,15 @@ export class FyflowTask {
      *   or tenant this task belongs to. Required when the task belongs to a
      *   keyed group that has no custom `keyFrom`.
      */
-    constructor({id, workerType, payload, optional = false, retryPolicy, workerGroups = [], handleRejection = true, limitKey}: any) {
+    constructor({id, workerType, payload, optional = false, retryPolicy, attemptsSpent = 0, workerGroups = [], handleRejection = true, limitKey}: any) {
+      if (typeof attemptsSpent !== 'number') {
+        throw new TypeError(`attemptsSpent must be a number, got ${typeof attemptsSpent}`);
+      }
+      if (!Number.isInteger(attemptsSpent) || attemptsSpent < 0) {
+        throw new RangeError(`attemptsSpent must be a non-negative integer, got ${attemptsSpent}`);
+      }
+      this.attemptsSpent = attemptsSpent;
+      this.attempts = attemptsSpent;
       this.id = id;
       this.limitKey = limitKey;
       this.workerType = workerType;
@@ -213,9 +247,9 @@ export class FyflowTask {
    * await scheduler.shutdown();           // always shut down when finished
    * ```
    *
-   * Emits: `task.running`, `task.completed`, `task.failed`, `task.progress`,
-   * `task.user_action`, `task.spawn_request`, `task.spawn_failed` and
-   * `scheduler.completed`.
+   * Emits: `task.running`, `task.retrying`, `task.completed`, `task.failed`,
+   * `task.progress`, `task.user_action`, `task.spawn_request`,
+   * `task.spawn_failed` and `scheduler.completed`.
    */
   export class FyflowScheduler extends EventTarget {
     tasks: Map<string, FyflowTask> = new Map<string, FyflowTask>();
@@ -228,6 +262,13 @@ export class FyflowTask {
     groups: Record<string, any>;
     stats = {queued:0, running:0, done:0, failed:0};
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
+    /**
+     * Tasks sitting out a retry backoff, by id. Held outside every queue, so no
+     * dispatch can start them early - they used to wait in the ready queue,
+     * where any dispatch did. Still counted in `stats.queued`, so the scheduler
+     * cannot report itself drained while a retry is pending.
+     */
+    private retryWaiting = new Map<string, { task: FyflowTask; timer?: ReturnType<typeof setTimeout> }>();
     // Active onCompleteDescendants() waits, keyed by tracker id so one task can be
     // awaited more than once. Empty unless onCompleteDescendants() is used.
     private descendantTrackers = new Map<number, DescendantTracker>();
@@ -757,6 +798,10 @@ export class FyflowTask {
       // A fresh attempt may be settled again
       task._settling = false;
       const token = ++task._dispatchToken;
+      // A requeue repeats the number, because it leaves `attempts` alone
+      task.attemptNumber = task.attempts + 1;
+      // The previous attempt's failure is not this one's
+      task.error = undefined;
 
       // Update state and stats synchronously
       task.state = 'running';
@@ -918,6 +963,8 @@ export class FyflowTask {
 
       const error = outcome.error;
 
+      task.error = error instanceof Error ? error.message : String(error ?? 'Task failed');
+
       // Retry, if the policy still allows it
       if (task.attempts < (task.retryPolicy?.maxRetries || 0)) {
         task.attempts++;
@@ -929,16 +976,33 @@ export class FyflowTask {
         this.stats.running = Math.max(0, this.stats.running - 1);
         this.stats.queued++;
 
-        const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-        if (workerQueue) workerQueue.push(task);
+        // Waits out its backoff outside the ready queue. It used to go straight
+        // back on it, with only an extra dispatch pass scheduled after the
+        // backoff - so under load any other dispatch started it early, 1 ms
+        // after failing where 1000 ms was asked for.
+        // In the map before the event, so a listener sees where it is.
+        const waiting: { task: FyflowTask; timer?: ReturnType<typeof setTimeout> } = { task };
+        this.retryWaiting.set(task.id, waiting);
+        task.timestamp = Date.now();
+        this.dispatchEvent(new CustomEvent('task.retrying', { detail: task }));
 
-        setTimeout(() => this._dispatchLoop(), task.retryPolicy?.backoffMs || 0);
+        // Armed after the event: the backoff counts from its timestamp
+        if (this.retryWaiting.get(task.id) === waiting) {
+          waiting.timer = setTimeout(() => {
+            if (this.retryWaiting.get(task.id) !== waiting) return;
+            this.retryWaiting.delete(task.id);
+            this.readyQueuesByWorker.get(task.workerType)?.push(task);
+            this._dispatchLoop();
+          }, task.retryPolicy?.backoffMs || 0);
+        }
+
+        // The failed attempt's slot is free now, for someone else
+        this._dispatchLoop();
         return;
       }
 
       // Terminal. stats.failed counts tasks that failed, mirroring stats.done -
       // not attempts, which is why a task with retries counts once.
-      task.error = error instanceof Error ? error.message : String(error ?? 'Task failed');
       task.endTime = Date.now();
       this.stats.running = Math.max(0, this.stats.running - 1);
       this.stats.failed++;
@@ -1841,8 +1905,13 @@ export class FyflowTask {
       }
 
       // 2. Stop retrying, and stop listening to the pools before they are torn
-      // down - otherwise the process stays alive
+      // down - otherwise the process stays alive. A backoff that ended during
+      // the drain has dispatched its retry like any other work; one still
+      // running is discarded with the queues, so it cannot fire into a pool
+      // that no longer exists.
       this._clearPeriodicRetry();
+      for (const { timer } of this.retryWaiting.values()) clearTimeout(timer);
+      this.retryWaiting.clear();
       this._removeAllListeners();
 
       // 3. Clear all queues

@@ -124,6 +124,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Progress Reporting', () => this.docProgress()));
     this.results.push(await this.runTest('Doc: Spawning And Descendants', () => this.docSpawning()));
     this.results.push(await this.runTest('Doc: Retry Policy', () => this.docRetry()));
+    this.results.push(await this.runTest('Doc: Resuming Keeps The Retry Budget', () => this.docResumeRetryBudget()));
     this.results.push(await this.runTest('Doc: Optional Tasks', () => this.docOptionalTask()));
     this.results.push(await this.runTest('Doc: Task Failure Handling', () => this.docFailure()));
     this.results.push(await this.runTest('Doc: Worker Status Inspection', () => this.docWorkerStatus()));
@@ -404,6 +405,62 @@ class DocsTestSuite {
 
     if (!rejected) throw new Error('Expected the task to reject after exhausting retries');
     if (task.attempts !== 2) throw new Error(`Expected 2 retry attempts, got ${task.attempts}`);
+  }
+
+  // RECIPE: AGENTS.md section 10 - resuming after a restart. The "restart" is a
+  // second scheduler; the first run is cut short after its first attempt.
+  private async docResumeRetryBudget(): Promise<void> {
+    const store = new Map<string, number>();
+    const record = (scheduler: FyflowScheduler) => {
+      scheduler.addEventListener('task.running', (e: any) => {
+        store.set(e.detail.id, Math.max(store.get(e.detail.id) ?? 0, e.detail.attemptNumber));
+      });
+    };
+    const id = 'doc-resume', payload = { id: 'doc-resume', fail: true };
+
+    // Before the restart: the first attempt fails, and the process dies during
+    // its backoff
+    const before = this.makeScheduler();
+    record(before);
+    const retrying: number[] = [];
+    before.addEventListener('task.retrying', (e: any) => retrying.push(e.detail.attemptNumber));
+    before.addTask(new FyflowTask({
+      id, workerType: 'DocsWorker', payload, retryPolicy: { maxRetries: 2, backoffMs: 1000 }
+    }));
+    const deadline = Date.now() + 2000;
+    while (retrying.length === 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 5));
+    await before.shutdown();
+    if (store.get(id) !== 1 || retrying.join() !== '1') {
+      throw new Error(`Before the restart: stored ${store.get(id)}, task.retrying for ${retrying.join() || 'none'}`);
+    }
+
+    // After the restart, as published
+    const after = this.makeScheduler();
+    record(after);
+    const numbers: number[] = [];
+    after.addEventListener('task.running', (e: any) => numbers.push(e.detail.attemptNumber));
+    const task = new FyflowTask({
+      id, workerType: 'DocsWorker', payload,
+      retryPolicy: { maxRetries: 2, backoffMs: 10 },
+      attemptsSpent: store.get(id) ?? 0
+    });
+    const outcome = await (after.addTask(task, { createPromise: true }) as Promise<any>).then(() => 'resolved', () => 'rejected');
+
+    // The table row maxRetries 2, attemptsSpent 1: two attempts, numbered 2 and 3
+    if (numbers.join() !== '2,3') throw new Error(`Resumed attempts were numbered ${numbers.join()}, expected 2,3`);
+    if (outcome !== 'rejected' || task.attempts !== 2 || store.get(id) !== 3) {
+      throw new Error(`Expected the budget to end at attempt 3: ${outcome}, attempts ${task.attempts}, stored ${store.get(id)}`);
+    }
+
+    // A spent budget still runs once
+    const spent = new FyflowTask({
+      id: 'doc-resume-spent', workerType: 'DocsWorker', payload,
+      retryPolicy: { maxRetries: 2, backoffMs: 10 }, attemptsSpent: 3
+    });
+    await (after.addTask(spent, { createPromise: true }) as Promise<any>).catch(() => {});
+    if (spent.attemptNumber !== 4 || spent.attempts !== 3) {
+      throw new Error(`A spent budget: attempt ${spent.attemptNumber}, attempts ${spent.attempts}`);
+    }
   }
 
   private async docOptionalTask(): Promise<void> {

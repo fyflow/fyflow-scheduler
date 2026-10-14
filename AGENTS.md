@@ -287,13 +287,30 @@ worker wrappers the pool manages for you - you should not construct them.
 | `workerType` | `string` | — | Key into `workerPools` |
 | `payload` | `any` | — | Passed verbatim to `run()` |
 | `optional` | `boolean` | `false` | If it fails, resolves `null` instead of rejecting |
-| `retryPolicy` | `{ maxRetries, backoffMs }` | none | |
+| `retryPolicy` | `{ maxRetries, backoffMs }` | none | A retry starts no earlier than `backoffMs` after the attempt failed, however busy the scheduler is |
+| `attemptsSpent` | `number` | `0` | Attempts already made, e.g. before a restart. Reduces the retries left; a task whose budget is already spent **still runs once**. `TypeError` if not a number, `RangeError` if negative, fractional, `NaN` or infinite |
 | `workerGroups` | `string[]` | `[]` | **Added to** the pool's groups, not a replacement |
 | `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` with no custom `keyFrom` |
 | `handleRejection` | `boolean` | `true` | Silences unhandled rejections for fire-and-forget |
 
-Readable after the run: `state`, `result`, `error`, `attempts`, `startTime`,
-`endTime`, `executionTime` (worker-measured ms, excludes queue wait).
+Readable after the run: `state`, `result`, `error`, `attempts`, `attemptNumber`,
+`startTime`, `endTime`, `executionTime` (worker-measured ms, excludes queue wait).
+
+| Field | Meaning |
+|---|---|
+| `attempts` | Retries used, counted against `maxRetries`. Starts at `attemptsSpent`, so 0 on a first attempt unless one was given |
+| `attemptNumber` | 1-based number of the current attempt, or of the last one once settled; 0 before the first dispatch. Always `attempts + 1` at dispatch |
+| `error` | The most recent failed attempt's message. Set on a failure that will be retried too, cleared when the next attempt starts: a task that succeeds on a retry ends with none |
+
+| `maxRetries` | `attemptsSpent` | Attempts this run | `attemptNumber` values |
+|---:|---:|---:|---|
+| 2 | 0 | up to 3 | 1, 2, 3 |
+| 2 | 1 | up to 2 | 2, 3 |
+| 2 | 3 | 1 | 4 |
+
+A **requeue is not an attempt.** When a worker dies under a task and the pool
+requeues it (§8), the re-run repeats the same `attemptNumber` and `attempts` is
+unchanged.
 
 States: `pending` → `running` → `done` | `failed`. A **non-optional** task that
 fails with no retries left ends in **`user_action`**, not `failed`; an
@@ -525,7 +542,8 @@ Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
 
 | Event | `e.detail` |
 |---|---|
-| `task.running` | the `FyflowTask` |
+| `task.running` | the `FyflowTask` — once per attempt, and again with the same `attemptNumber` after a requeue |
+| `task.retrying` | the task, after an attempt failed and a retry was decided: `state` `'pending'`, `attemptNumber` the attempt that failed, `attempts` already incremented, `error` its message. Never for the last attempt, which ends in `task.failed`. The next attempt starts no earlier than `timestamp + retryPolicy.backoffMs` |
 | `task.completed` | the `FyflowTask` (with `result`, `executionTime`) |
 | `task.failed` | the task, plus `error` |
 | `task.progress` | the task's fields **spread flat** (so the id is `id`, **not** `taskId`), plus `{ workerId, workerType, progress (0–1), message, details, timestamp }` |
@@ -538,13 +556,23 @@ Attach with `addEventListener(name, e => ...)`; payload is in `e.detail`.
 | `resource.blocked` | the same, plus `queuePosition` |
 | `resource.unblocked` | the same, plus `reason` |
 
-Every event above carries a `timestamp` (`Date.now()` at emit). On the four
-`task.*` events that is a field on the task itself — see the live-reference
+Per task, in order: `task.running`, then for each failed attempt that will be
+retried `task.retrying` and, after the backoff, `task.running` again; finally
+`task.completed`, or `task.failed` (plus `task.user_action`).
+
+Every event above carries a `timestamp` (`Date.now()` at emit). On the
+lifecycle events that is a field on the task itself — see the live-reference
 warning immediately below.
 
-> ⚠️ **An event `detail` is a live object, not a snapshot.** For `task.running`,
-> `task.completed`, `task.failed` and `task.user_action`, `detail` **is** the
-> `FyflowTask` — the same object the scheduler keeps mutating. Listeners run
+The rule behind the payload shapes: **a task's lifecycle transitions are the
+task itself; streams of observations — progress, resource state, the stats
+snapshot — are fresh objects.** A transition describes the task; a stream item
+describes a moment, which a consumer keeps, so it has to be a copy.
+
+> ⚠️ **An event `detail` is a live object, not a snapshot.** For every lifecycle
+> event — `task.running`, `task.retrying`, `task.completed`, `task.failed` and
+> `task.user_action` — `detail` **is** the `FyflowTask`, the same object the
+> scheduler keeps mutating. Listeners run
 > synchronously, so reading it inside the listener is correct; keeping it is not:
 >
 > ```javascript
@@ -919,6 +947,35 @@ pool.addEventListener('worker.failed', async (e) => {
   }
 });
 ```
+
+**Resuming after a restart, without resetting the retry budget**
+
+A task re-added under the same id after a process restart starts with a fresh
+budget unless it is told what was spent. Record the highest attempt each task
+reached, and pass it back:
+
+```typescript
+// While running: persist the highest attempt number seen. The max makes a
+// requeue - which repeats its number - harmless.
+scheduler.addEventListener('task.running', (e) => {
+  store.set(e.detail.id, Math.max(store.get(e.detail.id) ?? 0, e.detail.attemptNumber));
+});
+
+// After the restart: the attempt in flight at the kill counts as spent
+const task = new FyflowTask({
+  id, workerType: 'MyWorker', payload,
+  retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+  attemptsSpent: store.get(id) ?? 0
+});
+```
+
+If the stored count already uses up the budget the task still runs once; skip
+adding it if that is not wanted. `task.running` is the right moment to record:
+on a threaded pool it fires when the thread picks the attempt up, so an attempt
+that never started is not counted; on an inline pool it fires just before the
+worker instance exists, which can over-count by that one attempt — the safe
+direction. `task.retrying` fires before the backoff, if you also want the error
+of each failed attempt.
 
 **Long-running scheduler**
 

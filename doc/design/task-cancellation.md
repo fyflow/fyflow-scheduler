@@ -5,8 +5,9 @@
 cancellation would otherwise make common. Delete this file when it ships; move
 the contract to `AGENTS.md` first.
 
-**Depends on** `doc/design/attempt-accounting.md` (the backoff wait, and
-`attemptNumber`) and on three known issues in `TODO_CHECKLIST.md`:
+**Builds on** attempt accounting, now shipped (`attemptNumber`, `task.retrying`,
+and the backoff wait in `retryWaiting`; contract in `AGENTS.md` §5 and §6), and
+on three known issues in `TODO_CHECKLIST.md`:
 
 - "A requeued task can be settled by its abandoned run": the per-dispatch token
   (`task._dispatchToken`) and the wrappers' `forgetTask()`. Cancel wins only if a
@@ -56,7 +57,7 @@ dispatches for failing tasks, and tasks already running still finish.
 | Re-adding a cancelled task object | `addTask` **throws** for an object whose `state` is `'cancelled'`; create a new `FyflowTask` | Its tombstone may still sit in a queue, so re-queueing the same object would either be skipped as a tombstone or revive the stale entry. A deterministic rule beats one that depends on whether the tombstone has been passed yet |
 | Spawns from a cancelled parent | **Refused**: from a task whose cancel was accepted, or that ended `cancelled` | Requested scope only. Spawns from parents that ended any other way keep today's behaviour |
 | `context.signal` | **Created eagerly** with each attempt's context | `new AbortController()` measured at about 28 ns on Deno 2.9.6, about 0.17% at 60,000 tasks/s. A lazy getter would need a "cancelled before first access" record for nothing |
-| Event details | The live task, like every lifecycle transition | The rule set out in `doc/design/attempt-accounting.md` |
+| Event details | The live task, like every lifecycle transition | The rule stated in `AGENTS.md` §6 |
 | Deferred | `descendants: true`, and groundwork for pause | Neither was requested; see "Deferred" |
 
 ## Where a task can be when cancel arrives

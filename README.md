@@ -292,6 +292,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `optional`: Mark task as optional (failures don't block workflow)
 - `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup`)
 - `retryPolicy`: `{ maxRetries, backoffMs }`
+- `attemptsSpent`: Attempts already made, so a task re-added after a restart
+  keeps its retry budget
 - `onCompletePromise()`: Promise for this task alone
 - `onCompleteDescendants()`: Promise for this task plus everything it spawns
 

@@ -4,7 +4,7 @@
 workers). Tracked in `TODO_CHECKLIST.md`. Delete this file when it ships; move
 the contract to `AGENTS.md` first.
 
-**Depends on** `doc/design/attempt-accounting.md` (`attemptNumber`) and on the
+**Builds on** `task.attemptNumber`, now shipped (`AGENTS.md` §5), and on the
 known issue "A requeued task can be settled by its abandoned run" (the
 per-dispatch token and wrappers forgetting requeued tasks), without which a
 requeue produces two interleaved streams for one attempt.
@@ -146,8 +146,8 @@ Not `task.message.log`, `task.message.metrics`, and so on, because:
 
 Both details are **fresh objects per event**, like `resource.*`, not the live
 task. Messages are a stream a consumer keeps, such as an appended log, which is
-the rule `doc/design/attempt-accounting.md` sets out: lifecycle transitions are
-the task, streams are fresh objects.
+the rule `AGENTS.md` §6 states: lifecycle transitions are the task, streams are
+fresh objects.
 
 ## Delivery guarantees
 
@@ -220,7 +220,7 @@ with no running check. Deliberately left unchanged here.
 
 ### What `attemptNumber` is
 
-`task.attemptNumber` as defined in `doc/design/attempt-accounting.md`: 1-based,
+`task.attemptNumber` as defined in `AGENTS.md` §5: 1-based,
 set at dispatch, counting attempts spent before a Resume, and repeated by a
 requeue. The scheduler copies it at re-emit, which is safe because of guarantee
 2: every event of an attempt arrives before that attempt settles, and

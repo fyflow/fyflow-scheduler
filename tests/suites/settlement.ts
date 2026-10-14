@@ -85,6 +85,14 @@ class SettlementTestSuite {
     this.results.push(await this.runTest('Retries Do Not Signal user_action Early', () => this.testRetriesNoEarlyUserAction()));
     this.results.push(await this.runTest('Retries Count One Failure', () => this.testRetriesCountOnce()));
     this.results.push(await this.runTest('Retry Then Success Counts As Done', () => this.testRetryThenSuccess()));
+    this.results.push(await this.runTest('attemptsSpent Continues The Budget', () => this.testAttemptsSpentContinuesTheBudget()));
+    this.results.push(await this.runTest('A Spent Budget Runs Once', () => this.testSpentBudgetRunsOnce()));
+    this.results.push(await this.runTest('attemptsSpent Is Validated', () => this.testAttemptsSpentValidated()));
+    this.results.push(await this.runTest('task.retrying Fires Once Per Retry', () => this.testRetryingEvent()));
+    this.results.push(await this.runTest('A Retry That Succeeds Clears error', () => this.testRetrySuccessClearsError()));
+    this.results.push(await this.runTest('Backoff Holds Under Load', () => this.testBackoffHoldsUnderLoad()));
+    this.results.push(await this.runTest('No scheduler.completed During A Backoff', () => this.testNoCompletionDuringBackoff()));
+    this.results.push(await this.runTest('Shutdown During A Backoff', () => this.testShutdownDuringBackoff()));
     this.results.push(await this.runTest('Success Settles Exactly Once', () => this.testSuccessOnce()));
     this.results.push(await this.runTest('Resources Released On Ordinary Failure', () => this.testResourcesReleasedOnFailure()));
     this.results.push(await this.runTest('Resources Released When Worker Dies', () => this.testResourcesReleasedOnWorkerDeath()));
@@ -285,6 +293,219 @@ class SettlementTestSuite {
     if (scheduler.stats.failed !== 0) {
       throw new Error(`A task that eventually succeeded must not count as failed, got ${scheduler.stats.failed}`);
     }
+  }
+
+  // --- attempt accounting ----------------------------------------------------
+
+  /** Every scheduler task event for one task id, in order, as `event:attemptNumber`. */
+  private attemptLog(scheduler: FyflowScheduler, id: string) {
+    const log: string[] = [];
+    for (const ev of ['task.running', 'task.retrying', 'task.completed', 'task.failed']) {
+      scheduler.addEventListener(ev, (e: any) => {
+        if (e.detail.id === id) log.push(`${ev.slice(5)}:${e.detail.attemptNumber}`);
+      });
+    }
+    return log;
+  }
+
+  private async testAttemptsSpentContinuesTheBudget(): Promise<void> {
+    const { scheduler } = this.crashingScheduler();
+    const log = this.attemptLog(scheduler, 'resumed');
+    const task = this.failing('resumed', { retryPolicy: { maxRetries: 2, backoffMs: 5 }, attemptsSpent: 1 });
+    const before = { attempts: task.attempts, attemptNumber: task.attemptNumber };
+    if (before.attempts !== 1 || before.attemptNumber !== 0) {
+      throw new Error(`Before dispatch: ${JSON.stringify(before)}`);
+    }
+
+    if (await this.settle(scheduler.addTask(task, { createPromise: true })) !== 'rejected') {
+      throw new Error('Expected the task to reject once its budget was spent');
+    }
+    const expected = 'running:2,retrying:2,running:3,failed:3';
+    if (log.join(',') !== expected) throw new Error(`Expected ${expected}, got ${log.join(',')}`);
+    if (task.attempts !== 2) throw new Error(`Expected attempts 2, got ${task.attempts}`);
+  }
+
+  private async testSpentBudgetRunsOnce(): Promise<void> {
+    for (const optional of [false, true]) {
+      const { scheduler } = this.crashingScheduler();
+      const log = this.attemptLog(scheduler, 'spent');
+      const task = this.failing('spent', { retryPolicy: { maxRetries: 2, backoffMs: 5 }, attemptsSpent: 3, optional });
+      await this.settle(scheduler.addTask(task, { createPromise: true }));
+
+      if (log.join(',') !== 'running:4,failed:4') {
+        throw new Error(`optional ${optional}: expected one attempt numbered 4, got ${log.join(',')}`);
+      }
+      const state = optional ? 'failed' : 'user_action';
+      if (task.state !== state) throw new Error(`optional ${optional}: ended ${task.state}, expected ${state}`);
+    }
+  }
+
+  private async testAttemptsSpentValidated(): Promise<void> {
+    const make = (attemptsSpent: unknown) => () =>
+      new FyflowTask({ id: 'v', workerType: 'CrashingWorker', payload: {}, attemptsSpent });
+    const throwsWith = (fn: () => unknown, type: Function) => {
+      try { fn(); } catch (error) { return error instanceof type; }
+      return false;
+    };
+    for (const bad of ['1', null, {}]) {
+      if (!throwsWith(make(bad), TypeError)) throw new Error(`attemptsSpent ${JSON.stringify(bad)} did not throw TypeError`);
+    }
+    for (const bad of [-1, 1.5, NaN, Infinity]) {
+      if (!throwsWith(make(bad), RangeError)) throw new Error(`attemptsSpent ${bad} did not throw RangeError`);
+    }
+    if (make(undefined)().attempts !== 0 || make(2)().attempts !== 2) {
+      throw new Error('A valid attemptsSpent was not applied');
+    }
+  }
+
+  // task.retrying is a lifecycle transition, so its detail is the live task,
+  // read inside the listener.
+  private async testRetryingEvent(): Promise<void> {
+    const { scheduler } = this.crashingScheduler();
+    const counts = this.counted(scheduler);
+    const log = this.attemptLog(scheduler, 'retried');
+    const seen: string[] = [];
+    scheduler.addEventListener('task.retrying', (e: any) => {
+      const t = e.detail;
+      seen.push(`${t.state}/${t.attemptNumber}/${t.attempts}/${t.error}/${typeof t.timestamp}`);
+    });
+
+    const task = this.failing('retried', { retryPolicy: { maxRetries: 2, backoffMs: 5 } });
+    await this.settle(scheduler.addTask(task, { createPromise: true }));
+
+    const expected = 'running:1,retrying:1,running:2,retrying:2,running:3,failed:3';
+    if (log.join(',') !== expected) throw new Error(`Expected ${expected}, got ${log.join(',')}`);
+    const error = 'Intentional crash during task execution';
+    const expectedSeen = [`pending/1/1/${error}/number`, `pending/2/2/${error}/number`];
+    if (JSON.stringify(seen) !== JSON.stringify(expectedSeen)) {
+      throw new Error(`task.retrying details: ${JSON.stringify(seen)}`);
+    }
+    if (counts['task.failed'] !== 1) throw new Error(`Expected one task.failed, got ${counts['task.failed']}`);
+  }
+
+  private async testRetrySuccessClearsError(): Promise<void> {
+    const { scheduler } = this.crashingScheduler();
+    scheduler.addEventListener('task.retrying', (e: any) => { e.detail.payload.action = 'normal-task'; });
+    const task = this.failing('recovers', { retryPolicy: { maxRetries: 1, backoffMs: 5 } });
+    const outcome = await this.settle(scheduler.addTask(task, { createPromise: true }));
+
+    if (!outcome.startsWith('resolved')) throw new Error(`Expected success on the retry, got ${outcome}`);
+    if (task.state !== 'done' || task.attemptNumber !== 2) {
+      throw new Error(`Expected done on attempt 2, got ${task.state} on ${task.attemptNumber}`);
+    }
+    if (task.error !== undefined) throw new Error(`A task that succeeded still carries error "${task.error}"`);
+  }
+
+  // The retry used to wait in the ready queue, so any dispatch started it
+  // early: 1 ms after failing where 1000 ms was asked for. An idle scheduler
+  // passes either way, which is why this runs under load.
+  private async testBackoffHoldsUnderLoad(): Promise<void> {
+    const BACKOFF = 150;
+    const crashing = new WorkerManager(this.crashWorkerUrl, { maxThreads: 1, maxConcurrentTasks: 1, inline: true });
+    const load = new WorkerManager(this.requeueWorkerUrl, { maxThreads: 1, maxConcurrentTasks: 5, inline: true });
+    const scheduler = this.track(new FyflowScheduler({ CrashingWorker: crashing, Load: load }));
+
+    const TOTAL = 301;
+    const starts: number[] = [];
+    let loadStarts = 0, loadStartsAtLastAttempt = 0, overCounted = 0;
+    scheduler.addEventListener('task.running', (e: any) => {
+      if (e.detail.id !== 'backoff') { loadStarts++; return; }
+      starts.push(performance.now());
+      loadStartsAtLastAttempt = loadStarts;
+    });
+    // Stats count tasks, not attempts, through every backoff
+    scheduler.addEventListener('task.retrying', () => {
+      const s = scheduler.stats;
+      if (s.queued + s.running + s.done + s.failed > TOTAL) overCounted++;
+    });
+
+    const promise = scheduler.addTask(
+      this.failing('backoff', { retryPolicy: { maxRetries: 2, backoffMs: BACKOFF } }),
+      { createPromise: true }
+    );
+    scheduler.addTasks(Array.from({ length: TOTAL - 1 }, (_, i) => new FyflowTask({
+      id: `load-${i}`, workerType: 'Load', payload: { ms: 10 }
+    })));
+    await this.settle(promise, 5000);
+
+    if (starts.length !== 3) throw new Error(`Expected 3 attempts, got ${starts.length}`);
+    // Not vacuous: the load was still being dispatched when the last attempt
+    // started, so dispatches kept happening throughout both backoffs
+    if (loadStartsAtLastAttempt >= TOTAL - 1) {
+      throw new Error('Precondition: the load had finished before the last attempt');
+    }
+    const gaps = [starts[1] - starts[0], starts[2] - starts[1]].map(g => Math.round(g));
+    // 1 ms of timer slop
+    if (gaps.some(gap => gap < BACKOFF - 1)) {
+      throw new Error(`Retries started ${gaps.join(' and ')} ms apart under load, backoff is ${BACKOFF} ms`);
+    }
+    if (overCounted > 0) throw new Error(`Stats summed past the task count ${overCounted} time(s)`);
+  }
+
+  private async testNoCompletionDuringBackoff(): Promise<void> {
+    const { scheduler } = this.crashingScheduler();
+    const completedAt: number[] = [];
+    scheduler.addEventListener('scheduler.completed', () => completedAt.push(performance.now()));
+
+    // A success first, so the scheduler has something to report
+    await this.settle(scheduler.addTask(new FyflowTask({
+      id: 'ok-first', workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+    }), { createPromise: true }));
+    completedAt.length = 0;
+
+    // The second task runs once the first has failed, and settles inside its
+    // backoff - a settle is what makes the scheduler check whether it drained
+    const task = this.failing('slow-retry', { retryPolicy: { maxRetries: 1, backoffMs: 200 } });
+    const promise = scheduler.addTask(task, { createPromise: true });
+    let duringBackoff = false;
+    scheduler.addTask(new FyflowTask({
+      id: 'settles-in-backoff', workerType: 'CrashingWorker', payload: { action: 'normal-task' }
+    }));
+    scheduler.addEventListener('task.completed', (e: any) => {
+      if (e.detail.id === 'settles-in-backoff') duringBackoff = task.state === 'pending' && task.attempts === 1;
+    });
+    await this.settle(promise);
+    if (!duringBackoff) throw new Error('Precondition: nothing settled during the backoff');
+    const failedAt = performance.now();
+
+    if (completedAt.some(at => at < failedAt - 5)) {
+      throw new Error('scheduler.completed fired while a retry was waiting out its backoff');
+    }
+    if (completedAt.length !== 1) throw new Error(`Expected one scheduler.completed, got ${completedAt.length}`);
+  }
+
+  // Draining dispatches: a backoff that ends during shutdown's drain runs its
+  // retry. One that outlasts the drain is discarded with the queues and must
+  // not fire into a pool that has been shut down.
+  private async testShutdownDuringBackoff(): Promise<void> {
+    const crashing = new WorkerManager(this.crashWorkerUrl, { maxThreads: 1, maxConcurrentTasks: 2, inline: true });
+    const load = new WorkerManager(this.requeueWorkerUrl, { maxThreads: 1, maxConcurrentTasks: 1, inline: true });
+    const scheduler = this.track(new FyflowScheduler({ CrashingWorker: crashing, Load: load }));
+
+    const short = this.failing('short-backoff', { retryPolicy: { maxRetries: 1, backoffMs: 100 } });
+    const long = this.failing('long-backoff', { retryPolicy: { maxRetries: 1, backoffMs: 700 } });
+    scheduler.addTask(new FyflowTask({ id: 'keeps-draining', workerType: 'Load', payload: { ms: 400 } }));
+    scheduler.addTask(short);
+    scheduler.addTask(long);
+
+    const started = performance.now();
+    while (!(short.attempts === 1 && long.attempts === 1) && performance.now() - started < 2000) {
+      await new Promise(r => setTimeout(r, 5));
+    }
+    if (long.attempts !== 1) throw new Error('Precondition: the tasks never failed their first attempt');
+
+    await Promise.race([
+      scheduler.shutdown(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown() hung')), 3000))
+    ]);
+    // Past the long backoff's end
+    await new Promise(r => setTimeout(r, 900 - (performance.now() - started)));
+
+    if (short.attemptNumber !== 2) throw new Error(`The retry due during the drain did not run (attempt ${short.attemptNumber})`);
+    if (long.attemptNumber !== 1) throw new Error(`A retry was dispatched after shutdown (attempt ${long.attemptNumber})`);
+    // Its timer was cleared: it did not land back in a queue shutdown emptied
+    const leftover = [...scheduler.readyQueuesByWorker.values()].reduce((n, q) => n + q.length, 0);
+    if (leftover > 0) throw new Error(`${leftover} task(s) were queued after shutdown`);
   }
 
   private async testSuccessOnce(): Promise<void> {
@@ -775,6 +996,11 @@ class SettlementTestSuite {
     scheduler.addEventListener('task.progress', (e: any) => {
       if (e.detail.id === 'tenant') progress.push(e.detail.message);
     });
+    // A requeue is not an attempt: both runs report the same number
+    const attemptNumbers: number[] = [];
+    scheduler.addEventListener('task.running', (e: any) => {
+      if (e.detail.id === 'tenant') attemptNumbers.push(e.detail.attemptNumber);
+    });
 
     const promise = scheduler.addTask(new FyflowTask({
       id: 'tenant', workerType: 'Requeue',
@@ -829,13 +1055,21 @@ class SettlementTestSuite {
       );
     }
 
-    return { scheduler, first, second, settled, outcomes, progress };
+    return { scheduler, first, second, settled, outcomes, progress, attemptNumbers };
   }
 
   private async testRequeueAbandonedResultIgnored(): Promise<void> {
     for (const inline of [true, false]) {
       const kind = inline ? 'inline' : 'threaded';
-      const { scheduler, first, second, settled, outcomes } = await this.requeueAbandonedRun(inline, {});
+      const { scheduler, first, second, settled, outcomes, attemptNumbers } = await this.requeueAbandonedRun(inline, {});
+
+      const tenant = scheduler.tasks.get('tenant')!;
+      if (attemptNumbers.join(',') !== '1,1' || tenant.attempts !== 0) {
+        throw new Error(
+          `${kind}: a requeue counted as an attempt - attempt numbers ${attemptNumbers.join(',')}, ` +
+          `attempts ${tenant.attempts}`
+        );
+      }
 
       if (outcomes.length !== 1) {
         throw new Error(`${kind}: expected one outcome, got ${JSON.stringify(outcomes)}`);

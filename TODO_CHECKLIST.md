@@ -86,7 +86,7 @@ cannot carry worker output to the main thread, and the browser does not have it.
 
 **Status**: 🟡 Refinement - plan open in `doc/design/task-messages.md`
 
-#### 🟡 Start a task with attempts already spent (#4, P2)
+#### 🟢 Start a task with attempts already spent (#4, P2)
 A config field so a resumed task does not get a fresh retry budget, and an event
 when a retry starts. Decided: `attemptsSpent` sets the starting `attempts`, and a
 task whose spent attempts already use up the budget runs once anyway; a new
@@ -96,7 +96,36 @@ task whose spent attempts already use up the budget runs once anyway; a new
 transitions. Includes the backoff fix below. Depends on the requeue known issue
 below. Plan: `doc/design/attempt-accounting.md`, no open questions.
 
-**Status**: 🟡 Refinement - plan open in `doc/design/attempt-accounting.md`
+**Outcome**: built as planned; the plan is deleted and its contract is in
+`AGENTS.md` §5 (`attemptsSpent`, `attemptNumber`, `attempts` as retries used,
+`error` per attempt, requeue is not an attempt), §6 (`task.retrying`, per-task
+ordering, and the lifecycle-versus-stream rule replacing "the four `task.*`
+events") and §10 (the Resume recipe). A retrying task waits in a
+`retryWaiting` map rather than the ready queue, still counted in
+`stats.queued`; `shutdown()` clears those timers once its drain ends. One
+addition to the plan: the retry branch now runs the dispatch loop at once, so the
+failed attempt's slot goes to other work - it used to wait for the backoff timer.
+
+Tests (settlement, 8 new plus an extension): the budget continuing from
+`attemptsSpent`; a spent budget running once, optional or not; validation;
+`task.retrying` once per retry with its fields; `error` cleared by a successful
+retry; backoff under load; no `scheduler.completed` during a backoff; shutdown
+during a backoff, one ending inside the drain and one outlasting it; the requeue
+tests assert one `attemptNumber` across both runs, inline and threaded. Docs:
+"Resuming Keeps The Retry Budget". Mutation checks, each failing its test:
+`task.retrying` on the final failure; the old immediate push; a backoff not
+counted in `stats.queued`; waiting tasks not discarded at shutdown;
+`attemptNumber` counting requeues; `error` not reset at dispatch; `attemptsSpent`
+ignored. Clearing the timers alone is not observable in-process - the timer
+callback already ignores a discarded waiter - so it only stops a dead timer
+holding the process open until it fires.
+
+Benchmark (`benchmark:quick`, alternated with the previous commit, three runs
+each), medians: 1K -0.5%, 10K +8.3%, 50K -2.2%, 100K -2.7%, threaded -2.9% to
++4.2%. Every head median lies inside the base runs' range, so the extra write
+per dispatch is not measurable.
+
+**Status**: 🟢 Completed - Deno and Node 22 157/157, browser 75/75, `jsr:smoke` (Node 24, type stripping included)
 
 ## Known Issues / Follow-ups
 
@@ -490,7 +519,7 @@ link is unconfirmed.
 
 **Status**: 🔵 Not Started
 
-#### 🔵 Retry backoff is not enforced under load
+#### 🟢 Retry backoff is not enforced under load
 `_settleTask` pushes a retried task back onto the ready queue immediately and
 only schedules an extra `_dispatchLoop()` after `backoffMs`, so any dispatch in
 between starts the retry early. Confirmed on Deno 2.9.6 with `backoffMs: 1000`:
@@ -499,7 +528,11 @@ alongside. Fixed as part of #4, which holds a retrying task outside the ready
 queue for its backoff. The test must run under load, since the idle case passes
 either way.
 
-**Status**: 🔵 Not Started - scheduled with #4
+**Outcome**: fixed with #4; see that entry. "Backoff Holds Under Load"
+(settlement) runs 300 short tasks alongside a retried one with a 150 ms backoff;
+with the old immediate push restored, its retries started 31 and 16 ms apart.
+
+**Status**: 🟢 Completed - with #4
 
 #### 🔵 `scheduler.completed` never fires for a run with no successes
 `_checkCompletion` requires `stats.done > 0`, so a run in which every task
