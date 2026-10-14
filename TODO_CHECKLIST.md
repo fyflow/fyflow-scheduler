@@ -434,7 +434,7 @@ each fail the scale test. `jsr:smoke` fails without the allowlist line.
 
 **Status**: 🟢 Completed - Deno and Node 22 146/146, browser 75/75, `jsr:smoke`
 
-#### 🔵 `shutdown()` stops listening to its pools before draining them
+#### 🟢 `shutdown()` stops listening to its pools before draining them
 `shutdown()` calls `_removeAllListeners()` before its 5 s wait for running tasks.
 Settles during the wait still run the dispatch loop, so new tasks are dispatched
 into pools about to be torn down, and those tasks reach `task.completed` with no
@@ -444,7 +444,22 @@ remove listeners after the drain. Dispatching during the drain is intended, not
 part of the bug: `AGENTS.md` §7 promises that shutdown drains outstanding work so
 a workflow that can still finish does.
 
-**Status**: 🔵 Not Started
+It broke that promise outright: a child spawned during the drain was never added
+(the spawn request is a pool event), so the workflow finished short and
+`onCompleteDescendants()` resolved without it.
+
+**Outcome**: pool listeners are removed after the drain, as proposed. The
+periodic retry timer moved with them: it was cleared before the drain, but a
+full pool relies on it to dispatch the next task, and settles during the drain
+re-armed it anyway. Test "Shutdown Drain Still Hears The Pools" (spawning): a
+root spawns two children after `shutdown()` has started, with a second task
+queued behind it on a one-slot pool. All four must complete, each after its
+`task.running`, and the descendant wait must resolve. Mutation checks: removing
+listeners before the drain loses both children; suppressing `task.running` for
+tasks dispatched during shutdown fails the ordering check. Requeues during the
+drain are restored by the same change but have no test of their own.
+
+**Status**: 🟢 Completed - Deno and Node 22 148/148, browser 75/75
 
 #### 🔵 Counting `task.running` minus `task.completed` overshoots real concurrency
 A task frees its slots before `task.completed` is emitted, and the freed slot

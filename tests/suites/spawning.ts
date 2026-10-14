@@ -96,6 +96,7 @@ class SpawningTestSuite {
     this.results.push(await this.runTest('Spawn Of Unknown Worker Type Does Not Crash', () => this.testUnknownWorkerSpawn()));
     this.results.push(await this.runTest('Descendants - Survive Task Eviction', () => this.testDescendantsSurviveEviction()));
     this.results.push(await this.runTest('Descendants - Reject On Scheduler Shutdown', () => this.testDescendantsRejectOnShutdown()));
+    this.results.push(await this.runTest('Shutdown Drain Still Hears The Pools', () => this.testShutdownDrainHearsThePools()));
 
     const totalDuration = performance.now() - this.startTime;
     const passed = this.results.filter(r => r.passed).length;
@@ -386,6 +387,57 @@ class SpawningTestSuite {
     if (!outcome.includes('shut down')) {
       throw new Error(`Expected a shutdown-specific message, got: ${outcome}`);
     }
+  }
+
+  // The other half of the contract above: work that can still finish does.
+  // shutdown() used to stop listening to its pools before draining, so a child
+  // spawned during the drain was never added and the wait resolved without it,
+  // and a task dispatched during the drain completed with no task.running.
+  private async testShutdownDrainHearsThePools(): Promise<void> {
+    const pool = new WorkerManager(this.spawningWorkerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true, idleTimeout: 0
+    });
+    const scheduler = new FyflowScheduler({ SpawningWorker: pool });
+    this.schedulers.push(scheduler);
+
+    const runningSeen = new Set<string>();
+    const completed: string[] = [];
+    const completedWithoutRunning: string[] = [];
+    scheduler.addEventListener('task.running', (e: any) => runningSeen.add(e.detail.id));
+    scheduler.addEventListener('task.completed', (e: any) => {
+      completed.push(e.detail.id);
+      if (!runningSeen.has(e.detail.id)) completedWithoutRunning.push(e.detail.id);
+    });
+
+    // The root spawns its children 150 ms in, well after shutdown() starts.
+    // The second root waits behind it for the pool's single slot.
+    const root = new FyflowTask({
+      id: 'drain-root', workerType: 'SpawningWorker',
+      payload: { spawn: 2, childId: 'drain-child', delay: 150 }
+    });
+    const queued = new FyflowTask({
+      id: 'drain-queued', workerType: 'SpawningWorker', payload: { delay: 10 }
+    });
+    scheduler.addTask(root);
+    scheduler.addTask(queued);
+    const waiting = root.onCompleteDescendants().then(() => 'resolved', (error: any) => `rejected:${error.message}`);
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    if (!runningSeen.has('drain-root')) throw new Error('Precondition: the root was not running before shutdown');
+    if (runningSeen.has('drain-queued')) throw new Error('Precondition: the queued task started before shutdown');
+    await scheduler.shutdown();
+
+    const outcome = await Promise.race([
+      waiting,
+      new Promise<string>(resolve => setTimeout(() => resolve('NEVER SETTLED'), 3000))
+    ]);
+    const expected = ['drain-root', 'drain-queued', 'drain-child-0', 'drain-child-1'];
+    const missing = expected.filter(id => !completed.includes(id));
+    if (missing.length > 0) throw new Error(`Never completed during the drain: ${missing.join(', ')}`);
+    if (completedWithoutRunning.length > 0) {
+      throw new Error(`Completed with no task.running: ${completedWithoutRunning.join(', ')}`);
+    }
+    if (outcome !== 'resolved') throw new Error(`Expected the descendant wait to resolve, got: ${outcome}`);
   }
 
   // A spawn the scheduler cannot satisfy must fail that spawn alone

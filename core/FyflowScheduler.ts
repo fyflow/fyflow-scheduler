@@ -1820,13 +1820,12 @@ export class FyflowTask {
      */
     async shutdown(): Promise<void> {
 
-      // 1. Clear periodic retry timer to stop any ongoing retries
-      this._clearPeriodicRetry();
-
-      // 2. Remove all internal event listeners to prevent process hanging
-      this._removeAllListeners();
-
-      // 2. Wait for any currently running tasks to complete
+      // 1. Wait for any currently running tasks to complete. Draining is
+      // dispatching: each settle starts the next outstanding task, so the pools
+      // stay heard and the periodic retry stays armed until it is done. Their
+      // listeners used to be removed first, which silently dropped everything
+      // the pools reported meanwhile - task.running, progress, spawned children
+      // and requeues alike.
       // Bounded: a task dispatched to a pool whose workers can no longer be
       // created never settles, and an unbounded wait turns that into a hang with
       // no diagnostic. Workers are terminated below regardless.
@@ -1840,6 +1839,12 @@ export class FyflowTask {
           `they were dispatched to a pool that could not complete them`
         );
       }
+
+      // 2. Stop retrying, and stop listening to the pools before they are torn
+      // down - otherwise the process stays alive
+      this._clearPeriodicRetry();
+      this._removeAllListeners();
+
       // 3. Clear all queues
       this.readyQueuesByWorker.forEach(q => q.clear());
 
