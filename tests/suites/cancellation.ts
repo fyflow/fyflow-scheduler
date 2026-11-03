@@ -256,10 +256,15 @@ class CancellationTestSuite {
   }
 
   // Run with stats.queued > 0, so a wrong queued decrement is not hidden by
-  // the clamp at 0
+  // the clamp at 0.
+  //
+  // The queued tasks come from a full pool, not from waiters stranded behind a
+  // blocked head: today only b1 enters the blocked queue and b2-b4 wait in
+  // the ready queue, but after doc/design/admission-rework.md R2 all four are
+  // blocked. q1 and q2 are queued under either model.
   private async testBlocked(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
-    const { scheduler } = this.make({ maxConcurrentTasks: 1, maxThreads: 2, groups: ['g'] }, { g: group });
+    const { scheduler } = this.make({ maxConcurrentTasks: 1, maxThreads: 2 }, { g: group });
     const log = this.events(scheduler);
     const fold = new Map<string, number>();
     scheduler.addEventListener('resource.blocked', (e: any) => fold.set(e.detail.holderId, (fold.get(e.detail.holderId) ?? 0) + 1));
@@ -269,13 +274,16 @@ class CancellationTestSuite {
       reasons.push(`${e.detail.holderId}:${e.detail.reason}`);
     });
 
-    scheduler.addTask(this.task('holder', { delay: 150 }));
-    // One batch, so one dispatch pass: b1 is blocked, and the others wait in the
-    // ready queue behind it
-    scheduler.addTasks(['b1', 'b2', 'b3', 'b4'].map(id => this.task(id, { delay: 5 })));
+    const g = { workerGroups: ['g'] };
+    scheduler.addTask(this.task('holder', { delay: 150 }, g));
+    // The pool's second slot is still free, so b1 is checked against g and blocked
+    scheduler.addTasks(['b1', 'b2', 'b3', 'b4'].map(id => this.task(id, { delay: 5 }, g)));
+    // Fill that slot without g, then queue two more behind the full pool
+    scheduler.addTask(this.task('filler', { delay: 150 }));
+    scheduler.addTasks(['q1', 'q2'].map(id => this.task(id, { delay: 5 })));
     await sleep(20);
     const blockedBefore = scheduler.getAdmissionQueue('g').g?.map(w => w.holderId) ?? [];
-    if (!blockedBefore.includes('b1') || scheduler.stats.queued === 0) {
+    if (!blockedBefore.includes('b1') || scheduler.stats.queued < 2) {
       throw new Error(`Precondition: blocked ${blockedBefore}, queued ${scheduler.stats.queued}`);
     }
     const queuedBefore = scheduler.stats.queued;
@@ -284,12 +292,12 @@ class CancellationTestSuite {
     if (scheduler.stats.queued !== queuedBefore) throw new Error(`Cancelling a blocked task moved queued ${queuedBefore} -> ${scheduler.stats.queued}`);
     if ((scheduler.getAdmissionQueue('g').g ?? []).some(w => w.holderId === 'b1')) throw new Error('Still in the admission queue');
     if (!reasons.includes('b1:cancelled')) throw new Error(`Unblock reasons: ${reasons}`);
-    this.assertAccounted(scheduler, 5, 'after cancel');
+    this.assertAccounted(scheduler, 8, 'after cancel');
 
-    await this.until(() => scheduler.stats.done === 4);
+    await this.until(() => scheduler.stats.done === 7);
     if (log.includes('running:b1')) throw new Error('b1 ran');
     for (const [holder, balance] of fold) if (balance !== 0) throw new Error(`Fold for ${holder} ended at ${balance}`);
-    this.assertAccounted(scheduler, 5, 'end');
+    this.assertAccounted(scheduler, 8, 'end');
   }
 
   private async testBackoff(): Promise<void> {
