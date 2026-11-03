@@ -61,7 +61,7 @@
       "test:messages": "deno run --allow-read --allow-net tests/runner.ts messages",
       "test:cancellation": "deno run --allow-read --allow-net tests/runner.ts cancellation",
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
-      "test:scripts": "deno test scripts/",
+      "test:scripts": "deno test scripts/ tests/harness_test.ts",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",
       "benchmark:quick": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick",
       "benchmark:baseline": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories baseline",

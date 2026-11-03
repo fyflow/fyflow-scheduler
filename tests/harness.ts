@@ -17,6 +17,30 @@ export interface TestResult {
   error?: string;
   /** Not run: excluded by --only, or after a failure under --bail. Suites drop these before counting. */
   skipped?: boolean;
+  /** Failed as its {@link KnownGap} predicted. Counted as passed. */
+  knownGap?: string;
+}
+
+/**
+ * A test that asserts behaviour the code does not have yet, landed ahead of
+ * the change that provides it - the target, written down and executed.
+ *
+ * Strict both ways, so a gap can neither hide a different bug nor outlive its
+ * fix:
+ * - it must fail, and with an error containing `failsWith`. Failing for any
+ *   other reason (a typo, a TypeError) is a real failure.
+ * - once it passes, it FAILS, telling you to delete the `knownGap` - the
+ *   change that closed it has to say so, in the same commit.
+ */
+export interface KnownGap {
+  /** Why it fails today, and what closes it - e.g. a design-doc phase. */
+  reason: string;
+  /** A substring of the error the gap produces today. */
+  failsWith: string;
+}
+
+export interface RunTestOptions {
+  knownGap?: KnownGap;
 }
 
 export interface HarnessOptions {
@@ -69,14 +93,51 @@ export function harnessOptions(): HarnessOptions {
 
 const BAILED = Symbol.for('fyflow.tests.bailed');
 const RAN = Symbol.for('fyflow.tests.ran');
-const state = globalThis as unknown as { [BAILED]?: boolean; [RAN]?: number };
+const GAPS = Symbol.for('fyflow.tests.gaps');
+const state = globalThis as unknown as { [BAILED]?: boolean; [RAN]?: number; [GAPS]?: string[] };
 
 /** Tests actually run so far, across every suite: a --only that matches nothing must not pass. */
 export function testsRun(): number {
   return state[RAN] ?? 0;
 }
 
-export async function runTest(name: string, testFn: () => Promise<void>): Promise<TestResult> {
+/**
+ * Known gaps that failed as predicted so far, across every suite. Only visible
+ * to the runner when suites share its module state - Deno and the browser. On
+ * Node each suite is a separate bundle, so each suite prints its own.
+ */
+export function knownGapsSeen(): string[] {
+  return state[GAPS] ?? [];
+}
+
+export async function runTest(
+  name: string,
+  testFn: () => Promise<void>,
+  runOptions: RunTestOptions = {},
+): Promise<TestResult> {
+  const gap = runOptions.knownGap;
+  const result = await runTestRaw(name, testFn, gap !== undefined);
+  if (!gap || result.skipped) return result;
+
+  if (result.passed) {
+    const error = `Known gap now passes - delete its knownGap (${gap.reason})`;
+    console.log(`❌ FAILED: ${name} - ${error}`);
+    if (harnessOptions().bail) state[BAILED] = true;
+    return { ...result, passed: false, error };
+  }
+  if (!result.error?.includes(gap.failsWith)) {
+    const error = `Known gap failed for an unexpected reason: expected "${gap.failsWith}", got "${result.error}"`;
+    console.log(`❌ FAILED: ${name} - ${error}`);
+    if (harnessOptions().bail) state[BAILED] = true;
+    return { ...result, error };
+  }
+  console.log(`🟠 KNOWN GAP: ${name} - ${gap.reason}`);
+  (state[GAPS] ??= []).push(name);
+  return { ...result, passed: true, knownGap: gap.reason };
+}
+
+/** `quietFailure`: the caller judges the failure (a known gap), so neither report it nor bail. */
+async function runTestRaw(name: string, testFn: () => Promise<void>, quietFailure = false): Promise<TestResult> {
   const options = harnessOptions();
   const lower = name.toLowerCase();
   if (options.only.length > 0 && !options.only.some(o => lower.includes(o))) {
@@ -103,8 +164,10 @@ export async function runTest(name: string, testFn: () => Promise<void>): Promis
     return { name, passed: true, duration };
   } catch (error: any) {
     const duration = performance.now() - start;
-    console.log(`❌ FAILED: ${name} (${duration.toFixed(1)}ms) - ${error?.message}`);
-    if (options.bail) state[BAILED] = true;
+    if (!quietFailure) {
+      console.log(`❌ FAILED: ${name} (${duration.toFixed(1)}ms) - ${error?.message}`);
+      if (options.bail) state[BAILED] = true;
+    }
     return { name, passed: false, duration, error: error?.message };
   } finally {
     clearTimeout(timer);
