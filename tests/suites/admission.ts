@@ -1,0 +1,574 @@
+// Admission and wake-up tests - R0 of doc/design/admission-rework.md.
+//
+// Three kinds of test, and the difference matters when one goes red:
+//
+// - **Wake paths, with the heartbeat off.** The 50 ms periodic retry wakes
+//   every waiter eventually, so a missing wake-up costs latency rather than
+//   correctness and passes every other suite. Each test here sets
+//   `periodicRetryIntervalMs` out of reach, so a missed wake is a waiter that
+//   never starts. Sources documented as heartbeat-only (`AGENTS.md` §6, "How a
+//   blocked task wakes up") get a second test with the heartbeat on, pinning
+//   what is promised today.
+// - **Targets, as known gaps.** Behaviour the rework is meant to deliver,
+//   asserted now and expected to fail with a stated error. The harness fails a
+//   gap that starts passing, so the change that closes one has to remove its
+//   `knownGap` in the same commit.
+// - **Guards.** Properties that hold today and must still hold after the
+//   rework: limits, the fold invariants, settlement under re-entrant
+//   listeners, flat admission cost for a global group.
+//
+// Assertions are on framework observables only - events, stats, group state -
+// never on state shared with a worker module, which does not survive the Node
+// bundle split.
+
+import {
+  WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup
+} from '../../index.ts';
+import { runTest, type RunTestOptions, type TestResult } from '../harness.ts';
+import { KeyedCounterGroup, instrument } from '../fixtures/keyedCounterGroup.ts';
+
+// Node.js process declaration for cross-platform compatibility
+declare const process: any;
+
+interface TestSuiteResult {
+  platform: string; totalTests: number; passed: number; failed: number;
+  duration: number; results: TestResult[];
+}
+
+/** Far enough out that the heartbeat never fires during a test. */
+const HEARTBEAT_OFF = 1_000_000_000;
+
+/** A woken waiter must start within this of the capacity freeing. */
+const WAKE_BOUND_MS = 25;
+
+/** How long to wait before calling a waiter "never started". */
+const NEVER_MS = 400;
+
+const NEVER_STARTED = 'never started';
+
+const R2 = 'doc/design/admission-rework.md R2';
+const R3 = 'doc/design/admission-rework.md R3';
+
+class AdmissionTestSuite {
+  private results: TestResult[] = [];
+  private workerUrl = "";
+  private schedulers: FyflowScheduler[] = [];
+
+  private track(scheduler: FyflowScheduler): FyflowScheduler {
+    this.schedulers.push(scheduler);
+    return scheduler;
+  }
+
+  async cleanup(): Promise<void> {
+    for (const scheduler of this.schedulers) {
+      try { await scheduler.shutdown(); } catch { /* already down */ }
+    }
+    this.schedulers = [];
+  }
+
+  private async run(name: string, fn: () => Promise<void>, options?: RunTestOptions): Promise<void> {
+    this.results.push(await runTest(name, async () => {
+      try { await fn(); } finally { await this.cleanup(); }
+    }, options));
+  }
+
+  private pool(extra: Record<string, any> = {}) {
+    return new WorkerManager(this.workerUrl, {
+      maxThreads: 4, maxConcurrentTasks: 20, inline: true, ...extra
+    });
+  }
+
+  private task(id: string, config: Record<string, any> = {}, delay = 10) {
+    const { workerType = 'W', ...rest } = config;
+    return new FyflowTask({ id, workerType, payload: { taskId: id, delay }, ...rest });
+  }
+
+  /** `performance.now()` at the first `type` event matching `match`. */
+  private when(target: EventTarget, type: string, match: (detail: any) => boolean): Promise<number> {
+    return new Promise(resolve => {
+      const listener = (e: Event) => {
+        if (!match((e as CustomEvent).detail)) return;
+        target.removeEventListener(type, listener);
+        resolve(performance.now());
+      };
+      target.addEventListener(type, listener);
+    });
+  }
+
+  private started(scheduler: FyflowScheduler, taskId: string): Promise<number> {
+    return this.when(scheduler, 'task.running', d => d?.id === taskId);
+  }
+
+  /** Resolves with the start time, or rejects with NEVER_STARTED. */
+  private async startsWithin(start: Promise<number>, taskId: string, ms = NEVER_MS): Promise<number> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        start,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`"${taskId}" ${NEVER_STARTED} within ${ms}ms`)), ms);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private assertPrompt(label: string, freedAt: number, startedAt: number, bound = WAKE_BOUND_MS) {
+    const latency = startedAt - freedAt;
+    if (latency > bound) {
+      throw new Error(`${label}: started ${latency.toFixed(1)}ms after capacity freed (bound ${bound}ms)`);
+    }
+  }
+
+  async runAllTests(_exitOnComplete = true): Promise<TestSuiteResult> {
+    if (typeof Deno !== "undefined") {
+      this.workerUrl = new URL("../workers/testInlineWorker.ts", import.meta.url).href;
+    } else {
+      // @ts-expect-error - esbuild resolves ?worker-direct at build time
+      this.workerUrl = new URL((await import('../workers/testInlineWorker.ts?worker-direct')).default).href;
+    }
+
+    const platform = typeof globalThis !== 'undefined' && 'Deno' in globalThis ? 'Deno' : 'Node.js';
+    console.log(`🚀 FyFlow Admission Tests - ${platform}`);
+    console.log('='.repeat(60));
+    const startTime = performance.now();
+    this.results = [];
+
+    // Wake paths, heartbeat off
+    await this.run('Wake: A Task Release Admits The Next Waiter', () => this.testWakeOnRelease(false));
+    await this.run('Wake: A Task Release Admits The Next Waiter (threaded)', () => this.testWakeOnRelease(true));
+    await this.run('Wake: A Keyed Release Admits That Key\'s Waiter', () => this.testWakeOnKeyedRelease());
+    await this.run('Wake: Cancelling A Holder Admits The Next Waiter', () => this.testWakeOnCancel());
+    await this.run('Wake: The Second Group\'s Release Admits A Two-Group Waiter', () => this.testWakeTwoGroups(), {
+      knownGap: {
+        reason: `a two-group waiter sits in its first group's queue, which the second group's release does not retry - ${R2} (migration)`,
+        failsWith: NEVER_STARTED
+      }
+    });
+    await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF), {
+      knownGap: {
+        reason: `resident admission is heartbeat-only (AGENTS.md §6) - ${R2} wakes it on release`,
+        failsWith: NEVER_STARTED
+      }
+    });
+    await this.run('Wake: A Rate Window Rolling Over Admits Without Polling', () => this.testWakeOnRateWindow(HEARTBEAT_OFF), {
+      knownGap: {
+        reason: `rate windows are heartbeat-only (AGENTS.md §6) - ${R3} wakes at resetAt`,
+        failsWith: NEVER_STARTED
+      }
+    });
+
+    // What the heartbeat promises today
+    await this.run('Heartbeat: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(50));
+    await this.run('Heartbeat: A Rate Window Rolling Over Admits', () => this.testWakeOnRateWindow(50));
+    await this.run('Heartbeat: Raising A Limit Admits Waiters', () => this.testRaisedLimit());
+
+    // Targets and guards on what admission costs
+    await this.run('Admission Queue Lists Every Waiter', () => this.testAdmissionQueueComplete(), {
+      knownGap: {
+        reason: `only the head of the ready queue enters the blocked queue; the rest stay in the ready queue - ${R2}`,
+        failsWith: 'admission queue lists'
+      }
+    });
+    await this.run('Global Group Admission Cost Is Flat', () => this.testCostFlat('global'));
+    await this.run('Keyed Admission Cost Is Flat In Queue Depth', () => this.testCostFlat('keyed'), {
+      knownGap: {
+        reason: `a release moves a key's whole queue back to the ready queue, and it is re-blocked - ${R2}`,
+        failsWith: 'grows with queue depth'
+      }
+    });
+    await this.run('Two-Group Admission Cost Is Flat', () => this.testCostFlat('two-group'));
+
+    // Guards
+    await this.run('Limits And Fold Invariants Hold Under Mixed Contention', () => this.testMixedContention());
+    await this.run('Re-entrant Cancel And Add From resource.acquired Settle Everything', () => this.testReentrantListeners());
+
+    const totalDuration = performance.now() - startTime;
+    this.results = this.results.filter(r => !r.skipped);
+    const passed = this.results.filter(r => r.passed).length;
+    const failed = this.results.length - passed;
+    const gaps = this.results.filter(r => r.knownGap);
+
+    console.log(`\n📊 Admission Test Summary - ${platform}`);
+    console.log('='.repeat(60));
+    console.log(`Total Tests: ${this.results.length}`);
+    console.log(`✅ Passed: ${passed}${gaps.length ? ` (${gaps.length} as known gaps)` : ''}`);
+    console.log(`❌ Failed: ${failed}`);
+    console.log(`⏱️  Duration: ${totalDuration.toFixed(1)}ms`);
+    if (gaps.length > 0) {
+      console.log('\n🟠 Known gaps:');
+      gaps.forEach(r => console.log(`  • ${r.name}: ${r.knownGap}`));
+    }
+    if (failed > 0) {
+      console.log('\n❌ Failed Tests:');
+      this.results.filter(r => !r.passed).forEach(r => console.log(`  • ${r.name}: ${r.error}`));
+    }
+
+    return {
+      platform, totalTests: this.results.length, passed, failed,
+      duration: totalDuration, results: this.results
+    };
+  }
+
+  // --- Wake paths -----------------------------------------------------------
+
+  /** AGENTS.md §6: "Releasing a task-held group retries that group's queue in the same turn". */
+  private async testWakeOnRelease(threaded: boolean) {
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool({ maxThreads: 2, maxConcurrentTasks: 1, inline: !threaded, groups: ['g'] }) },
+      { g },
+      { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const freed = this.when(s, 'task.completed', d => d?.id === 'holder');
+    const start = this.started(s, 'waiter');
+    const done = Promise.all([
+      s.addTask(this.task('holder', {}, 40), { createPromise: true }),
+      s.addTask(this.task('waiter', {}, 5), { createPromise: true })
+    ]);
+    // Threaded pools start slowly; allow for it in the never-started bound
+    const startedAt = await this.startsWithin(start, 'waiter', threaded ? 5_000 : NEVER_MS);
+    this.assertPrompt('waiter', await freed, startedAt);
+    await done;
+  }
+
+  private async testWakeOnKeyedRelease() {
+    const k = new KeyedCounterGroup(1, 'k');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool({ groups: ['k'] }) }, { k }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const freed = this.when(s, 'task.completed', d => d?.id === 'holder');
+    const start = this.started(s, 'waiter');
+    const done = Promise.all([
+      s.addTask(this.task('holder', { limitKey: 'a' }, 40), { createPromise: true }),
+      s.addTask(this.task('other', { limitKey: 'b' }, 5), { createPromise: true }),
+      s.addTask(this.task('waiter', { limitKey: 'a' }, 5), { createPromise: true })
+    ]);
+    this.assertPrompt('waiter', await freed, await this.startsWithin(start, 'waiter'));
+    await done;
+  }
+
+  private async testWakeOnCancel() {
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool({ groups: ['g'] }) }, { g }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const holder = new FyflowTask({ id: 'holder', workerType: 'W', payload: { taskId: 'holder', delay: 60 } });
+    const held = s.addTask(holder, { createPromise: true }) as Promise<any>;
+    held.catch(() => { /* cancelled */ });
+    const start = this.started(s, 'waiter');
+    const done = s.addTask(this.task('waiter', {}, 5), { createPromise: true });
+    await new Promise(r => setTimeout(r, 20));
+    const freed = this.when(s, 'task.cancelled', d => d?.id === 'holder');
+    await s.cancel('holder', { graceMs: 0 });
+    this.assertPrompt('waiter', await freed, await this.startsWithin(start, 'waiter'));
+    await done;
+  }
+
+  private async testWakeTwoGroups() {
+    // `both` is refused by A first, so it waits in A's queue. A frees at ~40ms
+    // while B is still full; B frees at ~80ms.
+    const A = new ConcurrentLimitGroup(1, 'A');
+    const B = new ConcurrentLimitGroup(1, 'B');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool() }, { A, B }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const freed = this.when(s, 'task.completed', d => d?.id === 'holdB');
+    const start = this.started(s, 'both');
+    const done = Promise.all([
+      s.addTask(this.task('holdA', { workerGroups: ['A'] }, 40), { createPromise: true }),
+      s.addTask(this.task('holdB', { workerGroups: ['B'] }, 80), { createPromise: true }),
+      s.addTask(this.task('both', { workerGroups: ['A', 'B'] }, 5), { createPromise: true })
+    ]);
+    const startedAt = await this.startsWithin(start, 'both');
+    this.assertPrompt('both', await freed, startedAt);
+    await done;
+  }
+
+  /** Two pools sharing a limit-1 resident group: Q's worker can exist only once P's is torn down. */
+  private async testWakeOnResidentRelease(heartbeatMs: number) {
+    const gpu = new ConcurrentLimitGroup(1, 'gpu');
+    const residentPool = () => this.pool({
+      maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 1 },
+      idleTimeout: 30, idleCheckIntervalMs: 10
+    });
+    const s = this.track(new FyflowScheduler(
+      { P: residentPool(), Q: residentPool() }, { gpu }, { periodicRetryIntervalMs: heartbeatMs }
+    ));
+    const freed = this.when(s, 'resource.released', d => d?.lifetime === 'resident' && d?.workerType === 'P');
+    const start = this.started(s, 'q');
+    const done = Promise.all([
+      s.addTask(this.task('p', { workerType: 'P' }, 10), { createPromise: true }),
+      s.addTask(this.task('q', { workerType: 'Q' }, 5), { createPromise: true })
+    ]);
+    // Teardown waits out P's idle timeout, so allow for that before "never"
+    const startedAt = await this.startsWithin(start, 'q', NEVER_MS + 100);
+    // On the heartbeat a waiter may wait a full interval, plus a dispatch
+    this.assertPrompt('q', await freed, startedAt, heartbeatMs === HEARTBEAT_OFF ? WAKE_BOUND_MS : heartbeatMs + WAKE_BOUND_MS);
+    await done;
+  }
+
+  private async testWakeOnRateWindow(heartbeatMs: number) {
+    const WINDOW = 40;
+    const rate = new RateLimitGroup([{ limit: 1, windowMs: WINDOW }], 'rate');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: heartbeatMs }
+    ));
+    const firstStart = this.started(s, 'first');
+    const start = this.started(s, 'second');
+    const done = Promise.all([
+      s.addTask(this.task('first', {}, 5), { createPromise: true }),
+      s.addTask(this.task('second', {}, 5), { createPromise: true })
+    ]);
+    const startedAt = await this.startsWithin(start, 'second');
+    // The window can free no earlier than WINDOW after the first started
+    const freedBy = (await firstStart) + WINDOW + 5;
+    this.assertPrompt('second', freedBy, startedAt, heartbeatMs === HEARTBEAT_OFF ? WAKE_BOUND_MS : heartbeatMs + WAKE_BOUND_MS);
+    await done;
+  }
+
+  /** An out-of-band capacity change has no release to wake on. The heartbeat covers it. */
+  private async testRaisedLimit() {
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['g'] }) }, { g }));
+    const start = this.started(s, 'waiter');
+    const done = Promise.all([
+      s.addTask(this.task('holder', {}, 400), { createPromise: true }),
+      s.addTask(this.task('waiter', {}, 5), { createPromise: true })
+    ]);
+    await new Promise(r => setTimeout(r, 20));
+    const raisedAt = performance.now();
+    g.limit = 2;
+    this.assertPrompt('waiter', raisedAt, await this.startsWithin(start, 'waiter'), 50 + WAKE_BOUND_MS);
+    await done;
+  }
+
+  // --- Admission cost and honesty --------------------------------------------
+
+  private async testAdmissionQueueComplete() {
+    const N = 30;
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['g'] }) }, { g }));
+    const done = Promise.all(
+      Array.from({ length: N }, (_, i) => s.addTask(this.task(`t${i}`, {}, 15), { createPromise: true }))
+    );
+    await new Promise(r => setTimeout(r, 50));
+    const listed = s.getAdmissionQueue('g').g?.length ?? 0;
+    // Everything not yet finished and not the one running is waiting on g
+    const waiting = N - s.stats.done - g.running;
+    await done;
+    if (listed < waiting - 1) {
+      throw new Error(`The admission queue lists ${listed} waiters while ${waiting} wait on the group`);
+    }
+  }
+
+  /**
+   * Admission work per task must not grow with how many tasks wait. Measured as
+   * `canRun` calls and `resource.blocked` events per task, at two depths 8x
+   * apart: flat is a ratio near 1, and the quadratic shape doubles with each
+   * doubling of depth.
+   */
+  private async testCostFlat(shape: 'global' | 'keyed' | 'two-group') {
+    const small = await this.measureShape(shape, 1);
+    const large = await this.measureShape(shape, 8);
+    const ratio = large.canRunPerTask / small.canRunPerTask;
+    const eventRatio = large.blockedPerTask / Math.max(small.blockedPerTask, 0.5);
+    console.log(`  ${shape}: canRun/task ${small.canRunPerTask.toFixed(1)} -> ${large.canRunPerTask.toFixed(1)}, ` +
+      `blocked/task ${small.blockedPerTask.toFixed(1)} -> ${large.blockedPerTask.toFixed(1)}`);
+    if (ratio > 1.5 || eventRatio > 1.5) {
+      throw new Error(
+        `${shape}: admission work per task grows with queue depth - canRun/task x${ratio.toFixed(1)}, ` +
+        `resource.blocked/task x${eventRatio.toFixed(1)} for 8x the waiters`
+      );
+    }
+  }
+
+  private async measureShape(shape: 'global' | 'keyed' | 'two-group', scale: number) {
+    const groups: Record<string, any> = shape === 'global'
+      ? { g: new ConcurrentLimitGroup(7, 'g') }
+      : shape === 'keyed'
+        ? { k: new KeyedCounterGroup(2, 'k') }
+        : { A: new ConcurrentLimitGroup(4, 'A'), B: new ConcurrentLimitGroup(4, 'B') };
+    const counters = Object.values(groups).map(g => instrument(g));
+    const s = this.track(new FyflowScheduler({ W: this.pool({ maxConcurrentTasks: 50 }) }, groups));
+    let blocked = 0;
+    s.addEventListener('resource.blocked', () => blocked++);
+
+    const N = (shape === 'keyed' ? 500 : 1000) * scale;
+    const tasks = Array.from({ length: N }, (_, i) => {
+      const config: Record<string, any> =
+        shape === 'global' ? { workerGroups: ['g'] }
+        : shape === 'keyed' ? { workerGroups: ['k'], limitKey: `key${i % 10}` }
+        : { workerGroups: i % 3 === 0 ? ['A', 'B'] : i % 3 === 1 ? ['A'] : ['B'] };
+      return new FyflowTask({ id: `t${i}`, workerType: 'W', payload: { countConcurrency: true, taskId: i }, ...config });
+    });
+    await Promise.all(tasks.map(t => s.addTask(t, { createPromise: true })));
+    await s.shutdown();
+    const canRun = counters.reduce((sum, c) => sum + c.canRun, 0);
+    return { canRunPerTask: canRun / N, blockedPerTask: blocked / N };
+  }
+
+  // --- Guards ----------------------------------------------------------------
+
+  /**
+   * Every kind of waiter at once - global, keyed, two-group and resident - with
+   * cancels landing wherever tasks happen to be. Checks the limits and both
+   * fold invariants of AGENTS.md §6.
+   */
+  private async testMixedContention() {
+    const groups = {
+      g: new ConcurrentLimitGroup(3, 'g'),
+      k: new KeyedCounterGroup(2, 'k'),
+      A: new ConcurrentLimitGroup(2, 'A'),
+      B: new ConcurrentLimitGroup(2, 'B'),
+      gpu: new ConcurrentLimitGroup(2, 'gpu')
+    };
+    const limits: Record<string, number> = { g: 3, k: 2, A: 2, B: 2, gpu: 2 };
+    const counters = Object.fromEntries(Object.entries(groups).map(([id, g]) => [id, instrument(g)]));
+    const s = this.track(new FyflowScheduler({
+      W: this.pool({ maxConcurrentTasks: 10 }),
+      R: this.pool({ maxThreads: 3, maxConcurrentTasks: 2, residentGroups: { gpu: 1 }, idleTimeout: 20, idleCheckIntervalMs: 10 }),
+    }, groups));
+
+    const membership = new Map<string, number>();
+    const holdings = new Map<string, number>();
+    let negative = '';
+    const bump = (map: Map<string, number>, key: string, by: number) => {
+      const next = (map.get(key) ?? 0) + by;
+      map.set(key, next);
+      return next;
+    };
+    s.addEventListener('resource.blocked', (e: any) => {
+      const d = e.detail; bump(membership, `${d.groupId}|${d.key ?? ''}|${d.holderId}`, 1);
+    });
+    s.addEventListener('resource.unblocked', (e: any) => {
+      const d = e.detail; bump(membership, `${d.groupId}|${d.key ?? ''}|${d.holderId}`, -1);
+    });
+    s.addEventListener('resource.acquired', (e: any) => {
+      const d = e.detail; bump(holdings, `${d.groupId}|${d.key ?? ''}`, d.cost);
+    });
+    s.addEventListener('resource.released', (e: any) => {
+      const d = e.detail;
+      if (bump(holdings, `${d.groupId}|${d.key ?? ''}`, -d.cost) < 0) negative ||= `${d.groupId}|${d.key ?? ''}`;
+    });
+
+    const N = 300;
+    const shapes = [['g'], ['k'], ['A'], ['B'], ['A', 'B'], ['g', 'k']];
+    const promises: Promise<any>[] = [];
+    for (let i = 0; i < N; i++) {
+      const resident = i % 5 === 0;
+      const workerGroups = resident ? [] : shapes[i % shapes.length];
+      const p = s.addTask(new FyflowTask({
+        id: `t${i}`, workerType: resident ? 'R' : 'W', workerGroups,
+        limitKey: `key${i % 4}`, payload: { taskId: `t${i}`, delay: 1 + (i % 7) }
+      }), { createPromise: true }) as Promise<any>;
+      promises.push(p.then(() => 'completed', () => 'rejected'));
+    }
+    // Cancels land on waiting, running and finished tasks alike
+    const cancels: Promise<boolean>[] = [];
+    for (let i = 3; i < N; i += 7) {
+      await new Promise(r => setTimeout(r, 1));
+      cancels.push(s.cancel(`t${i}`, { graceMs: 0 }));
+    }
+    const outcomes = await Promise.all(promises);
+    await Promise.all(cancels);
+
+    const settled = outcomes.length;
+    if (settled !== N) throw new Error(`${N - settled} tasks never settled`);
+    const stats = s.stats;
+    if (stats.done + stats.cancelled + stats.failed !== N) {
+      throw new Error(`Counters do not add up: ${JSON.stringify(stats)}`);
+    }
+    if (stats.running !== 0 || stats.queued !== 0) throw new Error(`Left in flight: ${JSON.stringify(stats)}`);
+
+    for (const [id, c] of Object.entries(counters)) {
+      for (const [key, peak] of c.peak) {
+        if (peak > limits[id]) throw new Error(`${id}${key ? `[${key}]` : ''} reached ${peak} against a limit of ${limits[id]}`);
+      }
+    }
+    await s.shutdown();
+    if (negative) throw new Error(`Holdings of ${negative} went negative`);
+    const heldOver = [...holdings].filter(([, n]) => n !== 0);
+    if (heldOver.length) throw new Error(`Holdings not released: ${JSON.stringify(heldOver)}`);
+    const unbalanced = [...membership].filter(([, n]) => n !== 0);
+    if (unbalanced.length) throw new Error(`Queue membership unbalanced: ${JSON.stringify(unbalanced.slice(0, 5))}`);
+  }
+
+  /**
+   * A resource.acquired listener that re-enters the scheduler from inside
+   * admission: it cancels the task being admitted, cancels the next waiter, and
+   * adds a new task. Today's release path collects before acting; the rework
+   * dispatches from inside it, so this is the case most likely to break.
+   *
+   * A task cancelled by its own `resource.acquired` must never reach a worker
+   * (`_dispatchTask` settles it on the spot). The waiter-in-transit case, a
+   * task cancelled after the retry loop collected it, is covered by the
+   * cancellation suite's "Cancel From An Admitted Unblock".
+   */
+  private async testReentrantListeners() {
+    const g = new ConcurrentLimitGroup(2, 'g');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['g'] }) }, { g }));
+    const promises: Promise<string>[] = [];
+    const add = (id: string, delay: number) => {
+      const p = s.addTask(this.task(id, {}, delay), { createPromise: true }) as Promise<any>;
+      promises.push(p.then(() => 'completed', () => 'rejected'));
+    };
+    let added = 0;
+    const selfCancelled = new Set<string>();
+    const ran = new Set<string>();
+    s.addEventListener('task.running', (e: any) => ran.add(e.detail.id));
+    s.addEventListener('resource.acquired', (e: any) => {
+      const id: string = e.detail.holderId;
+      const m = /^w(\d+)$/.exec(id);
+      if (!m) return;
+      const i = Number(m[1]);
+      if (i % 4 === 0) {
+        selfCancelled.add(id);
+        void s.cancel(id, { graceMs: 0 });
+      } else if (i % 4 === 1) {
+        void s.cancel(`w${i + 1}`, { graceMs: 0 });
+        add(`fresh${added++}`, 3);
+      }
+    });
+
+    add('h0', 20);
+    add('h1', 20);
+    for (let i = 0; i < 12; i++) add(`w${i}`, 3);
+
+    // Fresh tasks are added while we wait, so wait until the count stops moving
+    let seen = -1;
+    while (seen !== promises.length) {
+      seen = promises.length;
+      await Promise.all(promises);
+    }
+    const stats = s.stats;
+    if (stats.running !== 0 || stats.queued !== 0) throw new Error(`Left in flight: ${JSON.stringify(stats)}`);
+    if (stats.done + stats.cancelled + stats.failed !== promises.length) {
+      throw new Error(`Counters do not add up for ${promises.length} tasks: ${JSON.stringify(stats)}`);
+    }
+    if (g.running !== 0) throw new Error(`The group still holds ${g.running}`);
+    if (added === 0 || selfCancelled.size === 0) throw new Error('The listener never ran - the test proves nothing');
+    const leaked = [...selfCancelled].filter(id => ran.has(id));
+    if (leaked.length) throw new Error(`Cancelled at admission, yet ran: ${leaked.join(', ')}`);
+    const states = [...selfCancelled].map(id => s.tasks.get(id)?.state);
+    if (states.some(state => state !== 'cancelled')) {
+      throw new Error(`Cancelled at admission, yet ended ${JSON.stringify(states)}`);
+    }
+  }
+}
+
+// Auto-run tests when executed directly - handle both Deno and Node.js
+if ((typeof Deno !== 'undefined' && import.meta.main) ||
+    (typeof process !== 'undefined' && process.argv[1] && import.meta.url &&
+     import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/')))) {
+  const testSuite = new AdmissionTestSuite();
+  try {
+    await testSuite.runAllTests(true);
+  } finally {
+    await testSuite.cleanup();
+  }
+}
+
+export { AdmissionTestSuite };
+export default AdmissionTestSuite;
