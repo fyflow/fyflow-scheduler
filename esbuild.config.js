@@ -135,7 +135,8 @@ if (buildType === 'development') {
       "tests/suites/cancellation.ts",
       "tests/suites/admission.ts",
       "tests/performance/contention-scaling.ts",
-      "benchmark/runBenchmarks.ts"
+      "benchmark/runBenchmarks.ts",
+      "benchmark/admission.ts"
     ],
     bundle: true,
     target: ["es2022"],

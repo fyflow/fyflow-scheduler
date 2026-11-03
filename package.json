@@ -42,6 +42,7 @@
     "benchmark:startup": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories startup",
     "benchmark:contention": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories contention",
     "benchmark:overlapping": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories overlapping",
+    "benchmark:admission": "npm run build:dev && node dev-dist/node/benchmark/admission.js",
     "benchmark:help": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --help"
   },
   "keywords": ["scheduler", "task", "worker", "async", "concurrency", "workflow", "parallel", "typescript"],

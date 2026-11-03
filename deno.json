@@ -70,6 +70,7 @@
       "benchmark:startup": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories startup",
       "benchmark:contention": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories contention",
       "benchmark:overlapping": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories overlapping",
+      "benchmark:admission": "deno run --allow-read --allow-write benchmark/admission.ts",
       "benchmark:help": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --help"
     }
   }
