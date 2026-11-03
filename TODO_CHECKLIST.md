@@ -9,10 +9,72 @@
 
 ## Current Development Tasks
 
-No feature work is open. fyflow-app's pass 1 requests are answered: #1
-(cancellation), #2 (a worker event channel, in place of a log API) and #4
-(attempts already spent) are built, and #3 (`meta` on tasks) was declined in the
-reply. Their summaries are in the archive below.
+fyflow-app's pass 1 requests are answered: #1 (cancellation), #2 (a worker event
+channel, in place of a log API) and #4 (attempts already spent) are built, and #3
+(`meta` on tasks) was declined in the reply. Their summaries are in the archive
+below.
+
+fyflow-app's pass 2 (`../fyflow-app/.scratch/mu-upstream-adoption/requests/fyflow-scheduler.pass2.md`)
+is planned. The reply has not been sent yet.
+
+#### 🔵 Concurrency limits are hard caps: make it the documented contract
+Phase 0 of `doc/design/keyed-concurrent-limit.md`, and a prerequisite for both
+tasks below. The code already acquires in the same synchronous turn as the check,
+and `testLimitsHoldAtScale` asserts the peak. Only the docs (`AGENTS.md` §1 and
+§9, `README.md`) still call groups "optimistic". Audit every `onStart` path,
+reword the docs, and add a mutation-checked docs test.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 `KeyedConcurrentLimitGroup` (scheduler pass 2 #1, P3)
+Phase A of `doc/design/keyed-concurrent-limit.md`: a concurrency limit counted
+per key, with an optional `limitFor(key)`, immediate key eviction and per-key
+`level` gauges. One key per task. Multi-key is phase B, accepted but deferred.
+It is blocked on R1 and R2 of the admission rework below, and is gated on its
+`admission` benchmark.
+
+**Status**: 🔵 Not Started
+
+#### 🟡 Admission and wake-up rework (foundation)
+`doc/design/admission-rework.md`. This is the shared foundation for keyed phase
+B and for specific-unit requests.
+
+**R0 is done** (branch `admission-r0`):
+- known gaps in `tests/harness.ts`;
+- `tests/suites/admission.ts`, 16 tests, 5 of them known gaps;
+- `benchmark:admission`;
+- the order-assertion audit.
+
+The baseline at `0adeefb`:
+- **Keyed groups are quadratic in each key's queue depth.** 50K tasks over 10
+  keys take 7.4 minutes, with 4,892 `canRun` calls and 1,630 `resource.blocked`
+  events per task, and an 881 ms stall.
+- **Global and two-group shapes are flat, but their admission queue shows 2-4
+  waiters** while ~49,000 wait.
+- **Empty blocked queues are never deleted**: 1,000 are left after a 1,000-key run.
+- **A two-group waiter, and a resident waiter, wake only on the heartbeat.**
+
+Next:
+- R1: housekeeping, which closes the leak;
+- R2: one wait list per task, admit on wake, migration. Decide risk 14
+  (resident head-of-line on arrival) first;
+- R3: optional, time-based wakes.
+
+It closes the herd known issue below, and supersedes "Empty blocked queues are
+never deleted".
+
+**Status**: 🟡 In Progress (R0 done)
+
+#### 🔵 Units with identities (scheduler pass 2 #2, P3)
+`doc/design/unit-grants.md`. Design only, to be built after the keyed group. It
+needs a `UnitGroup`, an `onStart` that returns a grant, `context.grants` and
+`workerContext.grants`, and protocol changes in both bootstraps. Requests for
+specific units (a candidate set `from`, plus a soft `prefer`) need one wait
+queue per candidate set and resident head-of-line admission scoped to
+overlapping sets. They also need admission on wake, so they depend on R2 of the
+admission rework.
+
+**Status**: 🔵 Not Started
 
 ### 0.6.0: release notes
 
@@ -98,6 +160,12 @@ lost or reordered, but the blocked queue stops describing who is waiting
 why a group-limited run is so much slower: 50K tasks at ~1,900 tasks/s under a
 limit-7 group, against ~114,000 pool-only. Not yet investigated; the throughput
 link is unconfirmed.
+
+Measured 2026-11-03 (`doc/design/admission-rework.md`): for a global group the
+moved queue is only 1-2 tasks, because the dispatch loop breaks on a non-keyed
+block, so the cost is linear (178K tasks/s at limit 7). For keyed groups it is
+quadratic: whole per-key queues are moved and re-blocked on every wake.
+Planned in R2 of that document.
 
 Still there after #1 (2026-10-14): 300 tasks of 30 ms on a 50-slot pool behind a
 `ConcurrentLimitGroup(1)` - mid-run, `getAdmissionQueue('g')` listed 1-2

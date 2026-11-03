@@ -97,11 +97,12 @@ cheaper pools overtake it.
 # Deno
 deno task check          # type check (includes scripts/)
 deno task test           # all suites
-deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation
+deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation|admission
 deno task examples       # run every example on Deno, then the bundled ones on Node
 deno task jsr:smoke      # stage only the publishable files and run a real worker against them
 deno lint .
 deno task benchmark:quick
+deno task benchmark:admission   # admission cost per task and wake latency; --json, --compare
 
 # Node (pnpm is the package manager)
 pnpm install --frozen-lockfile   # also runs prepare -> the library build
@@ -115,7 +116,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Nine suites, 215 tests, all in the default `deno task test` run:
+Ten suites, 231 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -128,11 +129,12 @@ Nine suites, 215 tests, all in the default `deno task test` run:
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
 | cancellation | 33 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
 | docs | 41 | **executes every snippet in README.md and AGENTS.md** |
+| admission | 16 | wake paths with the heartbeat off, admission cost per task, fold invariants under mixed contention; 5 known gaps |
 
-`deno task test:scripts` is separate and not included in `deno task test` — it
-unit-tests `scripts/publishOutput.ts`.
+`deno task test:scripts` is separate and not included in `deno task test`. It
+unit-tests `scripts/` and the known-gap rules in `tests/harness.ts`.
 
-Two conventions worth keeping:
+Three conventions worth keeping:
 
 - **A new documented claim needs a docs test.** The docs suite is what stops the
   documentation drifting from the code.
@@ -141,6 +143,16 @@ Two conventions worth keeping:
   and confirm the test fails, then restore it. Run only the tests meant to
   catch it, and stop at the first failure:
   `deno task test:settlement --only "requeue" --bail --timeout 5000`.
+- **Land a planned behaviour as a known gap, not a skipped test.**
+  - Write the test for the behaviour you want, and pass
+    `{ knownGap: { reason, failsWith } }` to `runTest`. It must fail, with an
+    error containing `failsWith`, and the run stays green.
+  - Once it starts passing it fails the run, so the change that closes a gap
+    deletes its `knownGap` in the same commit.
+  - A wake-up test must turn the heartbeat off
+    (`periodicRetryIntervalMs: 1_000_000_000`). Otherwise the 50 ms periodic
+    retry rescues every missed wake, and the bug shows up only as latency.
+    `tests/suites/admission.ts` is the pattern.
 
 Every test has a timeout, 60 s by default, enforced by `runTest` in
 `tests/harness.ts`, which every suite delegates to. Without it a mutation, or a
