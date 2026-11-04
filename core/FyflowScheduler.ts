@@ -891,8 +891,7 @@ export class FyflowTask {
     private _poolHasRoom(pool: any): boolean {
       if (pool._capacityRaceBackoff) return false;
       if (pool.threads.some((t: any) => t.canAcceptTask && t.canAcceptTask())) return true;
-      const initializingCount = pool.initializingThreads ? pool.initializingThreads.size : 0;
-      return (pool.threads.length + initializingCount) < pool.maxThreads;
+      return pool.threads.length < pool.maxThreads;
     }
 
     // NEW: Non-optimistic mode helper methods
@@ -914,9 +913,8 @@ export class FyflowTask {
       }
 
       // No available threads - can we create one?
-      // Account for threads being initialized (same logic as enqueueNoQueue)
-      const initializingCount = pool.initializingThreads ? pool.initializingThreads.size : 0;
-      const canCreateThread = (pool.threads.length + initializingCount) < pool.maxThreads;
+      // A starting worker is in `threads` already (same check as enqueueNoQueue)
+      const canCreateThread = pool.threads.length < pool.maxThreads;
       if (canCreateThread) {
         // Check resource groups before creating thread
         const resourceResult = this._checkAndBlockResources(task, pool);

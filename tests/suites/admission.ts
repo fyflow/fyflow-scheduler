@@ -48,8 +48,6 @@ const NEVER_STARTED = 'never started';
 
 const R3 = 'doc/design/admission-rework.md R3';
 
-const BOUNCED = 'bounced';
-
 class AdmissionTestSuite {
   private results: TestResult[] = [];
   private workerUrl = "";
@@ -145,12 +143,7 @@ class AdmissionTestSuite {
     await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF));
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (threaded)', () => this.testWakeOnWorkerReady(true));
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (inline)', () => this.testWakeOnWorkerReady(false));
-    await this.run('A Burst Onto An Empty Threaded Pool Dispatches Each Task Once', () => this.testBurstNoBounce(), {
-      knownGap: {
-        reason: 'a new thread takes its first task a microtask after creation, so the next task in the same dispatch loop takes its slot and the first bounces (TODO_CHECKLIST.md)',
-        failsWith: BOUNCED
-      }
-    });
+    await this.run('A Burst Onto An Empty Threaded Pool Dispatches Each Task Once', () => this.testBurstNoBounce());
     await this.run('Wake: A Rate Window Rolling Over Admits Without Polling', () => this.testWakeOnRateWindow(HEARTBEAT_OFF), {
       knownGap: {
         reason: `rate windows are heartbeat-only (AGENTS.md §6) - ${R3} wakes at resetAt`,
@@ -274,7 +267,7 @@ class AdmissionTestSuite {
     await Promise.all(Array.from({ length: n }, (_, i) =>
       s.addTask(this.task(`t${i}`, {}, 50), { createPromise: true })));
     if (acquired !== n) {
-      throw new Error(`${acquired - n} of ${n} tasks ${BOUNCED} off a new worker (${acquired} acquires for ${n} tasks)`);
+      throw new Error(`${acquired - n} of ${n} tasks bounced off a new worker (${acquired} acquires for ${n} tasks)`);
     }
   }
 

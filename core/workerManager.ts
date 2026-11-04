@@ -1,7 +1,7 @@
 import { ThreadWrapper } from "./threadWrapper.ts";
 import { InlineWrapper } from "./inlineWrapper.ts";
 import type { TaskMessageDetail, WorkerStatus } from "./workerInterface.ts";
-import { AttemptStoppedError, CancelledError } from "./workerInterface.ts";
+import { AttemptStoppedError } from "./workerInterface.ts";
 import { resolveMessageOptions } from "./messageChannel.ts";
 import type { ChannelEvent, MessageOptions } from "./messageChannel.ts";
 
@@ -227,16 +227,6 @@ export class WorkerManager extends EventTarget {
   // Track ALL event listeners for cleanup
   private allListeners = new Map<any, {event: string; listener: Function}[]>();
 
-  // Track initializing threads
-  private initializingThreads = new Set<WorkerInstance>();
-
-  /**
-   * Tasks between dispatch and their wrapper: `enqueueNoQueue` awaiting a new
-   * thread, the only path with an await before `runTask`. A cancel arriving
-   * here is recorded, and the task never reaches the wrapper.
-   */
-  private enqueuing = new Map<string, { cancelled: boolean; reason?: unknown }>();
-
   /**
    * Threaded pools: one entry per task being cancelled, from the cancel until
    * the scheduler settles it. Doubles as the record of which tasks on a worker
@@ -428,16 +418,13 @@ export class WorkerManager extends EventTarget {
       t.canAcceptTask && t.canAcceptTask()
     );
 
-    // If no available thread, create one if under limit
-    // Note: initializingThreads tracks threads being created to prevent race conditions
-    if (!targetThread && (this.threads.length + this.initializingThreads.size) < this.maxThreads
+    // If no available thread, create one if under limit. A new worker is in
+    // `threads` from creation, starting or not, so this counts it.
+    if (!targetThread && this.threads.length < this.maxThreads
         && this._acquireResident()) {
       const newThread = this._newWorker(this.config);
 
       this._bindResidentHolder(newThread.id);
-
-      // Track as initializing to prevent other tasks from creating duplicate threads
-      this.initializingThreads.add(newThread);
 
       // Set up event listeners
       this._setupWorkerEventListeners(newThread);
@@ -446,31 +433,12 @@ export class WorkerManager extends EventTarget {
       this.threads.push(newThread);
       this.startIdleTimer();
 
-      // For inline workers, thread is ready immediately
-      if (this.inline) {
-        this.initializingThreads.delete(newThread);
-        targetThread = newThread;
-      } else {
-        const entry: { cancelled: boolean; reason?: unknown } = { cancelled: false };
-        this.enqueuing.set(taskId, entry);
-        // For threaded workers, wait for initialization
-        await new Promise<void>((resolve) => {
-          const checkInit = () => {
-            if (newThread.canAcceptTask && newThread.canAcceptTask()) {
-              this.initializingThreads.delete(newThread);
-              resolve();
-            } else {
-              setTimeout(checkInit, 10); // Poll every 10ms
-            }
-          };
-          checkInit();
-        });
-        if (this.enqueuing.get(taskId) === entry) this.enqueuing.delete(taskId);
-        // Cancelled meanwhile: it never reaches the thread, which stays, idle,
-        // for the next task. The rejection settles it as cancelled.
-        if (entry.cancelled) throw new CancelledError(taskId, entry.reason);
-        targetThread = newThread;
-      }
+      // The task goes to the new worker in this same turn. A thread starts
+      // itself on its first runTask() and holds the task in its start-up queue
+      // meanwhile. Awaiting the thread first, as this once did, left its slot
+      // showing free for that await, so the next task in the same dispatch
+      // loop took it and this one bounced off a full worker.
+      targetThread = newThread;
     }
 
     if (!targetThread) {
@@ -486,8 +454,8 @@ export class WorkerManager extends EventTarget {
 
   /**
    * Called by the scheduler for a task it has dispatched to this pool and
-   * accepted a cancel for. Finds where the attempt is - on its way to a worker,
-   * or on one - and asks it to stop. Settles nothing: the attempt's promise
+   * accepted a cancel for. Finds the worker the attempt is on - in its start-up
+   * queue, or running - and asks it to stop. Settles nothing: the attempt's promise
    * does, once it has stopped.
    *
    * On a threaded pool it also starts the grace period: `graceMs`, or the
@@ -504,12 +472,6 @@ export class WorkerManager extends EventTarget {
       this._armGraceTimer(taskId, entry, graceMs);
     }
 
-    const enqueuing = this.enqueuing.get(taskId);
-    if (enqueuing) {
-      enqueuing.cancelled = true;
-      enqueuing.reason = options.reason;
-      return;
-    }
     // A scan of at most maxThreads, at cancel time only, rather than a
     // task -> worker map that every dispatch would pay for. A worker that
     // failed under the task has forgotten it, so only the live attempt matches.
@@ -552,9 +514,8 @@ export class WorkerManager extends EventTarget {
       entry.fired = true;
       // Cleared, or replaced by a later attempt's cancel
       if (this.graceTimers.get(taskId) !== entry) return;
-      // Only an attempt that is still on a worker: one still on its way to a
-      // new thread never reaches it, and one in a thread's start-up queue was
-      // rejected at the cancel
+      // Only an attempt that is still on a worker: one in a thread's start-up
+      // queue was rejected at the cancel
       const worker = this.threads.find(w => w.hasTask(taskId));
       if (worker instanceof ThreadWrapper) this._retireWorker(worker);
     }, graceMs);

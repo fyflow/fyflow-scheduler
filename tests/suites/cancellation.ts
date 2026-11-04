@@ -1,11 +1,12 @@
 // Task cancellation: scheduler.cancel().
 //
-// A task can be in seven places when a cancel arrives. Waiting, and removed at
+// A task can be in six places when a cancel arrives. Waiting, and removed at
 // once: 1. the ready queue, 2. a blocked queue, 3. a retry backoff. Dispatched,
-// and settled once its attempt stops: 4. on its way to a new thread
-// (enqueueNoQueue awaiting it), 5. in a thread's start-up queue, 6. inline,
-// before run(), 7. inside run() - the only one where the worker sees its
-// signal, and on a thread the only one that can need a forced stop. These
+// and settled once its attempt stops: 4. in a thread's start-up queue, 5.
+// inline, before run(), 6. inside run() - the only one where the worker sees
+// its signal, and on a thread the only one that can need a forced stop. There
+// used to be a seventh, on its way to a new thread while enqueueNoQueue awaited
+// it; the task now reaches the thread in the same turn. These
 // tests pin each, the events a listener can cancel from mid-transition, the
 // forced stop, and the counters. The counter check is exact - queued + running + done + failed +
 // cancelled + blocked equals the tasks added - because the counters are clamped
@@ -82,7 +83,7 @@ class CancellationTestSuite {
     this.results.push(await this.runTest('scheduler.completed Without A Success', () => this.testCompletion()));
     this.results.push(await this.runTest('Spawns From A Cancelled Task Are Refused', () => this.testSpawnRefused()));
     this.results.push(await this.runTest('onCompleteDescendants Rejects For A Cancelled Root', () => this.testDescendants()));
-    this.results.push(await this.runTest('Cancelled Before Reaching A New Thread', () => this.testBeforeThread()));
+    this.results.push(await this.runTest('Cancelled In The Same Turn As Its Dispatch To A New Thread', () => this.testBeforeThread()));
     this.results.push(await this.runTest('Cancelled While Its Thread Initialises', () => this.testThreadInitialising()));
     this.results.push(await this.runTest('Cancelled Before An Inline run()', () => this.testBeforeInlineRun()));
     this.results.push(await this.runTest('Cooperative Cancel: The Worker Sees The Signal', () => this.testCooperative()));
@@ -560,11 +561,12 @@ class CancellationTestSuite {
   }
 
 
-  // --- places 4-7: dispatched ------------------------------------------------
+  // --- places 4-6: dispatched ------------------------------------------------
 
-  // Place 4. addTask runs the dispatch synchronously, and on a threaded pool
-  // with no worker yet, enqueueNoQueue awaits the new thread before calling
-  // runTask - so a cancel in the same turn lands in between
+  // Place 4, at the earliest moment. addTask runs the dispatch synchronously,
+  // and on a threaded pool with no worker yet the task is in the new thread's
+  // start-up queue before addTask returns - there is no moment in between for
+  // a cancel to land in
   private async testBeforeThread(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
     const { pool, scheduler } = this.make({ inline: false, groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
@@ -577,7 +579,10 @@ class CancellationTestSuite {
 
     const task = this.task('p4');
     const promise = scheduler.addTask(task, { createPromise: true });
-    if (!(pool as any).enqueuing.has('p4')) throw new Error('Precondition: not between dispatch and its thread');
+    const wrapper = pool.threads[0] as any;
+    if (!wrapper || !wrapper.taskQueue.some((t: any) => t.taskId === 'p4')) {
+      throw new Error("Not in a new thread's start-up queue in the turn it was dispatched");
+    }
     if (await this.within(scheduler.cancel('p4'), 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
 
     if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error('Promise did not reject with CancelledError');
@@ -588,7 +593,7 @@ class CancellationTestSuite {
     this.assertAccounted(scheduler, 1, 'end');
   }
 
-  // Place 5. Handed to a fresh thread, waiting in its queue for it to initialise
+  // Place 4. Handed to a fresh thread, waiting in its queue for it to initialise
   private async testThreadInitialising(): Promise<void> {
     const { pool, scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
     const { log } = this.progress(scheduler);
@@ -610,7 +615,7 @@ class CancellationTestSuite {
     this.assertAccounted(scheduler, 1, 'end');
   }
 
-  // Place 6. On an inline pool the task is running from the start of runTask,
+  // Place 5. On an inline pool the task is running from the start of runTask,
   // before the worker instance exists
   private async testBeforeInlineRun(): Promise<void> {
     const { pool, scheduler } = this.make({}, {}, this.cancelWorkerUrl);
@@ -634,7 +639,7 @@ class CancellationTestSuite {
     this.assertAccounted(scheduler, 2, 'end');
   }
 
-  // Place 7, on both pool types: a worker honouring the signal stops at once
+  // Place 6, on both pool types: a worker honouring the signal stops at once
   private async testCooperative(): Promise<void> {
     for (const inline of [true, false]) {
       const kind = inline ? 'inline' : 'threaded';

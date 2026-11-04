@@ -162,25 +162,6 @@ instead, with a docs test; change the docs tests that count from events.
 
 **Status**: 🔵 Not Started
 
-#### 🔵 A burst onto a threaded pool bounces one task per new worker
-A new thread takes its first task a microtask after `enqueueNoQueue` creates it
-(the threaded branch awaits before `runTask`), so for that microtask the
-thread still shows a free slot. The next task in the same dispatch loop takes
-it, and the first task finds the thread full, is put back with its groups
-released, and is retried after the 10 ms capacity-race backoff. Measured with
-300 ms tasks and the heartbeat off: 4 threads x 1 slot gave 3 extra
-acquire/release pairs, 8 x 1 gave 7, and start times spread 30-60 ms. Each
-bounce is a `resource.acquired`/`resource.released` pair a consumer sees.
-
-The suspected cause - a new worker counted twice, in `threads` and
-`initializingThreads`, serialising start-ups - is not one: the overlap lasts the
-same microtask, and a task added during a start-up creates its own worker
-straight away. Likely fix: hand a fresh thread its task synchronously, as the
-inline branch does (a prototype closes the known gap). Known gap: "A Burst Onto
-An Empty Threaded Pool Dispatches Each Task Once" in the admission suite.
-
-**Status**: 🔵 Not Started
-
 #### 🔵 Admission follow-ups from R2
 - The wake pump's re-entrancy guard (`waking`) is not caught by any test:
   removing it fails nothing, because no path found nests a wake (settles arrive
@@ -418,6 +399,7 @@ another day does not.
 The following tasks have been completed and verified:
 
 ### ✅ Recently Completed (2026)
+- **A burst onto a threaded pool no longer bounces off new workers** - a new thread took its first task a microtask after `enqueueNoQueue` created it, so for that microtask its slot showed free; the next task in the same dispatch loop took it, and the first was put back, its groups released, and retried after the 10 ms capacity-race backoff. One bounce per new worker: 3 extra `resource.acquired`/`released` pairs for 4 threads, 7 for 8, start times spread 30-60 ms. A fresh thread now takes its task in the same turn, as an inline one always did, which leaves nothing that awaits between dispatch and the thread: the polling wait, the pool's `enqueuing` map and `initializingThreads` are gone, and the cancellation suite's "on its way to a new thread" place with them (six places now, not seven). Measured on the same bursts: no extra acquires, the last task starts as early or earlier (8 x 1: 88-119 ms against 110-131 ms), start times 3-6 ms apart rather than 10-80, the first can start later since every worker now starts at once; `benchmark:quick` threaded scenarios unchanged run alone (2.37 s against 2.38 s). Investigated as a suspected double count of initialising workers (`threads` + `initializingThreads`) serialising start-ups, which it is not - start-ups overlap. Test: "A Burst Onto An Empty Threaded Pool Dispatches Each Task Once" (admission).
 - **A worker becoming ready now dispatches** - tasks that arrived while a pool's only worker was starting found no free slot and no room for another worker, and the worker becoming ready ran no dispatch, so they waited for the next settle or the heartbeat: with `maxThreads: 1, maxConcurrentTasks: 8` the second task waited out the whole first task. Inline pools did the same. The scheduler now runs its dispatch loop a microtask after `worker.initialization.completed`. Two heartbeat-off tests in the admission suite (threaded and inline), both failing without the fix. Found during admission R2; R1 and earlier behaved the same.
 - **A browser performance spec no longer asserts a timing order** - "should measure Web Worker vs inline performance" required the Web Worker run to be the slower one, a race that failed once on WebKit in a full run. The overhead is now reported as a test annotation, and the spec shuts its two schedulers down, which it never did.
 - **Cancel a task, queued or running (fyflow-app #1)** - `scheduler.cancel()` reaches all seven places a task can be: waiting tasks are removed at once, running ones see `context.signal`, and a threaded worker that ignores it is retired after `cancelGraceMs` (default 2000) - detached before teardown, co-tenants requeued, settled `forced` only once the thread is dead, not counted as a restart. Cancel wins over any late outcome; `task.cancelling` then `task.cancelled`, with resources released at the second. Built in four stages with 33 tests in a new `cancellation` suite, 4 docs tests and a three-engine browser spec; 49 mutations checked. Cancelling 50,000 tasks takes 30-40 ms. Found and fixed on the way: `scheduler.completed` never fired for a run with no successes; a threaded `run()` returning `null` or `undefined` crashed the host; "is any task blocked?" walked every blocked queue (1.8 s to cancel 50,000 tasks over 5,000 keys, now 29 ms via a live count kept by `TaskQueue`). Benchmark against `main`: 50K +0.5%, 100K -5.1% (inside the band), threaded within ±3%.
