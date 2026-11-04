@@ -144,6 +144,9 @@ class AdmissionTestSuite {
     await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF));
     await this.run('Wake: A Waiter For A New Worker Takes A Slot Freed On One Its Pool Has', () => this.testResidentWaiterTakesFreeSlot(false));
     await this.run('Wake: A Waiter For A New Worker Takes A Free Slot From Behind Another Pool\'s Head', () => this.testResidentWaiterTakesFreeSlot(true));
+    await this.run('Wake: A Pool Backing Off A Capacity Race Keeps Its Resident Waiters Queued', () => this.testResidentRoomDuringBackoff());
+    await this.run('Head-Of-Line: A Waiter Woken From A Task-Held Queue Joins The Back Of The Resident Queue', () => this.testWokenWaiterBehindResident());
+    await this.run('A Group Throwing At Dispatch Fails That Task, Not The Scheduler', () => this.testGroupThrowsAtDispatch());
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (threaded)', () => this.testWakeOnWorkerReady(true));
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (inline)', () => this.testWakeOnWorkerReady(false));
     await this.run('A Burst Onto An Empty Threaded Pool Dispatches Each Task Once', () => this.testBurstNoBounce());
@@ -556,6 +559,104 @@ class AdmissionTestSuite {
       const left = (s.getAdmissionQueue('gpu').gpu ?? []).map(w => w.holderId).join(',');
       if (left !== 'b1') throw new Error(`B should still be waiting alone, queue "${left}"`);
     }
+  }
+
+  /**
+   * A pool backing off a capacity race reports no room, so a waiter admitted
+   * meanwhile only parks in its ready queue. One may; the rest keep their
+   * places in the resident queue. The free-slot admission used to drain the
+   * whole queue into the ready queue, one parked waiter after another.
+   */
+  private async testResidentRoomDuringBackoff() {
+    const gpu = new ConcurrentLimitGroup(1, 'gpu');
+    const pool = this.pool({ maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 0 });
+    const s = this.track(new FyflowScheduler({ A: pool }, { gpu }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const freed = this.when(s, 'task.completed', d => d?.id === 'a1');
+    const all = ['a1', 'a2', 'a3', 'a4'].map((id, i) =>
+      s.addTask(this.task(id, { workerType: 'A' }, i === 0 ? 30 : 5), { createPromise: true }) as Promise<any>);
+    const queue = () => (s.getAdmissionQueue('gpu').gpu ?? []).map(w => w.holderId).join(',');
+    if (queue() !== 'a2,a3,a4') throw new Error(`precondition: the resident queue is "${queue()}"`);
+
+    // The state a capacity race leaves the pool in, until its retry timer
+    (pool as any)._capacityRaceBackoff = true;
+    await freed;
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const during = queue();
+    (pool as any)._capacityRaceBackoff = false;
+    (s as any)._dispatchLoop();
+    await Promise.all(all);
+    if (during !== 'a3,a4') throw new Error(`during the backoff the resident queue went to "${during}", expected "a3,a4"`);
+  }
+
+  /**
+   * Head-of-line on resident groups holds for a waiter woken from a task-held
+   * queue too. It waited its turn for the CPU, not for the GPU, so it queues
+   * behind the pool already waiting for a worker. Exempting every woken
+   * waiter let cheap tasks cycling through a CPU queue take the units an
+   * expensive pool was waiting for.
+   */
+  private async testWokenWaiterBehindResident() {
+    const gpu = new ConcurrentLimitGroup(2, 'gpu');
+    const cpu = new ConcurrentLimitGroup(1, 'cpu');
+    const cheap = this.pool({ maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 0 });
+    const expensive = this.pool({ maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 2 }, idleTimeout: 0 });
+    const plain = this.pool({ maxThreads: 1, maxConcurrentTasks: 1 });
+    const s = this.track(new FyflowScheduler(
+      { C: cheap, E: expensive, P: plain }, { gpu, cpu }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const cpuFreed = this.when(s, 'task.completed', d => d?.id === 'p1');
+    // C's first worker, busy with work that needs no CPU: one GPU unit left
+    s.addTask(this.task('c1', { workerType: 'C' }, 300));
+    s.addTask(this.task('p1', { workerType: 'P', workerGroups: ['cpu'] }, 30));
+    // Waits for the CPU, then for a second C worker
+    s.addTask(this.task('c2', { workerType: 'C', workerGroups: ['cpu'] }, 5));
+    // Waits for a worker of cost 2: the GPU queue's head
+    s.addTask(this.task('e1', { workerType: 'E' }, 5));
+    const gpuQueue = () => (s.getAdmissionQueue('gpu').gpu ?? []).map(w => w.holderId).join(',');
+    const cpuQueue = () => (s.getAdmissionQueue('cpu').cpu ?? []).map(w => w.holderId).join(',');
+    if (gpuQueue() !== 'e1' || cpuQueue() !== 'c2') {
+      throw new Error(`precondition: gpu "${gpuQueue()}", cpu "${cpuQueue()}"`);
+    }
+    let c2Started = false;
+    s.addEventListener('task.running', (e: any) => { if (e.detail.id === 'c2') c2Started = true; });
+
+    await cpuFreed;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    if (c2Started || gpuQueue() !== 'e1,c2') {
+      throw new Error(`c2 ${c2Started ? 'started a worker on the unit e1 waits for' : 'is not queued'}; gpu queue "${gpuQueue()}"`);
+    }
+  }
+
+  /**
+   * A group callback that answers badly after `addTask` - here `limitFor`,
+   * read when a key becomes active - throws inside the dispatch loop, with
+   * the task already out of its queue. That task fails, with the group's
+   * error; it used to be dropped, never settling, and the throw escaped into
+   * whatever had triggered the loop.
+   */
+  private async testGroupThrowsAtDispatch() {
+    let bad = false;
+    const disk = new KeyedConcurrentLimitGroup(1, {
+      id: 'disk', keyFrom: (t: any) => t.payload.drive, limitFor: () => (bad ? 0 : 1)
+    });
+    const pool = this.pool({ maxThreads: 1, maxConcurrentTasks: 1, groups: ['disk'] });
+    const s = this.track(new FyflowScheduler({ W: pool }, { disk }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const task = (id: string, drive: string, delay: number) =>
+      new FyflowTask({ id, workerType: 'W', payload: { taskId: id, delay, drive } });
+    const a = s.addTask(task('a', 'C:', 30), { createPromise: true }) as Promise<any>;
+    // Validated at addTask, then waits for the pool's only slot
+    const b = s.addTask(task('b', 'D:', 5), { createPromise: true }) as Promise<any>;
+    bad = true;
+    const settled = (p: Promise<any>) => Promise.race([
+      p.then(() => 'completed', (e: any) => `failed: ${e?.message ?? e}`),
+      new Promise(resolve => setTimeout(() => resolve('never settled'), 1000))
+    ]);
+    const [ra, rb] = await Promise.all([settled(a), settled(b)]);
+    if (ra !== 'completed') throw new Error(`a: ${ra}`);
+    if (!String(rb).startsWith('failed') || !String(rb).includes('limitFor')) throw new Error(`b: ${rb}`);
+    const stats = s.stats;
+    if (stats.queued !== 0 || stats.running !== 0) throw new Error(`stats ${JSON.stringify(stats)}`);
+    if (disk.getActiveKeys().length !== 0) throw new Error(`keys still held: ${disk.getActiveKeys()}`);
   }
 
   private async testWakeOnRateWindow(heartbeatMs: number) {

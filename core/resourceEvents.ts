@@ -72,6 +72,13 @@ export type ResourceUnblockReason =
    * happen silently.
    */
   | 'orphaned'
+  /**
+   * One of its groups threw while it was being admitted - a `limitFor`,
+   * `keyFrom` or `requestFrom` answering badly after `addTask`, or a custom
+   * group's `canRun`. Failed terminally, as for `orphaned`, with the group's
+   * error as `cause`: the same answer would fail every attempt.
+   */
+  | 'failed'
   /** The task was cancelled while it waited. `task.cancelled` follows. */
   | 'cancelled'
   /** The scheduler is tearing down and discarded every waiter. */

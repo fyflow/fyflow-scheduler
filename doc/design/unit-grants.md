@@ -20,6 +20,9 @@
 >   queue whose head blocked first, until no head fits.
 > - Measured: 12 `canRun`, 1 blocked and 1 unblocked per task with 30% pinned,
 >   flat from 10K to 200K tasks (the admission suite asserts it).
+> - Grants are opt-in, `grants: true` on the group, not "any return value":
+>   an existing group's `async onStart` returns a Promise, which would fail
+>   every task through it. Changed after the PR #1 review.
 >
 > Decisions made building phase 1, against the open questions below:
 > - A task's `context.grants` **does** include its worker's resident grants,
@@ -182,7 +185,7 @@ that it does not reintroduce the scaling problems found in
 ```typescript
 interface ResourceGroup {
   canRun(key?: string, cost?: number, request?: unknown): boolean;
-  onStart?(key?: string, cost?: number, request?: unknown): unknown;  // was void; a return value is the grant
+  onStart?(key?: string, cost?: number, request?: unknown): unknown;  // was void; a grant, if the group sets grants: true
   onFinish?(key?: string, cost?: number, grant?: unknown): void;
 }
 ```

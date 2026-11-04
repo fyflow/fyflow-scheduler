@@ -502,8 +502,10 @@ Admission is **head-of-line**: a waiting expensive pool is not overtaken by
 cheaper ones. That holds for new arrivals too - a task that would need a new
 worker queues behind anyone already waiting on one of that pool's resident
 groups, **even when its own cost fits**. Without that, a steady stream of cheap
-arrivals keeps an expensive waiter out forever. A task for a pool whose worker
-already exists costs nothing extra and is not affected.
+arrivals keeps an expensive waiter out forever. A task that has just waited for
+another group, a CPU limit say, counts as an arrival here: it waited for that
+group, not for a worker. A task for a pool whose worker already exists costs
+nothing extra and is not affected.
 
 Costs must be positive integers and no larger than the group's limit; both are
 rejected at construction, as is an unknown group id, and a
@@ -799,17 +801,23 @@ new WorkerManager(modelUrl, { maxThreads: 2, residentGroups: { gpu: { cost: 1, f
 
 ##### A custom group can grant too
 
-Any group's `onStart` may return a value - a **grant** - and the scheduler
-carries it to the work, under the group's id. Returning nothing grants nothing,
-which is every group written before grants existed:
+A group that sets `grants: true` grants what its `onStart` returns, and the
+scheduler carries it to the work, under the group's id. Returning nothing
+grants nothing:
 
 ```typescript
 interface ResourceGroup {
+  readonly grants?: boolean;                                            // true: onStart's return value is a grant
   canRun(key?: string, cost?: number, request?: unknown): boolean;
-  onStart?(key?: string, cost?: number, request?: unknown): unknown;   // a return value is the grant
+  onStart?(key?: string, cost?: number, request?: unknown): unknown;
   onFinish?(key?: string, cost?: number, grant?: unknown): void;
 }
 ```
+
+- **Opt-in.** Without `grants: true` the return value is ignored and
+  `onFinish` gets `undefined`, as before grants existed - so a group written
+  then keeps working whatever its `onStart` returns, an `async onStart`'s
+  Promise included. `UnitGroup` sets it
 
 - `onFinish` gets **the original**, the very object `onStart` returned, so a
   group can use identity. The work and the events get a copy
@@ -1102,7 +1110,7 @@ resident acquire twice and see conservation drift by exactly the resident share.
 > not.
 
 A blocked task is in **exactly one** queue at a time: the queue of the group
-it is short of. **It leaves that queue six ways**, and `unblocked.reason` says
+it is short of. **It leaves that queue seven ways**, and `unblocked.reason` says
 which:
 
 | `reason` | What happened |
@@ -1111,11 +1119,12 @@ which:
 | `migrated` | This group (or key) freed up, but another group it needs - or another key of the same group, for a task naming several - is still full. It moves to the **tail** of that queue. The `resource.blocked` for the new queue comes **before** this event, so a fold never sees the task in no queue |
 | `superseded` | No longer emitted: it came from a task listed in two queues at once, which cannot happen any more. Kept in the type so code that names it still compiles |
 | `orphaned` | Its worker pool no longer exists. The task is **failed terminally** — `task.failed`, then `user_action` unless it is optional, and its promise rejects. Retries are skipped: the pool is gone |
+| `failed` | One of its groups threw while it was being admitted — a `limitFor`, `keyFrom` or `requestFrom` answering badly after `addTask`, or a custom group's `canRun`. **Failed terminally**, as for `orphaned`, with the group's error as `cause`: the same answer would fail every attempt. A task the dispatch loop was about to start fails the same way, with no `unblocked`, since it was in no queue |
 | `shutdown` | The scheduler tore down and discarded every remaining waiter |
 | `cancelled` | It was cancelled while it waited (§5) |
 
-**Do not switch exhaustively on `reason`.** `cancelled` and `migrated` were
-added later, and the union may grow again - the same rule as for `groupType`.
+**Do not switch exhaustively on `reason`.** `cancelled`, `migrated` and
+`failed` were added later, and the union may grow again - the same rule as for `groupType`.
 Treat a reason you do not recognise as an exit.
 
 Two invariants worth folding against, because a fold can stay internally

@@ -1221,7 +1221,7 @@ class DocsTestSuite {
     const issued: object[] = [];
     let sameBack = 0;
     const seats = {
-      id: 'seat', type: 'seat', running: 0,
+      id: 'seat', type: 'seat', running: 0, grants: true,
       canRun() { return true; },
       onStart() { const g = { seat: issued.length }; issued.push(g); return g; },
       onFinish(_k?: string, _c?: number, grant?: unknown) { if (issued.includes(grant as object)) sameBack++; },
@@ -1234,6 +1234,24 @@ class DocsTestSuite {
     }), { createPromise: true }) as any;
     if ((r.grants.seat as any)?.seat !== 0) throw new Error(`The custom grant did not arrive: ${JSON.stringify(r.grants)}`);
     if (sameBack !== 1) throw new Error('onFinish did not get the original grant back');
+
+    // Opt-in: without `grants: true` the return value is ignored - an async
+    // onStart's Promise too - and onFinish gets undefined
+    const backAsLegacy: unknown[] = [];
+    const legacy = {
+      id: 'legacy', type: 'legacy', running: 0,
+      canRun() { return true; },
+      async onStart() { /* returns a Promise */ },
+      onFinish(_k?: string, _c?: number, grant?: unknown) { backAsLegacy.push(grant); },
+      getMetrics() { return { limit: 1, running: 0, available: 1, utilization: 0 }; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; }
+    };
+    const plain = this.makeScheduler({ groups: ['legacy'] }, { legacy });
+    const l = await plain.addTask(new FyflowTask({
+      id: 'l', workerType: 'DocsWorker', payload: { value: 1, reportGrants: true }
+    }), { createPromise: true }) as any;
+    if ('legacy' in l.grants) throw new Error(`A group without grants: true granted ${JSON.stringify(l.grants)}`);
+    if (backAsLegacy.length !== 1 || backAsLegacy[0] !== undefined) throw new Error('onFinish got a grant from a group that does not grant');
   }
 
   // RECIPE: AGENTS.md section 5, "Asking for particular units" - the snippet

@@ -26,6 +26,7 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 /** A custom group that grants an object, and checks it gets the same one back. */
 class TokenGroup extends EventTarget {
   readonly type = 'token';
+  readonly grants = true;
   running = 0;
   issued: object[] = [];
   returnedSame = 0;
@@ -50,6 +51,7 @@ class TokenGroup extends EventTarget {
 class KeyedTokenGroup extends EventTarget {
   readonly type = 'keyed-token';
   readonly keyed = true;
+  readonly grants = true;
   running = 0;
   n = 0;
   constructor(readonly id: string) { super(); }
@@ -113,6 +115,8 @@ class GrantsTestSuite {
     this.results.push(await this.runTest('A Retry Is Granted Afresh', () => this.testRetry()));
     this.results.push(await this.runTest('restartWorker Gives The Replacement Its Own Grant', () => this.testRestart()));
     this.results.push(await this.runTest('A Custom Group\'s Grant Reaches run() And Returns To onFinish', () => this.testCustomGroup()));
+    this.results.push(await this.runTest('A Group That Does Not Opt In Grants Nothing, Whatever onStart Returns', () => this.testNoOptIn()));
+    this.results.push(await this.runTest('A Worker Created From A task.running Listener Keeps Its Own Units', () => this.testResidentReentry()));
     this.results.push(await this.runTest('A Keyed Group\'s Grants Are Per Key', () => this.testKeyedShape()));
     this.results.push(await this.runTest('A Grant That Cannot Be Copied Fails The Task And Frees The Units', () => this.testUncloneable()));
     this.results.push(await this.runTest('A Forced Stop Frees The Unit Only Once The Thread Is Dead', () => this.testForcedStop()));
@@ -127,6 +131,7 @@ class GrantsTestSuite {
     this.results.push(await this.runTest('Requests: A Resident Pool Takes Its Units From Its Set', () => this.testResidentFrom()));
     this.results.push(await this.runTest('Requests: A Pool Pinned To A Busy Unit Does Not Block One Wanting A Free One', () => this.testResidentDisjointSets()));
     this.results.push(await this.runTest('Requests: A Pool With More Threads Than Cards Runs On The Cards It Has', () => this.testMoreThreadsThanCards()));
+    this.results.push(await this.runTest('Requests: One Release Admits One Waiter Into A Full Pool', () => this.testSweepParksOne()));
     this.results.push(await this.runTest('Requests: Bad Requests Throw Up Front', () => this.testRequestValidation()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -672,6 +677,38 @@ class GrantsTestSuite {
   }
 
   /**
+   * One unit freed, and the pool its waiters run on is full: one waiter is
+   * admitted, to wait in the ready queue for a slot, and the rest keep their
+   * places. A parked waiter holds nothing, so it counts against what the
+   * release freed - across every round of the sweep. Each round used to start
+   * that count at 0, so one release moved every waiter into the ready queue.
+   */
+  private async testSweepParksOne(): Promise<void> {
+    const gpu = new UnitGroup(['g0', 'g1'], { id: 'gpu' });
+    const options = { inline: true, maxThreads: 2, maxConcurrentTasks: 1, idleTimeout: 0 };
+    const holders = new WorkerManager(this.workerUrl, options);
+    const full = new WorkerManager(this.workerUrl, options);
+    this.pools.push(holders, full);
+    const scheduler = new FyflowScheduler({ H: holders, F: full }, { gpu }, GrantsTestSuite.NO_HEARTBEAT);
+    this.schedulers.push(scheduler);
+    const onGpu = { workerGroups: ['gpu'] };
+    const h1 = this.succeed(scheduler, new FyflowTask({ id: 'h1', workerType: 'H', payload: { holdMs: 40 }, ...onGpu }));
+    const h2 = this.succeed(scheduler, new FyflowTask({ id: 'h2', workerType: 'H', payload: { holdMs: 300 }, ...onGpu }));
+    const waiters = [0, 1, 2, 3].map(i =>
+      this.succeed(scheduler, new FyflowTask({ id: `w${i}`, workerType: 'F', payload: {}, ...onGpu })));
+    // F's slots fill with work that needs no unit
+    const busy = [0, 1].map(i =>
+      this.succeed(scheduler, new FyflowTask({ id: `b${i}`, workerType: 'F', payload: { holdMs: 150 } })));
+    const queued = () => (scheduler.getAdmissionQueue('gpu').gpu ?? []).map(w => w.holderId).join(',');
+    if (queued() !== 'w0,w1,w2,w3') throw new Error(`precondition: the queue is "${queued()}"`);
+    await h1;
+    await sleep(5);
+    const after = queued();
+    await Promise.all([h2, ...waiters, ...busy]);
+    if (after !== 'w1,w2,w3') throw new Error(`one release left the queue "${after}", expected "w1,w2,w3"`);
+  }
+
+  /**
    * A pool allowed three workers but only two cards: two workers, on the two
    * cards, and every task runs on one of them. The third worker can never be
    * created, so the tasks waiting for it take the first free slot instead.
@@ -694,6 +731,68 @@ class GrantsTestSuite {
       if (pool.threads.length !== 2) throw new Error(`${kindOf(inline)}: ${pool.threads.length} workers`);
       if (gpu.isBusy('g2')) throw new Error(`${kindOf(inline)}: g2 was taken`);
       await scheduler.shutdown();
+    }
+  }
+
+  /**
+   * A group that does not set `grants: true` grants nothing, whatever its
+   * onStart returns - an `async onStart` returns a Promise, which cannot be
+   * copied. It used to be taken for a grant, so every task through such a
+   * group failed, and a resident one created no worker at all.
+   */
+  private async testNoOptIn(): Promise<void> {
+    for (const inline of KINDS) {
+      const returned: unknown[] = [];
+      const legacy = (id: string) => ({
+        id, type: 'legacy', running: 0, finishedWith: [] as unknown[],
+        canRun() { return true; },
+        async onStart() { /* written before grants: returns a Promise */ },
+        onFinish(_k?: string, _c?: number, grant?: unknown) { returned.push(grant); },
+        getMetrics() { return { limit: 1, running: 0, available: 1, utilization: 0 }; },
+        addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; }
+      });
+      const { scheduler } = this.setup(inline, { legacy: legacy('legacy'), resident: legacy('resident') }, {
+        groups: ['legacy'], residentGroups: { resident: 1 }
+      });
+      const r = await this.succeed(scheduler, this.task('t'));
+      if (!same(r.task, {}) || !same(r.ctor, {})) {
+        throw new Error(`${kindOf(inline)}: granted ${JSON.stringify(r.task)}, resident ${JSON.stringify(r.ctor)}`);
+      }
+      await scheduler.shutdown();
+      // onFinish gets what was granted - nothing - as before grants existed
+      if (returned.length !== 2 || returned.some(g => g !== undefined)) {
+        throw new Error(`${kindOf(inline)}: onFinish got ${returned.map(g => String(g)).join(', ')}`);
+      }
+    }
+  }
+
+  /**
+   * An inline worker announces its first task synchronously, before its
+   * resident units are bound to it, so a listener adding a task from
+   * `task.running` creates a second worker in between. Each keeps its own
+   * card. Binding the oldest pending holding instead swapped them: each worker
+   * was filed under the other's card, and freed it at teardown.
+   */
+  private async testResidentReentry(): Promise<void> {
+    const gpu = new UnitGroup(['g0', 'g1'], { id: 'gpu' });
+    const { pool, scheduler } = this.setup(true, { gpu }, {
+      maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }
+    });
+    let second: Promise<any> | undefined;
+    scheduler.addEventListener('task.running', (e: any) => {
+      if (e.detail.id === 'first' && !second) second = this.succeed(scheduler, this.task('second', { holdMs: 30 }));
+    });
+    const first = await this.succeed(scheduler, this.task('first', { holdMs: 30 }));
+    if (!second) throw new Error('precondition: task.running never fired for first');
+    const r2 = await second;
+    if (first.workerId === r2.workerId || same(first.ctor.gpu, r2.ctor.gpu)) {
+      throw new Error(`precondition: one worker per card, got ${JSON.stringify([first.ctor, r2.ctor])}`);
+    }
+    for (const r of [first, r2]) {
+      const filed = pool.getResidentGrants(r.workerId)?.gpu;
+      if (!same(filed, r.ctor.gpu)) {
+        throw new Error(`worker ${r.workerId} runs on ${JSON.stringify(r.ctor.gpu)} but is filed under ${JSON.stringify(filed)}`);
+      }
     }
   }
 

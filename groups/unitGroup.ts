@@ -68,6 +68,8 @@ export interface UnitGroupOptions {
 export class UnitGroup extends EventTarget implements ResourceGroup {
   readonly id: string;
   readonly type = 'unit' as const;
+  /** What `onStart` returns is a grant: the units, by name. */
+  readonly grants = true as const;
   /** Every unit, in the order lowest-index-first grants them. */
   readonly units: readonly UnitId[];
   /** `units.length`. */

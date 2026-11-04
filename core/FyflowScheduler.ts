@@ -177,9 +177,10 @@ export class FyflowTask {
     /** Which blocked queue, while `_queuedIn` is `blocked`. */
     _blockedQueueId?: string;
     /**
-     * Admitted from a blocked queue and not yet dispatched. It has waited its
-     * turn, so it is not held behind the resident queue again when it creates
-     * a worker - see {@link FyflowScheduler._checkAndBlockResident}.
+     * Admitted from a resident queue and not yet dispatched. It has waited its
+     * turn for a worker, so it is not held behind the resident queue again
+     * when it creates one - see {@link FyflowScheduler._checkAndBlockResident}.
+     * Not set for a waiter admitted from a task-held queue.
      */
     _admittedByWake?: boolean;
     /** The pending `cancel()` of a dispatched task, resolved when it settles. */
@@ -480,8 +481,11 @@ export class FyflowTask {
       // behind anyone already waiting on one of its resident groups, even when
       // its own cost fits. Admitting it would let a stream of cheap arrivals
       // keep an expensive waiter out forever - which used to happen, because
-      // only the retry path applied the rule. A task admitted from a queue has
-      // already waited its turn and is not sent back.
+      // only the retry path applied the rule. A task admitted from a resident
+      // queue has already waited its turn and is not sent back. One woken
+      // from a task-held queue waited for that group, not for these, so it
+      // queues here like any arrival: exempted, cheap tasks cycling through a
+      // CPU queue took the units an expensive pool was waiting for.
       const fits = pool.canHoldAnotherWorker?.() !== false;
       const behind = task._admittedByWake
         ? undefined
@@ -617,7 +621,10 @@ export class FyflowTask {
             const [task, seq] = waits.entries().next().value!;
             waits.delete(task);
             if (task._queuedIn !== 'blocked' || task._blockedSeq !== seq) continue;
-            this._admitOutOfTurn(task, pool);
+            // Parked: the slot was not its to take after all - the pool is
+            // backing off a capacity race. The rest keep their places rather
+            // than all parking in the ready queue behind it.
+            if (this._admitOutOfTurn(task, pool)) break;
           }
           if (waits.size === 0) this._residentWaits.delete(workerType);
         }
@@ -626,15 +633,26 @@ export class FyflowTask {
       }
     }
 
-    /** Take a resident waiter out of its queue, wherever it is, and admit or move it. */
-    private _admitOutOfTurn(task: FyflowTask, pool: any): void {
+    /**
+     * Take a resident waiter out of its queue, wherever it is, and admit or move it.
+     *
+     * @returns true if it was admitted but parked, for want of a free slot.
+     */
+    private _admitOutOfTurn(task: FyflowTask, pool: any): boolean {
       const queueId = task._blockedQueueId!;
       const queue = this.blockedQueues.get(queueId);
-      if (!queue) return;
+      if (!queue) return false;
       const { groupId } = this._splitQueueId(queueId);
       const group = this.groups[groupId];
       // Another of its holds full: wait there, where a release can admit it
-      const refusing = this._holdsFor(task, pool).find(hold => !hold.group.canRun(hold.key, 1, hold.request));
+      let refusing: Hold | undefined;
+      let error: unknown;
+      try {
+        refusing = this._holdsFor(task, pool).find(hold => !hold.group.canRun(hold.key, 1, hold.request));
+      } catch (e) {
+        error = e ?? new Error('a resource group threw');
+      }
+      let parked = false;
       if (refusing) {
         this._migrate(task, pool, queue, groupId, undefined, refusing);
       } else {
@@ -642,9 +660,16 @@ export class FyflowTask {
         // queue, where a tombstone would hide it
         if (queue.at(0) === task) queue.shift();
         else queue.remove(task);
-        this._admitWaiter(task, pool, group, groupId, undefined);
+        if (error !== undefined) {
+          task._queuedIn = undefined;
+          task._blockedQueueId = undefined;
+        } else {
+          parked = this._admitWaiter(task, pool, group, groupId, undefined, true);
+        }
       }
       this._dropBlockedQueueIfEmpty(queueId);
+      if (error !== undefined) this._failUndispatched(task, FyflowScheduler._groupError(task, error), queueId, 'failed');
+      return parked;
     }
 
     /**
@@ -1026,8 +1051,10 @@ export class FyflowTask {
           const task = queue.shift()!;
           task._queuedIn = undefined;
 
-          // Check if we can dispatch this task
-          const canDispatchResult = this._canDispatchTask(task, pool);
+          // Check if we can dispatch this task. Undefined: a group threw, and
+          // the task has failed.
+          const canDispatchResult = this._tryCanDispatch(task, pool);
+          if (canDispatchResult === undefined) continue;
           if (canDispatchResult === true) {
             // Dispatch the task (synchronous dispatch, async execution)
             this._dispatchTask(task, pool);
@@ -1141,6 +1168,37 @@ export class FyflowTask {
       return pool.threads.length < pool.maxThreads;
     }
 
+    /**
+     * {@link _canDispatchTask}, for a task already out of the ready queue and
+     * still counted in `queued`. The checks call into the task's groups, whose
+     * callbacks can throw: `keyFrom` or `requestFrom` on a retry, which
+     * resolves them afresh, or `limitFor` for a key that has gone idle since
+     * `addTask`. That fails the task, terminally - the same answer would fail
+     * every attempt - where it used to escape the dispatch loop, with the task
+     * in no queue: it never settled, and the throw reached whatever had
+     * started the loop, a settle or a timer.
+     *
+     * @returns undefined once the task has been failed.
+     */
+    private _tryCanDispatch(task: FyflowTask, pool: any): boolean | 'blocked' | 'blocked-keyed' | undefined {
+      try {
+        return this._canDispatchTask(task, pool);
+      } catch (error) {
+        // Nothing has queued it: every check that blocks a task does so last
+        this.stats.queued = Math.max(0, this.stats.queued - 1);
+        this._failUndispatched(task, FyflowScheduler._groupError(task, error), undefined, 'failed');
+        return undefined;
+      }
+    }
+
+    /** The error a task fails with when one of its groups threw. */
+    private static _groupError(task: FyflowTask, error: unknown): Error {
+      const message = error instanceof Error ? error.message : String(error);
+      const wrapped = new Error(`A resource group threw while admitting task "${task.id}": ${message}`);
+      (wrapped as any).cause = error;
+      return wrapped;
+    }
+
     // NEW: Non-optimistic mode helper methods
     _canDispatchTask(task: FyflowTask, pool: any): boolean | 'blocked' | 'blocked-keyed' {
       // See the capacity race in _dispatchTask
@@ -1213,7 +1271,10 @@ export class FyflowTask {
       // group this one had checked but not yet taken, and both took it: a
       // concurrency group held more than its limit.
       for (const hold of holds) {
-        const grant = hold.group.onStart(hold.key, 1, hold.request);
+        const returned = hold.group.onStart(hold.key, 1, hold.request);
+        // Only a group that says it grants: one written before grants may
+        // return anything - an async onStart returns a Promise
+        const grant = hold.group.grants === true ? returned : undefined;
         if (grant !== undefined) {
           (task._grants ??= new Map()).set(FyflowScheduler._holdId(hold.id, hold.key), { raw: grant, copy: undefined });
         }
@@ -1773,6 +1834,10 @@ export class FyflowTask {
       // Each round admits or moves one waiter, or sets a queue aside, so this
       // bounds it whatever a listener does; it is never reached in practice
       let budget = 2 * this.blockedLive.live + candidates.length + 1;
+      // Waiters parked for want of a slot, across every round: each round is
+      // one wake of one queue, and a parked waiter holds nothing, so counted
+      // per round one release parked every waiter of a full pool
+      const sweep = { parked: 0 };
       while (budget-- > 0 && candidates.length > 0) {
         let oldest = -1;
         let oldestSeq = Infinity;
@@ -1785,15 +1850,19 @@ export class FyflowTask {
         }
         if (oldest === -1) return;
         // Its head cannot go: set aside for the rest of the sweep
-        if (this._wakeQueue(candidates[oldest], 1) === 0) candidates.splice(oldest, 1);
+        if (this._wakeQueue(candidates[oldest], 1, sweep) === 0) candidates.splice(oldest, 1);
       }
     }
 
     private wakePending = new Set<string>();
     private waking = false;
 
-    /** @returns how many waiters left the queue; at most `maxExits`. */
-    private _wakeQueue(queueId: string, maxExits = Infinity): number {
+    /**
+     * @param sweep carries the parked count between the rounds of a
+     *   {@link _sweepWaitSets}.
+     * @returns how many waiters left the queue; at most `maxExits`.
+     */
+    private _wakeQueue(queueId: string, maxExits = Infinity, sweep?: { parked: number }): number {
       const blockedTasks = this.blockedQueues.get(queueId);
       if (!blockedTasks || blockedTasks.length === 0) return 0;
 
@@ -1802,7 +1871,7 @@ export class FyflowTask {
       this.blockedInUse.set(queueId, (this.blockedInUse.get(queueId) ?? 0) + 1);
       try {
         const { groupId, key } = this._splitQueueId(queueId);
-        return this._admitFromQueue(queueId, groupId, blockedTasks, key, maxExits);
+        return this._admitFromQueue(queueId, groupId, blockedTasks, key, maxExits, sweep);
       } finally {
         const depth = this.blockedInUse.get(queueId)! - 1;
         if (depth > 0) this.blockedInUse.set(queueId, depth);
@@ -1828,7 +1897,8 @@ export class FyflowTask {
      * its event is emitted once it has landed.
      */
     private _admitFromQueue(
-      queueId: string, groupId: string, blockedTasks: TaskQueue<FyflowTask>, key?: string, maxExits = Infinity
+      queueId: string, groupId: string, blockedTasks: TaskQueue<FyflowTask>, key?: string, maxExits = Infinity,
+      sweep?: { parked: number }
     ): number {
       const group = this.groups[groupId];
       if (!group) return 0;
@@ -1838,13 +1908,15 @@ export class FyflowTask {
       // nothing yet, so they count against the capacity this wake hands out -
       // or a full pool would pull the whole queue into its ready queue. A
       // group that does not weigh `cost` (a rate group) cannot be asked for
-      // more than one, so at most one goes that way per wake.
-      let parked = 0;
+      // more than one, so at most one goes that way per wake - or per sweep.
+      let parked = sweep?.parked ?? 0;
       // Asked only once something has parked: most wakes never need it, and
       // a group with several wait sets is woken one queue at a time
       let weighsCost: boolean | undefined;
-      // Waiters whose pool has gone. Failed after the loop, never during it.
+      // Waiters whose pool has gone, or whose group threw. Failed after the
+      // loop, never during it.
       const orphaned: FyflowTask[] = [];
+      const failed: Array<{ task: FyflowTask; error: unknown }> = [];
 
       while (blockedTasks.length > 0 && exits < maxExits) {
         const task = blockedTasks.at(0)!;
@@ -1871,10 +1943,30 @@ export class FyflowTask {
         const residentWait = own === undefined;
         // What it asked of this group: its own request, or its pool's
         const request = residentWait ? pool.residentRequests?.[groupId] : own.request;
-        if (!group.canRun(key, parked + 1, request)) break;
+        // The groups are asked below, and a group's callbacks can throw - a
+        // limitFor answering badly for a key not active since addTask. That
+        // fails this waiter, not the release that woke it.
+        let canGo: boolean;
+        let workerShort: boolean;
+        let refusing: Hold | undefined;
+        try {
+          canGo = group.canRun(key, parked + 1, request);
+          workerShort = canGo && this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false;
+          refusing = canGo && !workerShort
+            ? holds.find(hold => hold !== own && !hold.group.canRun(hold.key, 1, hold.request))
+            : undefined;
+        } catch (error) {
+          blockedTasks.shift();
+          task._queuedIn = undefined;
+          task._blockedQueueId = undefined;
+          failed.push({ task, error });
+          exits++;
+          continue;
+        }
+        if (!canGo) break;
 
         // Its pool's per-worker cost does not fit.
-        if (this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false) {
+        if (workerShort) {
           // In a resident queue: stop. Head-of-line - nothing behind it may
           // overtake. Letting cheaper tasks through instead starves an
           // expensive pool indefinitely: a stream of 2-unit workers can keep a
@@ -1895,7 +1987,6 @@ export class FyflowTask {
         // this one: wait there instead. Its release is what can admit the task
         // now, and this queue's never could - a task left here waited for the
         // heartbeat.
-        const refusing = holds.find(hold => hold !== own && !hold.group.canRun(hold.key, 1, hold.request));
         if (refusing) {
           // Except out of a resident queue. Moved, it gives up its place at the
           // head; the pools behind it take the units it was waiting for, and
@@ -1912,12 +2003,14 @@ export class FyflowTask {
         // Exit (a): admitted
         blockedTasks.shift();
         exits++;
-        if (this._admitWaiter(task, pool, group, groupId, key)) parked++;
+        if (this._admitWaiter(task, pool, group, groupId, key, residentWait)) parked++;
       }
+      if (sweep) sweep.parked = parked;
 
       // Last, with the queue in its final shape, so a listener re-entering on
       // task.failed sees consistent state
       for (const task of orphaned) this._failOrphanedTask(task, queueId);
+      for (const { task, error } of failed) this._failUndispatched(task, FyflowScheduler._groupError(task, error), queueId, 'failed');
       return exits;
     }
 
@@ -1926,14 +2019,19 @@ export class FyflowTask {
      * queue first, so stats and `_queuedIn` are true while its event is out;
      * dispatched from there.
      *
+     * @param residentWait it waited in a resident queue - for a worker - so it
+     *   has had its turn there, and resident head-of-line does not send it to
+     *   the back again. One that waited for a task-held group has not.
      * @returns true if it was left in the ready queue for want of a free slot.
      */
-    private _admitWaiter(task: FyflowTask, pool: any, group: any, groupId: string, key: string | undefined): boolean {
+    private _admitWaiter(
+      task: FyflowTask, pool: any, group: any, groupId: string, key: string | undefined, residentWait: boolean
+    ): boolean {
       task._blockedQueueId = undefined;
       const workerQueue = this.readyQueuesByWorker.get(task.workerType)!;
       workerQueue.unshift(task);
       task._queuedIn = 'ready';
-      task._admittedByWake = true;
+      if (residentWait) task._admittedByWake = true;
       this.stats.queued++;
       if (this._resourceObserved) {
         this._emitResource('resource.unblocked', group, {
@@ -1952,7 +2050,8 @@ export class FyflowTask {
       if (task._queuedIn !== 'ready' || workerQueue.at(0) !== task) return false;
       workerQueue.shift();
       task._queuedIn = undefined;
-      const result = this._canDispatchTask(task, pool);
+      const result = this._tryCanDispatch(task, pool);
+      if (result === undefined) return false;
       if (result === true) {
         this._dispatchTask(task, pool);
       } else if (result === false) {
@@ -2042,6 +2141,21 @@ export class FyflowTask {
      * it was not, it was silent.
      */
     private _failOrphanedTask(task: FyflowTask, leftQueueId: string): void {
+      this._failUndispatched(task, new Error(
+        `Worker pool "${task.workerType}" no longer exists - task "${task.id}" ` +
+        `was waiting on a resource group and can never be dispatched`
+      ), leftQueueId, 'orphaned');
+    }
+
+    /**
+     * Fail, terminally, a task that is pending and in no queue: no retry, and
+     * not through `_settleTask`, for the reasons {@link _failOrphanedTask}
+     * gives. `leftQueueId` is the blocked queue it has just been taken out of,
+     * if any, whose exit is announced with `reason`.
+     */
+    private _failUndispatched(
+      task: FyflowTask, error: Error, leftQueueId: string | undefined, reason: 'orphaned' | 'failed'
+    ): void {
       // Guarded on the task having ended, not on `_settling`. That flag is per
       // attempt and stays set after a retry or requeue decision until the next
       // dispatch, so a waiter that had already failed once returned here
@@ -2050,21 +2164,16 @@ export class FyflowTask {
       if (this._isTerminal(task.state)) return;
       task._settling = true;
 
-      const error = new Error(
-        `Worker pool "${task.workerType}" no longer exists - task "${task.id}" ` +
-        `was waiting on a resource group and can never be dispatched`
-      );
-
       // Announce the exit it has already made, then leave no membership behind:
       // a queue still holding it would never drain in a consumer's fold
-      this._emitOrphanedExit(task, leftQueueId);
+      if (leftQueueId !== undefined) this._emitExit(task, leftQueueId, reason);
       const left: string[] = [];
       for (const [queueId, queue] of this.blockedQueues) {
         if (queue.remove(task)) left.push(queueId);
       }
       // Deleted before any event, and outside the iteration
       for (const queueId of left) this._dropBlockedQueueIfEmpty(queueId);
-      for (const queueId of left) this._emitOrphanedExit(task, queueId);
+      for (const queueId of left) this._emitExit(task, queueId, reason);
 
       task.error = error.message;
       task.endTime = Date.now();
@@ -2089,8 +2198,8 @@ export class FyflowTask {
       this._checkCompletion();
     }
 
-    /** One `orphaned` exit, for the queue named by `queueId`. */
-    private _emitOrphanedExit(task: FyflowTask, queueId: string): void {
+    /** One `orphaned` or `failed` exit, for the queue named by `queueId`. */
+    private _emitExit(task: FyflowTask, queueId: string, reason: 'orphaned' | 'failed'): void {
       if (!this._resourceObserved) return;
 
       const { groupId, key } = this._splitQueueId(queueId);
@@ -2101,7 +2210,7 @@ export class FyflowTask {
         holderId: task.id,
         workerType: task.workerType,
         key,
-        reason: 'orphaned'
+        reason
       });
     }
 

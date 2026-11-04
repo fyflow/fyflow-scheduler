@@ -79,6 +79,25 @@ Next:
   even when an existing worker of its pool had a free slot - with
   `idleTimeout: 0`, forever. Pre-existing, found building phase 2. It now
   takes the slot from wherever it is in the resident queue.
+- **Fixed, from the PR #1 review** (2026-11-04), each with a test that fails
+  without it:
+  - a worker created from a `task.running` listener swapped resident units
+    with the worker being created - bound by identity now;
+  - one release of a group with wait sets parked every waiter of a full
+    pool - the sweep's parked count now spans its rounds;
+  - a waiter woken from a task-held queue skipped resident head-of-line;
+  - a group callback throwing at dispatch (`limitFor`, `keyFrom`,
+    `requestFrom`) left the task in no queue, never settling - it fails,
+    terminally, `unblocked.reason` `failed`;
+  - the free-slot admission drained a pool's resident queue into its ready
+    queue during a capacity-race backoff;
+  - any `onStart` return value was a grant, so an `async onStart` failed
+    every task - grants are now opt-in, `grants: true`.
+- **Open, from the same review:** admission positions are per wait set with
+  nothing naming the set; a `{ cost }`-only object in `residentGroups` is
+  read as a request; `UnitGroup` caches a resolved request per object.
+  `onStart` throwing part-way through a task's acquires is not handled
+  (pre-existing).
 
 **Status**: 🟡 In Progress (phases 1 and 2 done)
 

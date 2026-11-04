@@ -453,8 +453,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   on a task, `residentGroups: { gpu: { from: ['gpu0', 'gpu1'] } }` on a pool,
   and `prefer` as a hint that never blocks. A pinned waiter holds up nobody, and
   a freed unit goes to the oldest waiter that can use it
-- `new UnitGroup(2)` names its units `0` and `1`. Any custom group can grant
-  too, by returning a value from `onStart` - see `AGENTS.md` §5
+- `new UnitGroup(2)` names its units `0` and `1`. A custom group can grant
+  too: set `grants: true` and return the grant from `onStart` - see `AGENTS.md` §5
 
 **Worker management** (on a `WorkerManager`)
 - `getWorkerIds()`: ids of the workers that currently exist (created lazily)

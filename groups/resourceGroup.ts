@@ -91,6 +91,15 @@ export interface ResourceGroup extends EventTarget {
   readonly keyed?: boolean;
 
   /**
+   * True when what `onStart` returns is a **grant** - see
+   * {@link ResourceGroup.onStart}. Opt-in, so a group written before grants
+   * keeps working whatever its `onStart` happens to return: an
+   * `async onStart` returns a Promise, which is not a grant and cannot be
+   * copied. `UnitGroup` sets it.
+   */
+  readonly grants?: boolean;
+
+  /**
    * Key this task belongs to, for keyed groups - or several, for a task that
    * needs more than one: a copy from C: to D: holds both disks. The task is
    * admitted only when every key has room, and holds one unit of each;
@@ -119,20 +128,21 @@ export interface ResourceGroup extends EventTarget {
    * scheduler commits to running a task, or to creating a worker that declares
    * the group in `residentGroups`.
    *
-   * A return value other than `undefined` is a **grant**: what the holder
-   * got, as opposed to how much - which card, which seat. The scheduler hands
-   * a copy to the work (`context.grants[groupId]` for a task,
-   * `workerContext.grants[groupId]` for a resident worker) and the original
-   * back to `onFinish`. It must survive `structuredClone`; one that does not
-   * fails the dispatch, and the units are released. A group returning
-   * nothing grants nothing, which is every group that predates grants.
+   * For a group that sets {@link ResourceGroup.grants}, a return value other
+   * than `undefined` is a **grant**: what the holder got, as opposed to how
+   * much - which card, which seat. The scheduler hands a copy to the work
+   * (`context.grants[groupId]` for a task, `workerContext.grants[groupId]` for
+   * a resident worker) and the original back to `onFinish`. It must survive
+   * `structuredClone`; one that does not fails the dispatch, and the units are
+   * released. Without `grants: true` the return value is ignored, as it was
+   * before grants existed.
    */
   onStart?(key?: string, cost?: number, request?: unknown): unknown;
 
   /**
    * Return `cost` units (default 1). Must mirror the matching `onStart`.
    * `grant` is exactly what that `onStart` returned - the same object, not a
-   * copy - or undefined if it returned nothing.
+   * copy - or undefined if it returned nothing or the group does not grant.
    */
   onFinish?(key?: string, cost?: number, grant?: unknown): void;
 

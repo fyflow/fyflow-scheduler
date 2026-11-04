@@ -380,8 +380,8 @@ export class WorkerManager extends EventTarget {
    * Synchronous, and called in the same turn as the capacity check, so no other
    * pool can interleave between the two.
    *
-   * @returns the holding, queued as pending until {@link _bindResidentHolder},
-   *   or false when it does not fit.
+   * @returns the holding, pending until {@link _bindResidentHolder} attaches
+   *   it to its worker, or false when it does not fit.
    * @throws when a group grants a value `structuredClone` cannot copy. What
    *   was taken is given back first; the worker is never created.
    */
@@ -393,7 +393,9 @@ export class WorkerManager extends EventTarget {
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       const group = this.residentRegistry[id];
       if (!group) continue;
-      const grant = group.onStart?.(undefined, cost, this.residentRequests[id]);
+      // A return value is a grant only from a group that says it grants
+      const returned = group.onStart?.(undefined, cost, this.residentRequests[id]);
+      const grant = group.grants === true ? returned : undefined;
       taken.push(id);
       if (grant === undefined) continue;
       holding.raw.set(id, grant);
@@ -425,10 +427,18 @@ export class WorkerManager extends EventTarget {
    * {@link _acquireResident}: the worker id does not exist yet at acquire time,
    * and both call sites bind in the same synchronous turn. A holding that is
    * acquired and never bound is a bug, not a state worth modelling.
+   *
+   * By identity, not the oldest pending: the worker's first task is handed
+   * over before the bind, and an inline worker announces it synchronously, so
+   * a listener re-entering the scheduler from `task.running` can create a
+   * second worker - and bind it - in between. Taking the head of the pending
+   * list then swapped the two workers' units: each held, and later freed, the
+   * other's card while running on its own.
    */
-  private _bindResidentHolder(workerId: string) {
-    const holding = this.residentPending.shift();
-    if (!holding) return;
+  private _bindResidentHolder(workerId: string, holding: ResidentHolding) {
+    const index = this.residentPending.indexOf(holding);
+    if (index === -1) return;
+    this.residentPending.splice(index, 1);
     this.residentHolders.set(workerId, holding);
 
     if (!this.residentNotify) return;
@@ -549,7 +559,7 @@ export class WorkerManager extends EventTarget {
       // task: resource.acquired can reach a listener that re-enters the
       // scheduler, and announced any earlier, a task dispatched from there saw
       // room for another worker and the pool created more than maxThreads.
-      this._bindResidentHolder(newThread.id);
+      this._bindResidentHolder(newThread.id, holding);
       return running;
     }
 
@@ -773,7 +783,7 @@ export class WorkerManager extends EventTarget {
     this.startIdleTimer(); // Start idle timer when first worker is added
 
     // Announced once it is in `threads`: see enqueueNoQueue
-    this._bindResidentHolder(thread.id);
+    this._bindResidentHolder(thread.id, holding);
     return thread;
   }
 
@@ -1098,7 +1108,7 @@ export class WorkerManager extends EventTarget {
     this._setupWorkerEventListeners(newWorker);
     this.threads.push(newWorker);
     this.startIdleTimer(); // Ensure idle timer is running
-    if (holding) this._bindResidentHolder(newWorker.id);
+    if (holding) this._bindResidentHolder(newWorker.id, holding);
 
     return true;
   }
