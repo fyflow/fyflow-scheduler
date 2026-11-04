@@ -102,6 +102,12 @@ export interface ResourceEventDetail {
    * sees, frozen one level down. Absent for every group that grants nothing.
    */
   grant?: unknown;
+  /**
+   * What the waiter asked of the group, on `resource.blocked` and
+   * `resource.unblocked` only, and only when it made a request - a
+   * `UnitGroup` waiter pinned to a unit carries `{ from: ['gpu1'] }`.
+   */
+  request?: unknown;
   /** `Date.now()` at emit, matching every other timestamp in the library. */
   timestamp: number;
   /**
@@ -162,4 +168,6 @@ export interface AdmissionWaiter {
   position: number;
   /** The bucket, for keyed groups. */
   key?: string;
+  /** What it asked of the group, when it made a request - as on `resource.blocked`. */
+  request?: unknown;
 }

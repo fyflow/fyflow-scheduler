@@ -23,6 +23,15 @@ import { validateGraceMs } from './workerManager.ts';
 const BLOCKED_QUEUE_SEPARATOR = '\u0000';
 
 /**
+ * One thing a task holds, or would: a group, a key of a keyed group, and what
+ * it asked of a group that takes requests.
+ */
+type Hold = { id: string; group: any; key: string | undefined; request?: unknown };
+
+/** A pending wake of every wait set of one group, rather than of one queue. */
+const SWEEP_PREFIX = '\u0001';
+
+/**
  * A unit of work handed to a worker pool.
  *
  * Tasks are independent - there is no dependency graph. A task runs as soon as
@@ -113,6 +122,12 @@ export class FyflowTask {
      * can derive the key from the payload instead.
      */
     limitKey?: string;
+    /**
+     * What this task asks of a group that takes requests, per group id - for
+     * a {@link UnitGroup}, which units it will accept: `{ gpu: { from: ['gpu1'] } }`.
+     * Read by the group's default `requestFrom`; validated at `addTask`.
+     */
+    units?: Record<string, unknown>;
     _resourcesPreAllocated?: boolean; // Flag to track if resources are pre-allocated
     /**
      * Keys resolved at dispatch, per keyed group id - one or more, without
@@ -127,6 +142,17 @@ export class FyflowTask {
      * afresh.
      */
     _grants?: Map<string, { raw: unknown; copy: unknown }>;
+    /**
+     * Requests resolved with the keys, per group id, for groups that take one.
+     * Held for the same reason: the acquire, the wait and the release all use
+     * the request the task was admitted under.
+     */
+    _requests?: Record<string, unknown>;
+    /**
+     * When it joined its blocked queue, as a scheduler-wide sequence. A release
+     * a group's several wait sets compete for goes to the oldest head.
+     */
+    _blockedSeq?: number;
     /** `context.grants` for this attempt, built from {@link _grants}. */
     _grantView?: Record<string, unknown>;
     /**
@@ -183,8 +209,11 @@ export class FyflowTask {
      * @param config.limitKey Bucket for keyed resource groups, e.g. the endpoint
      *   or tenant this task belongs to. Required when the task belongs to a
      *   keyed group that has no custom `keyFrom`.
+     * @param config.units Requests for groups that take one, per group id - for
+     *   a `UnitGroup`, `{ gpu: { from: ['gpu1'] } }` pins the task to one unit.
+     *   A request naming a unit the group does not have throws at `addTask`.
      */
-    constructor({id, workerType, payload, optional = false, retryPolicy, attemptsSpent = 0, workerGroups = [], handleRejection = true, limitKey}: any) {
+    constructor({id, workerType, payload, optional = false, retryPolicy, attemptsSpent = 0, workerGroups = [], handleRejection = true, limitKey, units}: any) {
       if (typeof attemptsSpent !== 'number') {
         throw new TypeError(`attemptsSpent must be a number, got ${typeof attemptsSpent}`);
       }
@@ -195,6 +224,7 @@ export class FyflowTask {
       this.attempts = attemptsSpent;
       this.id = id;
       this.limitKey = limitKey;
+      this.units = units;
       this.workerType = workerType;
       this.payload = payload;
       this.optional = optional;
@@ -408,11 +438,31 @@ export class FyflowTask {
     }
 
     /** Resident groups a pool holds per worker, as {@link _groupsForTask} entries. */
-    private _residentGroupsForPool(pool: any): Array<{ id: string; group: any; cost: number }> {
+    private _residentGroupsForPool(pool: any): Array<{ id: string; group: any; cost: number; request?: unknown }> {
       const declared: Record<string, number> = pool?.residentGroups || {};
+      const requests: Record<string, unknown> = pool?.residentRequests || {};
       return Object.entries(declared)
-        .map(([id, cost]) => ({ id, group: this.groups[id], cost }))
+        .map(([id, cost]) => ({ id, group: this.groups[id], cost, request: requests[id] }))
         .filter(entry => entry.group);
+    }
+
+    /**
+     * Whether a resident waiter of `entry` would arrive behind someone. Per
+     * wait set for a group that has them: a pool pinned to a busy unit must
+     * not hold up a pool that wants a free one, so only a waiter whose set
+     * overlaps this one's counts. Any waiter at all, for every other group.
+     */
+    private _residentQueueBehind(entry: { id: string; group: any; request?: unknown }): boolean {
+      if (!FyflowScheduler._hasWaitSets(entry.group)) {
+        return (this.blockedQueues.get(entry.id)?.length ?? 0) > 0;
+      }
+      const own = FyflowScheduler._waitSetOf(entry.group, entry.request);
+      for (const queueId of this._queuesOfGroup(entry.id)) {
+        if ((this.blockedQueues.get(queueId)?.length ?? 0) === 0) continue;
+        const { set } = this._splitQueueId(queueId);
+        if (entry.group.waitSetsOverlap?.(own, set) ?? own === set) return true;
+      }
+      return false;
     }
 
     /**
@@ -435,15 +485,15 @@ export class FyflowTask {
       const fits = pool.canHoldAnotherWorker?.() !== false;
       const behind = task._admittedByWake
         ? undefined
-        : entries.find(({ id }) => (this.blockedQueues.get(id)?.length ?? 0) > 0);
+        : entries.find(entry => this._residentQueueBehind(entry));
       if (fits && !behind) return true;
 
       // Queue against the first group without room, or the queue it must wait
       // behind. That group's release wakes the task.
       const short = (fits ? behind : undefined)
-        ?? entries.find(({ group, cost }) => !group.canRun(undefined, cost))
+        ?? entries.find(({ group, cost, request }) => !group.canRun(undefined, cost, request))
         ?? entries[0];
-      const queueId = this._blockedQueueId(short.id);
+      const queueId = this._blockedQueueId(short.id, FyflowScheduler._waitSetOf(short.group, short.request));
       const queue = this._blockedQueue(queueId);
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
@@ -452,6 +502,7 @@ export class FyflowTask {
       task._blockedQueueId = queueId;
       if (!queue.includes(task)) {
         queue.push(task);
+        task._blockedSeq = ++this.blockedSeq;
         if (this._resourceObserved) {
           this._emitResource('resource.blocked', short.group, {
             groupId: short.id,
@@ -488,15 +539,37 @@ export class FyflowTask {
      * Inverse of {@link _blockedQueueId}. The delimiter is NUL - splitting on a
      * space instead mis-keys every keyed group without erroring.
      */
-    private _splitQueueId(queueId: string): { groupId: string; key?: string } {
+    private _splitQueueId(queueId: string): { groupId: string; key?: string; set?: string; suffix?: string } {
       const separator = queueId.indexOf(BLOCKED_QUEUE_SEPARATOR);
-      return separator === -1
-        ? { groupId: queueId }
-        : {
-            groupId: queueId.slice(0, separator),
-            key: queueId.slice(separator + 1)
-          };
+      if (separator === -1) return { groupId: queueId };
+      const groupId = queueId.slice(0, separator);
+      const suffix = queueId.slice(separator + 1);
+      // A keyed group's queues are per key; any other group's are per wait
+      // set, which is never a key and never reaches an event as one
+      return this.groups[groupId]?.keyed
+        ? { groupId, key: suffix, suffix }
+        : { groupId, set: suffix, suffix };
     }
+
+    /** A group that queues its waiters per candidate set - `UnitGroup`. */
+    private static _hasWaitSets(group: any): boolean {
+      return typeof group?.waitSetFor === 'function';
+    }
+
+    /** The wait set a request queues in; undefined is the group's plain queue. */
+    private static _waitSetOf(group: any, request: unknown): string | undefined {
+      return request === undefined ? undefined : group?.waitSetFor?.(request);
+    }
+
+    /** The plain queue of a group and every per-key or per-set queue it has. */
+    private _queuesOfGroup(groupId: string): string[] {
+      const ids = [groupId];
+      for (const suffix of this.blockedKeys.get(groupId) ?? []) ids.push(this._blockedQueueId(groupId, suffix));
+      return ids;
+    }
+
+    /** Arrival order across every blocked queue - see {@link FyflowTask._blockedSeq}. */
+    private blockedSeq = 0;
 
     /**
      * Resolve the bucket for every keyed group this task belongs to.
@@ -507,8 +580,16 @@ export class FyflowTask {
      */
     private _resolveResourceKeys(task: FyflowTask, pool: any): Record<string, string[]> {
       const keys: Record<string, string[]> = {};
+      let requests: Record<string, unknown> | undefined;
 
       for (const { id, group } of this._groupsForTask(task, pool)) {
+        // A group that takes requests resolves - and validates - the task's
+        // here, so a request naming a unit that does not exist throws at
+        // addTask rather than waiting forever
+        if (typeof group.requestFor === 'function') {
+          const request = group.requestFor(task, 1);
+          if (request !== undefined) (requests ??= {})[id] = request;
+        }
         if (!group.keyed) continue;
 
         // One key, or several: a copy from C: to D: holds both disks. Empty
@@ -528,6 +609,7 @@ export class FyflowTask {
         keys[id] = resolved;
       }
 
+      task._requests = requests;
       return keys;
     }
 
@@ -539,13 +621,17 @@ export class FyflowTask {
      */
     private _holdsFor(
       task: FyflowTask, pool: any, keys: Record<string, string[]> = task._resourceKeys ?? {}
-    ): Array<{ id: string; group: any; key: string | undefined }> {
-      const holds: Array<{ id: string; group: any; key: string | undefined }> = [];
+    ): Hold[] {
+      const holds: Hold[] = [];
+      const requests = task._requests;
       for (const entry of this._groupsForTask(task, pool)) {
         // A keyless hold is the entry itself, `key` absent: this runs for every
         // waiter a wake examines, and a copy per group showed up as heap
         if (!entry.group.keyed) {
-          holds.push(entry as { id: string; group: any; key: undefined });
+          const request = requests?.[entry.id];
+          holds.push(request === undefined
+            ? entry as Hold
+            : { id: entry.id, group: entry.group, key: undefined, request });
           continue;
         }
         for (const key of keys[entry.id] ?? []) holds.push({ id: entry.id, group: entry.group, key });
@@ -571,7 +657,7 @@ export class FyflowTask {
      * @returns the error for a grant that cannot be copied, which fails the
      *   attempt. Its units are still released: the original is kept.
      */
-    private _copyGrants(task: FyflowTask, holds: Array<{ id: string; group: any; key: string | undefined }>): Error | undefined {
+    private _copyGrants(task: FyflowTask, holds: Hold[]): Error | undefined {
       const view: Record<string, unknown> = {};
       let error: Error | undefined;
       for (const { id, group, key } of holds) {
@@ -613,7 +699,8 @@ export class FyflowTask {
     }
 
     /**
-     * Keys with a blocked queue, per keyed group. Kept in step with
+     * Keys with a blocked queue, per keyed group - or wait sets, for a group
+     * that has them (see {@link _splitQueueId}). Kept in step with
      * `blockedQueues` by the two methods below, so finding a keyed group's
      * waiting keys is a lookup rather than a scan of every queue.
      */
@@ -633,11 +720,11 @@ export class FyflowTask {
       if (!queue) {
         queue = this._newBlockedQueue();
         this.blockedQueues.set(queueId, queue);
-        const { groupId, key } = this._splitQueueId(queueId);
-        if (key !== undefined) {
+        const { groupId, suffix } = this._splitQueueId(queueId);
+        if (suffix !== undefined) {
           let keys = this.blockedKeys.get(groupId);
           if (!keys) this.blockedKeys.set(groupId, keys = new Set());
-          keys.add(key);
+          keys.add(suffix);
         }
       }
       return queue;
@@ -655,10 +742,10 @@ export class FyflowTask {
       const queue = this.blockedQueues.get(queueId);
       if (!queue || queue.length > 0) return;
       this.blockedQueues.delete(queueId);
-      const { groupId, key } = this._splitQueueId(queueId);
-      if (key !== undefined) {
+      const { groupId, suffix } = this._splitQueueId(queueId);
+      if (suffix !== undefined) {
         const keys = this.blockedKeys.get(groupId);
-        keys?.delete(key);
+        keys?.delete(suffix);
         if (keys?.size === 0) this.blockedKeys.delete(groupId);
       }
     }
@@ -925,11 +1012,12 @@ export class FyflowTask {
       // one. Checked here and acquired by _dispatchTask in the same turn, so
       // all-or-nothing needs no locking, and with no partial hold there is
       // nothing to deadlock on.
-      for (const { id, group, key } of this._holdsFor(task, pool, keys)) {
-        if (!group.canRun(key)) {
+      for (const { id, group, key, request } of this._holdsFor(task, pool, keys)) {
+        if (!group.canRun(key, 1, request)) {
           const blockedOnKey = Boolean(group.keyed);
-          // Blocked on this group - and on this key, when the group is keyed
-          const queueId = this._blockedQueueId(id, key);
+          // Blocked on this group - and on this key, when the group is keyed,
+          // or in the queue of its candidate set, for a group that has them
+          const queueId = this._blockedQueueId(id, key ?? FyflowScheduler._waitSetOf(group, request));
           const blockedQueue = this._blockedQueue(queueId);
           // It has left the ready queue: count it out of `queued` before
           // resource.blocked fires, so a listener sees consistent stats
@@ -941,6 +1029,7 @@ export class FyflowTask {
           task._blockedQueueId = queueId;
           if (!blockedQueue.includes(task)) {
             blockedQueue.push(task);
+            task._blockedSeq = ++this.blockedSeq;
             if (this._resourceObserved) {
               this._emitResource('resource.blocked', group, {
                 groupId: id,
@@ -1046,7 +1135,7 @@ export class FyflowTask {
       // group this one had checked but not yet taken, and both took it: a
       // concurrency group held more than its limit.
       for (const hold of holds) {
-        const grant = hold.group.onStart(hold.key);
+        const grant = hold.group.onStart(hold.key, 1, hold.request);
         if (grant !== undefined) {
           (task._grants ??= new Map()).set(FyflowScheduler._holdId(hold.id, hold.key), { raw: grant, copy: undefined });
         }
@@ -1531,7 +1620,9 @@ export class FyflowTask {
         // Nobody waiting on it: skip before asking the group anything, so a
         // heartbeat costs O(groups with waiters) rather than O(groups)
         if (!group) continue;
-        if (group.keyed ? !this.blockedKeys.has(groupId) : !this.blockedQueues.has(groupId)) continue;
+        if (group.keyed || FyflowScheduler._hasWaitSets(group)
+            ? !this.blockedKeys.has(groupId) && !this.blockedQueues.has(groupId)
+            : !this.blockedQueues.has(groupId)) continue;
         if (!group.canRun()) continue;
 
         if (group.keyed) {
@@ -1565,7 +1656,11 @@ export class FyflowTask {
      * after it, in the same synchronous turn.
      */
     _retryBlockedTasksForGroup(groupId: string, key?: string) {
-      const queueId = this._blockedQueueId(groupId, key);
+      // A group with wait sets is woken as a whole: what was freed may suit
+      // any of its sets, and they compete for it in arrival order
+      const queueId = FyflowScheduler._hasWaitSets(this.groups[groupId])
+        ? SWEEP_PREFIX + groupId
+        : this._blockedQueueId(groupId, key);
       this.wakePending.add(queueId);
       if (this.waking) return;
       this.waking = true;
@@ -1573,26 +1668,63 @@ export class FyflowTask {
         while (this.wakePending.size > 0) {
           const next: string = this.wakePending.values().next().value!;
           this.wakePending.delete(next);
-          this._wakeQueue(next);
+          if (next.startsWith(SWEEP_PREFIX)) this._sweepWaitSets(next.slice(SWEEP_PREFIX.length));
+          else this._wakeQueue(next);
         }
       } finally {
         this.waking = false;
       }
     }
 
+    /**
+     * Wake a group whose waiters queue per candidate set: admit, one at a
+     * time, the oldest head among all its queues that can go - whether it
+     * asked for one unit in particular or for any. So a pinned waiter is not
+     * starved by a stream of "any" tasks: once it is the oldest that can use
+     * a freed unit, it gets it.
+     *
+     * Heads only, never a scan: a waiter pinned to a busy unit is skipped
+     * along with its whole queue, at the cost of one comparison. A queue
+     * whose head cannot go is set aside for the rest of the sweep.
+     */
+    private _sweepWaitSets(groupId: string) {
+      // Listed once per sweep, not per admission: building the ids is string
+      // work, and it showed as heap. A queue created during the sweep holds a
+      // waiter that was just refused, which the next release wakes.
+      const candidates = this._queuesOfGroup(groupId);
+      // Each round admits or moves one waiter, or sets a queue aside, so this
+      // bounds it whatever a listener does; it is never reached in practice
+      let budget = 2 * this.blockedLive.live + candidates.length + 1;
+      while (budget-- > 0 && candidates.length > 0) {
+        let oldest = -1;
+        let oldestSeq = Infinity;
+        for (let i = 0; i < candidates.length; i++) {
+          const head = this.blockedQueues.get(candidates[i])?.at(0);
+          if (head && (head._blockedSeq ?? 0) < oldestSeq) {
+            oldest = i;
+            oldestSeq = head._blockedSeq ?? 0;
+          }
+        }
+        if (oldest === -1) return;
+        // Its head cannot go: set aside for the rest of the sweep
+        if (this._wakeQueue(candidates[oldest], 1) === 0) candidates.splice(oldest, 1);
+      }
+    }
+
     private wakePending = new Set<string>();
     private waking = false;
 
-    private _wakeQueue(queueId: string) {
+    /** @returns how many waiters left the queue; at most `maxExits`. */
+    private _wakeQueue(queueId: string, maxExits = Infinity): number {
       const blockedTasks = this.blockedQueues.get(queueId);
-      if (!blockedTasks || blockedTasks.length === 0) return;
+      if (!blockedTasks || blockedTasks.length === 0) return 0;
 
       // Held for the whole wake - see blockedInUse - and deleted after, if the
       // wake, or anything it reached, emptied it
       this.blockedInUse.set(queueId, (this.blockedInUse.get(queueId) ?? 0) + 1);
       try {
         const { groupId, key } = this._splitQueueId(queueId);
-        this._admitFromQueue(queueId, groupId, blockedTasks, key);
+        return this._admitFromQueue(queueId, groupId, blockedTasks, key, maxExits);
       } finally {
         const depth = this.blockedInUse.get(queueId)! - 1;
         if (depth > 0) this.blockedInUse.set(queueId, depth);
@@ -1617,9 +1749,12 @@ export class FyflowTask {
      * is never taken out and put back: every move below is a real exit, and
      * its event is emitted once it has landed.
      */
-    private _admitFromQueue(queueId: string, groupId: string, blockedTasks: TaskQueue<FyflowTask>, key?: string) {
+    private _admitFromQueue(
+      queueId: string, groupId: string, blockedTasks: TaskQueue<FyflowTask>, key?: string, maxExits = Infinity
+    ): number {
       const group = this.groups[groupId];
-      if (!group) return;
+      if (!group) return 0;
+      let exits = 0;
 
       // Waiters moved to a ready queue whose pool had no free slot. They hold
       // nothing yet, so they count against the capacity this wake hands out -
@@ -1627,14 +1762,15 @@ export class FyflowTask {
       // group that does not weigh `cost` (a rate group) cannot be asked for
       // more than one, so at most one goes that way per wake.
       let parked = 0;
-      const weighsCost = !group.canRun(key, Number.MAX_SAFE_INTEGER);
+      // Asked only once something has parked: most wakes never need it, and
+      // a group with several wait sets is woken one queue at a time
+      let weighsCost: boolean | undefined;
       // Waiters whose pool has gone. Failed after the loop, never during it.
       const orphaned: FyflowTask[] = [];
 
-      while (blockedTasks.length > 0) {
+      while (blockedTasks.length > 0 && exits < maxExits) {
         const task = blockedTasks.at(0)!;
-        if (parked > 0 && !weighsCost) break;
-        if (!group.canRun(key, parked + 1)) break;
+        if (parked > 0 && !(weighsCost ??= !group.canRun(key, Number.MAX_SAFE_INTEGER))) break;
 
         const pool = this.workerPools[task.workerType];
         if (!pool) {
@@ -1645,6 +1781,7 @@ export class FyflowTask {
           task._queuedIn = undefined;
           task._blockedQueueId = undefined;
           orphaned.push(task);
+          exits++;
           continue;
         }
 
@@ -1652,7 +1789,11 @@ export class FyflowTask {
         // the task itself holds - the same derivation `_blockedHoldingFor` uses
         // Built once per waiter: the checks below all read it
         const holds = this._holdsFor(task, pool);
-        const residentWait = !holds.some(({ id }) => id === groupId);
+        const own = holds.find(({ id, key: k }) => id === groupId && k === key);
+        const residentWait = own === undefined;
+        // What it asked of this group: its own request, or its pool's
+        const request = residentWait ? pool.residentRequests?.[groupId] : own.request;
+        if (!group.canRun(key, parked + 1, request)) break;
 
         // Its pool's per-worker cost does not fit.
         if (this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false) {
@@ -1666,8 +1807,9 @@ export class FyflowTask {
           // waiting there. Stopping here instead blocked every waiter behind
           // it - including ones that need no worker - until the heartbeat.
           const resident = this._residentGroupsForPool(pool);
-          const short = resident.find(({ group: g, cost }) => !g.canRun(undefined, cost)) ?? resident[0];
+          const short = resident.find(({ group: g, cost, request: r }) => !g.canRun(undefined, cost, r)) ?? resident[0];
           this._migrate(task, pool, blockedTasks, groupId, key, { ...short, key: undefined });
+          exits++;
           continue;
         }
 
@@ -1675,9 +1817,7 @@ export class FyflowTask {
         // this one: wait there instead. Its release is what can admit the task
         // now, and this queue's never could - a task left here waited for the
         // heartbeat.
-        const refusing = holds.find(({ id, group: g, key: k }) =>
-          !(id === groupId && k === key) && !g.canRun(k)
-        );
+        const refusing = holds.find(hold => hold !== own && !hold.group.canRun(hold.key, 1, hold.request));
         if (refusing) {
           // Except out of a resident queue. Moved, it gives up its place at the
           // head; the pools behind it take the units it was waiting for, and
@@ -1687,6 +1827,7 @@ export class FyflowTask {
           // are both short at once.
           if (residentWait) break;
           this._migrate(task, pool, blockedTasks, groupId, key, refusing);
+          exits++;
           continue;
         }
 
@@ -1699,6 +1840,7 @@ export class FyflowTask {
         task._queuedIn = 'ready';
         task._admittedByWake = true;
         this.stats.queued++;
+        exits++;
         if (this._resourceObserved) {
           this._emitResource('resource.unblocked', group, {
             groupId,
@@ -1733,6 +1875,7 @@ export class FyflowTask {
       // Last, with the queue in its final shape, so a listener re-entering on
       // task.failed sees consistent state
       for (const task of orphaned) this._failOrphanedTask(task, queueId);
+      return exits;
     }
 
     /**
@@ -1750,13 +1893,14 @@ export class FyflowTask {
      */
     private _migrate(
       task: FyflowTask, pool: any, from: TaskQueue<FyflowTask>, fromGroupId: string, fromKey: string | undefined,
-      to: { id: string; group: any; key: string | undefined }
+      to: Hold
     ) {
       const toKey = to.key;
-      const toQueueId = this._blockedQueueId(to.id, toKey);
+      const toQueueId = this._blockedQueueId(to.id, toKey ?? FyflowScheduler._waitSetOf(to.group, to.request));
       from.shift();
       const target = this._blockedQueue(toQueueId);
       target.push(task);
+      task._blockedSeq = ++this.blockedSeq;
       task._queuedIn = 'blocked';
       task._blockedQueueId = toQueueId;
       if (!this._resourceObserved) return;
@@ -2154,11 +2298,14 @@ export class FyflowTask {
       task: FyflowTask,
       pool: any,
       groupId: string
-    ): { lifetime: ResourceLifetime; cost: number } {
+    ): { lifetime: ResourceLifetime; cost: number; request?: unknown } {
       const taskHeld = this._groupsForTask(task, pool).some(entry => entry.id === groupId);
-      return taskHeld
+      const request = taskHeld ? task._requests?.[groupId] : pool?.residentRequests?.[groupId];
+      const holding: { lifetime: ResourceLifetime; cost: number; request?: unknown } = taskHeld
         ? { lifetime: 'task-held', cost: 1 }
         : { lifetime: 'resident', cost: pool?.residentGroups?.[groupId] ?? 1 };
+      if (request !== undefined) holding.request = request;
+      return holding;
     }
 
     _setupGroupEventListeners() {
@@ -2493,12 +2640,12 @@ export class FyflowTask {
      */
     getAdmissionQueue(groupId?: string): Record<string, AdmissionWaiter[]> {
       // Collected per (group, key) first so sub-queues can be ordered by key
-      const byGroup = new Map<string, Array<{ key?: string; waiters: AdmissionWaiter[] }>>();
+      const byGroup = new Map<string, Array<{ key?: string; suffix?: string; waiters: AdmissionWaiter[] }>>();
 
       for (const [queueId, queue] of this.blockedQueues) {
         if (queue.length === 0) continue;
 
-        const { groupId: id, key } = this._splitQueueId(queueId);
+        const { groupId: id, key, suffix } = this._splitQueueId(queueId);
         if (groupId !== undefined && id !== groupId) continue;
 
         const waiters = queue.toArray().map((task, position) => {
@@ -2516,7 +2663,7 @@ export class FyflowTask {
         });
 
         const subQueues = byGroup.get(id) ?? [];
-        subQueues.push({ key, waiters });
+        subQueues.push({ key, suffix, waiters });
         byGroup.set(id, subQueues);
       }
 
@@ -2524,7 +2671,7 @@ export class FyflowTask {
       for (const [id, subQueues] of byGroup) {
         // Map iteration order is queue-creation order, which a consumer folding
         // the stream cannot reproduce. Key order can be.
-        subQueues.sort((a, b) => (a.key ?? '').localeCompare(b.key ?? ''));
+        subQueues.sort((a, b) => (a.suffix ?? '').localeCompare(b.suffix ?? ''));
         admission[id] = subQueues.flatMap(sub => sub.waiters);
       }
       return admission;

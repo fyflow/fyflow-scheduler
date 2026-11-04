@@ -23,6 +23,15 @@ export interface UnitRequest {
   prefer?: readonly UnitId[];
 }
 
+/** A request as unit indices: `from` ascending, undefined for every unit. */
+interface ResolvedRequest {
+  from?: number[];
+  prefer?: number[];
+  waitSet?: string;
+}
+
+const NO_REQUEST: ResolvedRequest = {};
+
 export interface UnitGroupOptions {
   /** Stable id used in `workerGroups`, a pool's `groups` or `residentGroups`. Generated if omitted. */
   id?: string;
@@ -65,6 +74,7 @@ export class UnitGroup extends EventTarget implements ResourceGroup {
   readonly limit: number;
 
   private index = new Map<UnitId, number>();
+  private resolved = new WeakMap<UnitRequest, ResolvedRequest>();
   private busy: Uint8Array;
   private running = 0;
   private requestFrom: (task: any) => UnitRequest | undefined;
@@ -151,33 +161,53 @@ export class UnitGroup extends EventTarget implements ResourceGroup {
    * Undefined for "any unit". `prefer` does not count - it never blocks.
    */
   waitSetFor(request: UnitRequest | undefined): string | undefined {
-    if (!request?.from) return undefined;
-    const set = [...new Set(request.from)].map(u => this.index.get(u)!).sort((a, b) => a - b);
-    // The whole group is "any": one queue, not two
-    if (set.length === this.limit) return undefined;
-    return set.join(',');
+    return request ? this.resolve(request).waitSet : undefined;
   }
 
-  /** Whether a waiter in wait set `set` could use any of `grant`'s units. */
-  waitSetCovers(set: string | undefined, grant: unknown): boolean {
-    if (set === undefined) return true;
-    if (!Array.isArray(grant)) return true;
-    const members = set.split(',');
-    return grant.some(unit => {
-      const i = this.index.get(unit);
-      return i !== undefined && members.includes(String(i));
-    });
+  /**
+   * Whether two wait sets share a unit - undefined being every unit. Resident
+   * admission is head-of-line only between waiters whose sets overlap, so a
+   * pool pinned to a busy unit does not hold up one that wants a free one.
+   */
+  waitSetsOverlap(a: string | undefined, b: string | undefined): boolean {
+    if (a === undefined || b === undefined) return true;
+    const members = new Set(a.split(','));
+    return b.split(',').some(i => members.has(i));
   }
 
   /** Free units among the candidates, `cost` of them needed (default 1). */
   canRun(_key?: string, cost: number = 1, request?: UnitRequest): boolean {
-    if (!request?.from) return this.limit - this.running >= cost;
+    const from = request ? this.resolve(request).from : undefined;
+    if (!from) return this.limit - this.running >= cost;
     let free = 0;
-    for (const unit of new Set(request.from)) {
-      const i = this.index.get(unit);
-      if (i !== undefined && !this.busy[i] && ++free >= cost) return true;
+    for (const i of from) {
+      if (!this.busy[i] && ++free >= cost) return true;
     }
-    return free >= cost;
+    return false;
+  }
+
+  /**
+   * A request as unit indices, worked out once per request object. The
+   * scheduler passes the same object on every call for a task - the check,
+   * each wake, the acquire - and allocating a set on each of those showed as
+   * heap under a deep queue of pinned waiters.
+   */
+  private resolve(request: UnitRequest): ResolvedRequest {
+    let resolved = this.resolved.get(request);
+    if (resolved) return resolved;
+    const indices = (list: readonly UnitId[] | undefined) => list === undefined
+      ? undefined
+      : [...new Set(list)].map(u => this.index.get(u)).filter((i): i is number => i !== undefined);
+    const from = indices(request.from)?.sort((a, b) => a - b);
+    // The whole group is "any": one queue, not two
+    const whole = from === undefined || from.length === this.limit;
+    resolved = {
+      from: whole ? undefined : from,
+      prefer: indices(request.prefer),
+      waitSet: whole ? undefined : from!.join(',')
+    };
+    this.resolved.set(request, resolved);
+    return resolved;
   }
 
   /**
@@ -188,15 +218,16 @@ export class UnitGroup extends EventTarget implements ResourceGroup {
    *   cap, so this means the scheduler admitted what it should not have.
    */
   onStart(_key?: string, cost: number = 1, request?: UnitRequest): UnitId[] {
-    const allowed = request?.from ? new Set(request.from) : undefined;
+    const { from, prefer } = request ? this.resolve(request) : NO_REQUEST;
     const granted: number[] = [];
-    const take = (i: number | undefined) => {
-      if (granted.length >= cost || i === undefined || this.busy[i] || granted.includes(i)) return;
-      if (allowed && !allowed.has(this.units[i])) return;
+    const take = (i: number) => {
+      if (granted.length >= cost || this.busy[i] || granted.includes(i)) return;
+      if (from && !from.includes(i)) return;
       granted.push(i);
     };
-    for (const unit of request?.prefer ?? []) take(this.index.get(unit));
-    for (let i = 0; i < this.limit && granted.length < cost; i++) take(i);
+    for (const i of prefer ?? []) take(i);
+    if (from) for (const i of from) take(i);
+    else for (let i = 0; i < this.limit && granted.length < cost; i++) take(i);
 
     if (granted.length < cost) {
       throw new Error(

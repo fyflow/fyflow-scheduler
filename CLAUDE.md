@@ -124,7 +124,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Eleven suites, 278 tests, all in the default `deno task test` run:
+Eleven suites, 287 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -135,10 +135,10 @@ Eleven suites, 278 tests, all in the default `deno task test` run:
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 26 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
-| grants | 12 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, uncloneable grants, the forced stop |
+| grants | 19 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, uncloneable grants, the forced stop; requests for particular units, per-set queues, FIFO across sets, resident requests |
 | cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
-| docs | 49 | **executes every snippet in README.md and AGENTS.md** |
-| admission | 36 | wake paths with the heartbeat off (including a worker becoming ready), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task; 1 known gap (R3) |
+| docs | 50 | **executes every snippet in README.md and AGENTS.md** |
+| admission | 37 | wake paths with the heartbeat off (including a worker becoming ready), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task, unit requests; 1 known gap (R3) |
 
 `deno task test:scripts` is separate and not included in `deno task test`. It
 unit-tests `scripts/` and the known-gap rules in `tests/harness.ts`.

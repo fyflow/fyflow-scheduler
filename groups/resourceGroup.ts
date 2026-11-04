@@ -136,6 +136,37 @@ export interface ResourceGroup extends EventTarget {
    */
   onFinish?(key?: string, cost?: number, grant?: unknown): void;
 
+  /**
+   * The request `task` makes of this group, for a group with a request
+   * language. Called at `addTask`, so a bad request throws there; the result
+   * is what `canRun` and `onStart` receive for that task. Omit it and the
+   * group never gets one.
+   */
+  requestFor?(task: unknown, cost?: number): unknown;
+
+  /**
+   * Throws if `request` could never be granted `cost` units. Called when a
+   * pool declares a request in `residentGroups`, which a group without this
+   * method rejects.
+   */
+  checkRequest?(request: unknown, cost?: number): void;
+
+  /**
+   * The queue a waiter with `request` waits in: one per distinct answer, so a
+   * waiter that cannot use what was freed is never looked at. `undefined` is
+   * the group's plain queue. A release wakes every queue of the group, oldest
+   * head first. Without it, all of the group's waiters share one queue, in
+   * which a head that cannot be granted holds up everyone behind it.
+   */
+  waitSetFor?(request: unknown): string | undefined;
+
+  /**
+   * Whether waiters in two wait sets compete - share a unit. Resident
+   * admission is head-of-line only between those that do. Defaults to
+   * equality.
+   */
+  waitSetsOverlap?(a: string | undefined, b: string | undefined): boolean;
+
   // Get current metrics
   getMetrics(): ResourceGroupMetrics;
 

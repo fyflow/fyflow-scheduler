@@ -70,12 +70,13 @@ export function instrument(group: ResourceGroup): { canRun: number; peak: Map<st
 
   if (g.onStart) {
     const onStart = g.onStart.bind(g);
-    g.onStart = (key?: string, cost = 1) => {
+    // The rest - a request - passes through, and the grant comes back
+    g.onStart = (key?: string, cost = 1, ...rest: any[]) => {
       const k = key ?? '';
       const now = (held.get(k) ?? 0) + cost;
       held.set(k, now);
       counts.peak.set(k, Math.max(counts.peak.get(k) ?? 0, now));
-      return onStart(key, cost);
+      return onStart(key, cost, ...rest);
     };
   }
   if (g.onFinish) {

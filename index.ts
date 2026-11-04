@@ -48,7 +48,7 @@ export { ThreadWrapper } from "./core/threadWrapper.ts";
 export { InlineWrapper } from "./core/inlineWrapper.ts";
 
 // Types and interfaces
-export type { WorkerManagerOptions } from "./core/workerManager.ts";
+export type { WorkerManagerOptions, ResidentGroupRequest } from "./core/workerManager.ts";
 export type {
   WorkerInterface,
   WorkerConfig,

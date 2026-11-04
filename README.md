@@ -381,6 +381,7 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `optional`: Mark task as optional (failures don't block workflow)
 - `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup` and
   `KeyedConcurrentLimitGroup`)
+- `units`: Requests for particular units of a `UnitGroup`, per group id
 - `retryPolicy`: `{ maxRetries, backoffMs }`
 - `attemptsSpent`: Attempts already made, so a task re-added after a restart
   keeps its retry budget
@@ -448,6 +449,10 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - In `residentGroups` it gives one worker per device: each worker holds its
   units for its lifetime and reads them from `this.workerContext.grants`, from
   its constructor on
+- A task or a pool can ask for particular units: `units: { gpu: { from: ['gpu1'] } }`
+  on a task, `residentGroups: { gpu: { from: ['gpu0', 'gpu1'] } }` on a pool,
+  and `prefer` as a hint that never blocks. A pinned waiter holds up nobody, and
+  a freed unit goes to the oldest waiter that can use it
 - `new UnitGroup(2)` names its units `0` and `1`. Any custom group can grant
   too, by returning a value from `onStart` - see `AGENTS.md` §5
 

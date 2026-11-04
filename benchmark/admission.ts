@@ -31,7 +31,7 @@
 // commits run back to back on one machine (TODO_CHECKLIST.md). The ratios -
 // canRun/task across sizes - are the signal, and they are machine-independent.
 
-import { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup } from '../index.ts';
+import { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup, UnitGroup } from '../index.ts';
 import { KeyedCounterGroup, instrument } from '../tests/fixtures/keyedCounterGroup.ts';
 import { RuntimeUtils } from './perfUtils.ts';
 
@@ -73,7 +73,7 @@ interface LatencyRow {
   missed: number;
 }
 
-const COST_SHAPES = ['none', 'global', 'keyed', 'keyed-wide', 'two-group', 'keyed-rate', 'keyed-multi'] as const;
+const COST_SHAPES = ['none', 'global', 'keyed', 'keyed-wide', 'two-group', 'keyed-rate', 'keyed-multi', 'units'] as const;
 const LATENCY_SHAPES = ['two-group-wake', 'resident-handoff'] as const;
 type CostShape = typeof COST_SHAPES[number];
 
@@ -119,6 +119,13 @@ async function measureCost(shape: CostShape, N: number): Promise<CostRow> {
       // canRun/task and events/task flat across sizes
       groups.k = new KeyedConcurrentLimitGroup(2, { id: 'k', keyFrom: (t: any) => t.payload.keys });
       keysFor = i => (i % 5 === 0 ? [`key${i % 10}`, `key${(i + 3) % 10}`] : `key${i % 10}`);
+      break;
+    case 'units':
+      // Unit grants phase 2: 8 named units, 30% of tasks pinned to one of
+      // them - eight wait sets and "any". Its gate is the same: canRun/task and
+      // events/task flat across sizes
+      groups.u = new UnitGroup(8, { id: 'u' });
+      configFor = i => ({ workerGroups: ['u'], ...(i % 10 < 3 ? { units: { u: { from: [i % 8] } } } : {}) });
       break;
     case 'keyed-rate': {
       const [limit, windowMs, keys] = [10, 20, 10];

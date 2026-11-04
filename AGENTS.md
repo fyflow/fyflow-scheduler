@@ -310,7 +310,7 @@ import {
 
 import type {
   FyflowSchedulerOptions, AddTaskOptions, CancelOptions,
-  WorkerManagerOptions, WorkerConfig, WorkerInterface, WorkerStatus,
+  WorkerManagerOptions, ResidentGroupRequest, WorkerConfig, WorkerInterface, WorkerStatus,
   WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerContext,
   SpawnTaskConfig, ProgressData,
   TaskMessageDetail, WorkerMessageDetail, MessageOptions,     // emitted events
@@ -402,6 +402,7 @@ task's too.
 | `attemptsSpent` | `number` | `0` | Attempts already made, e.g. before a restart. Reduces the retries left; a task whose budget is already spent **still runs once**. `TypeError` if not a number, `RangeError` if negative, fractional, `NaN` or infinite |
 | `workerGroups` | `string[]` | `[]` | **Added to** the pool's groups, not a replacement |
 | `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` or `KeyedConcurrentLimitGroup` with no custom `keyFrom` |
+| `units` | `Record<string, unknown>` | none | Requests per group id, for a group that takes one: `{ gpu: { from: ['gpu1'] } }` pins the task to a `UnitGroup` unit (§5). A request naming a unit the group does not have throws at `addTask` |
 | `handleRejection` | `boolean` | `true` | Silences unhandled rejections for fire-and-forget |
 
 Readable after the run: `state`, `result`, `error`, `attempts`, `attemptNumber`,
@@ -448,7 +449,7 @@ this task plus everything it spawns (§7).
 | `inline` | `false` | `true` runs in the main process — right for async/IO, wrong for CPU-bound |
 | `config` | `{}` | First constructor argument for every worker instance |
 | `groups` | `[]` | Group ids every task in this pool must acquire |
-| `residentGroups` | `{}` | Groups held for a **worker's** lifetime — see below |
+| `residentGroups` | `{}` | Groups held for a **worker's** lifetime — see below. A value may be `{ cost?, from?, prefer? }`, a request to a `UnitGroup` (§5) |
 | `idleTimeout` | `5000` | Ms before an idle worker is terminated. `0` = never |
 | `idleCheckIntervalMs` | `5000` | How often idle workers are swept |
 | `requeueFailedTasks` | `true` | Requeue in-flight tasks when a worker dies |
@@ -585,7 +586,7 @@ new ConcurrentLimitGroup(limit: number, id?: string)
 new RateLimitGroup(windows: { limit: number, windowMs: number }[], id?: string)
 new KeyedRateLimitGroup(windows, { id?, keyFrom?, idleKeyTtlMs? })
 new KeyedConcurrentLimitGroup(limit: number, { id?, keyFrom?, limitFor? })
-new UnitGroup(units: (string | number)[] | number, { id? })
+new UnitGroup(units: (string | number)[] | number, { id?, requestFrom? })
 ```
 
 All five expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
@@ -735,10 +736,62 @@ async run(payload: any, context?: TaskWorkerContext) {
   units the worker held, and a replacement worker gets its own
 - `getBusyUnits()`, `getFreeUnits()`, `isBusy(unit)` read its state;
   `getMetrics()` counts units like `ConcurrentLimitGroup`
+- A task's grant is per attempt: read it on every attempt, never cache it
+  across them
 - `onFinish` throws on a unit it did not grant, or one already free, and
   `onStart` throws if asked for more units than are free. Admission is a hard
   cap, so neither happens through the scheduler; they surface a bug rather than
   absorb it
+
+##### Asking for particular units
+
+Not every holder will take any unit: a task may need *the* card its data
+sits on, and a pool may be pinned to some devices. A request is a **candidate
+set**, `from`, and the group grants from it; `prefer` is a hint that never
+blocks:
+
+| Want | Request |
+|---|---|
+| any unit | no request |
+| exactly `gpu1` | `{ from: ['gpu1'] }` |
+| any one of two cards | `{ from: ['gpu0', 'gpu1'] }` |
+| both of them, together - resident only | `{ cost: 2, from: ['gpu0', 'gpu1'] }` |
+| `gpu1` if free, else any | `{ prefer: ['gpu1'] }` |
+
+```typescript
+// a task: per group, on the task
+new FyflowTask({ id, workerType: 'GpuWorker', payload, units: { gpu: { from: ['gpu1'] } } })
+
+// a pool: where residentGroups takes a cost
+new WorkerManager(modelUrl, { maxThreads: 2, residentGroups: { gpu: { cost: 1, from: ['gpu0', 'gpu1'] } } })
+```
+
+- **Validated up front.** A unit the group does not have, in `from` or
+  `prefer`, throws at `addTask`; a pool's request is checked when the scheduler
+  is constructed, where a cost above the size of its `from` throws too. A
+  task-held hold always costs 1
+- `units[id]` is where the group reads a task's request by default; give the
+  group `requestFrom: task => ...` to derive it from the payload instead. It is
+  read when the task is added, and again for each attempt; change the object
+  afterwards and nothing notices
+- **`prefer` changes which unit, never whether.** A busy preferred unit is
+  skipped, and the task takes another. "The unit this task used last" is a
+  `prefer` - pass the previous attempt's grant back in
+- **A pinned waiter holds up nobody.** Waiters queue per candidate set, and a
+  release wakes only the heads of those queues: a task pinned to a busy `gpu1`
+  is never looked at when `gpu0` frees, and does not stop "any" tasks from
+  using it
+- **A freed unit goes to the oldest waiter that can use it**, whether it asked
+  for that unit or for any. So a pinned waiter cannot be starved by a stream of
+  "any" tasks: once it is the oldest one `gpu1` suits, it gets the next `gpu1`.
+  A task added from a listener of that very release can still take it first -
+  as it can for every group, since the release event comes before the wake
+- **Resident head-of-line is per set.** A pool waiting for a busy unit holds up
+  only pools whose sets overlap its own; one that wants a free unit goes ahead
+- A waiter's request is on its `resource.blocked` and `resource.unblocked`
+  (`request`), and on its `getAdmissionQueue()` entry. It is never a `key`:
+  the queues per set are an internal arrangement, and `key` stays the bucket
+  of a keyed group
 
 ##### A custom group can grant too
 
@@ -764,8 +817,13 @@ interface ResourceGroup {
 - For a keyed group the entry is per key, `context.grants[id]` being
   `{ [key]: grant }` - for a task naming one key too, so the shape depends on
   the group and never on how many keys a task has
-- `request` is reserved for a group that defines a request language; the
-  scheduler passes nothing there yet
+- `request` is what the holder asked for, and the scheduler never reads it. A
+  group with a request language implements `requestFor(task)` (called at
+  `addTask`, so it can throw) and, for resident requests, `checkRequest`. To
+  queue its waiters apart, as `UnitGroup` does, it implements
+  `waitSetFor(request)` and `waitSetsOverlap(a, b)`. Without that, all its
+  waiters share one queue, where a head that cannot be granted holds up
+  everyone behind it
 
 ---
 
@@ -1008,6 +1066,7 @@ interface ResourceEventDetail {
   cost:       number;              // units taken. Always 1 except for a weighted resident hold
   key?:       string;              // the bucket, for keyed groups - one per event, even for a task naming several
   grant?:     unknown;             // acquired/released only: what the group granted, e.g. ['gpu1']. Absent if it grants nothing
+  request?:   unknown;             // blocked/unblocked only: what the waiter asked for, e.g. { from: ['gpu1'] }
   timestamp:  number;
   readings:   GaugeReading[];      // group state AFTER the operation
 }
@@ -1077,6 +1136,7 @@ interface AdmissionWaiter {
   cost:       number;                    // the pool's per-worker cost, or 1 for task-held
   position:   number;                    // 0-based; 0 is the head, and it is admitted first
   key?:       string;                    // the bucket, for keyed groups
+  request?:   unknown;                   // what it asked of the group, if anything - e.g. { from: ['gpu1'] }
 }
 ```
 

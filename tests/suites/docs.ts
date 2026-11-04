@@ -137,6 +137,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Concurrency Limit Per Disk', () => this.docKeyedConcurrentLimit()));
     this.results.push(await this.runTest('Doc: Several Keys Per Task', () => this.docSeveralKeysPerTask()));
     this.results.push(await this.runTest('Doc: Units With Names', () => this.docUnitsWithNames()));
+    this.results.push(await this.runTest('Doc: Asking For Particular Units', () => this.docUnitRequests()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
@@ -1232,6 +1233,81 @@ class DocsTestSuite {
     }), { createPromise: true }) as any;
     if ((r.grants.seat as any)?.seat !== 0) throw new Error(`The custom grant did not arrive: ${JSON.stringify(r.grants)}`);
     if (sameBack !== 1) throw new Error('onFinish did not get the original grant back');
+  }
+
+  // RECIPE: AGENTS.md section 5, "Asking for particular units" - the snippet
+  // and the claims under it: from pins, prefer never blocks, bad requests throw
+  // up front, a pinned waiter holds up nobody, the request on the waiter, and
+  // a pool's request with a cost
+  private async docUnitRequests(): Promise<void> {
+    const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+    const scheduler = this.makeScheduler({
+      groups: ['gpu'], maxThreads: 1, maxConcurrentTasks: 4
+    }, { gpu }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const run = (id: string, units: any, awaitMs = 20) => scheduler.addTask(new FyflowTask({
+      id, workerType: 'DocsWorker', payload: { id, value: 1, reportGrants: true, awaitMs }, units
+    }), { createPromise: true }) as Promise<any>;
+
+    // from pins; a busy pinned unit makes the task wait, not take another
+    const order: string[] = [];
+    scheduler.addEventListener('task.running', (e: any) => order.push(e.detail.id));
+    const blocked: any[] = [];
+    scheduler.addEventListener('resource.blocked', (e: any) => blocked.push(e.detail));
+    const first = run('p1', { gpu: { from: ['gpu1'] } }, 60);
+    const second = run('p2', { gpu: { from: ['gpu1'] } });
+    // A pinned waiter holds up nobody: an "any" task added behind it takes gpu0
+    const any = run('any', undefined);
+    await new Promise(r => setTimeout(r, 10));
+    const waiter = scheduler.getAdmissionQueue().gpu?.find((w: any) => w.holderId === 'p2');
+    if (JSON.stringify(waiter?.request) !== '{"from":["gpu1"]}') throw new Error(`The waiter's request: ${JSON.stringify(scheduler.getAdmissionQueue())}`);
+    if (waiter?.key !== undefined) throw new Error(`A set showed as a key: ${waiter?.key}`);
+    const [r1, r2, ra] = await Promise.all([first, second, any]);
+    if (r1.card !== 'gpu1' || r2.card !== 'gpu1') throw new Error(`Pinned tasks ran on ${r1.card}, ${r2.card}`);
+    if (ra.card !== 'gpu0') throw new Error(`The "any" task ran on ${ra.card}`);
+    if (order.indexOf('any') > order.indexOf('p2')) throw new Error(`The pinned waiter held up "any": ${order}`);
+    if (!blocked.some(d => d.holderId === 'p2' && d.request?.from?.[0] === 'gpu1')) throw new Error('resource.blocked carried no request');
+
+    // prefer changes which unit, never whether
+    const hold = run('hold', { gpu: { from: ['gpu1'] } }, 60);
+    await new Promise(r => setTimeout(r, 10));
+    const pref = await run('pref', { gpu: { prefer: ['gpu1'] } });
+    if (pref.card !== 'gpu0') throw new Error(`A busy preferred unit should be skipped, ran on ${pref.card}`);
+    await hold;
+    const pref2 = await run('pref2', { gpu: { prefer: ['gpu1'] } });
+    if (pref2.card !== 'gpu1') throw new Error(`A free preferred unit should be taken, ran on ${pref2.card}`);
+
+    // Validated up front
+    let threw = '';
+    try { run('bad', { gpu: { from: ['gpu7'] } }); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('no unit "gpu7"')) throw new Error(`A unit the group lacks should throw at addTask, got "${threw}"`);
+    threw = '';
+    try { run('badp', { gpu: { prefer: ['gpu7'] } }); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('no unit "gpu7"')) throw new Error(`prefer is validated too, got "${threw}"`);
+
+    // requestFrom: derived from the payload
+    const derived = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu', requestFrom: (t: any) => ({ from: [t.payload.card] }) });
+    const ds = this.makeScheduler({ groups: ['gpu'] }, { gpu: derived });
+    const d = await ds.addTask(new FyflowTask({
+      id: 'd', workerType: 'DocsWorker', payload: { value: 1, reportGrants: true, card: 'gpu1' }
+    }), { createPromise: true }) as any;
+    if (d.card !== 'gpu1') throw new Error(`requestFrom was not used: ran on ${d.card}`);
+
+    // A pool: the snippet's form, and a cost above its from throws
+    const cards = new UnitGroup(['gpu0', 'gpu1', 'gpu2'], { id: 'gpu' });
+    const pool = this.makeScheduler({
+      maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: { cost: 1, from: ['gpu0', 'gpu1'] } }
+    }, { gpu: cards });
+    const rs = await Promise.all([0, 1, 2, 3].map(i => pool.addTask(new FyflowTask({
+      id: `r${i}`, workerType: 'DocsWorker', payload: { value: 1, reportGrants: true, awaitMs: 30 }
+    }), { createPromise: true }) as Promise<any>));
+    const held = new Set(rs.map(r => r.worker?.gpu?.[0]));
+    if (held.has('gpu2') || held.size === 0) throw new Error(`The pool held ${[...held]}`);
+    await pool.shutdown();
+    threw = '';
+    try {
+      this.makeScheduler({ residentGroups: { gpu: { cost: 3, from: ['gpu0', 'gpu1'] } } }, { gpu: new UnitGroup(['gpu0', 'gpu1', 'gpu2'], { id: 'gpu' }) });
+    } catch (e: any) { threw = e.message; }
+    if (!threw) throw new Error('A pool cost above its from should throw at construction');
   }
 
   private async docKeyedRateLimit(): Promise<void> {

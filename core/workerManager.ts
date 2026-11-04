@@ -48,6 +48,17 @@ export type ResidentResourceNotice =
     };
 
 /**
+ * A resident group declared with a request: for a `UnitGroup`, which units a
+ * worker of this pool may hold. `cost` defaults to 1; the rest is passed to
+ * the group as its request.
+ */
+export interface ResidentGroupRequest {
+  cost?: number;
+  from?: readonly (string | number)[];
+  prefer?: readonly (string | number)[];
+}
+
+/**
  * One worker's resident holding: what each group's `onStart` returned, kept
  * to hand back to its `onFinish`, and the frozen copies the worker sees.
  */
@@ -128,13 +139,14 @@ export interface WorkerManagerOptions {
    * ```typescript
    * residentGroups: ['vram']       // one unit per worker
    * residentGroups: { vram: 20 }   // this pool's model needs 20 units per worker
+   * residentGroups: { gpu: { cost: 1, from: ['gpu0', 'gpu1'] } }   // a request, for a group that takes one
    * ```
    *
    * Cost is per worker, not per pool: `maxThreads: 4` with `{ vram: 2 }` uses 8
    * units at full spread. A worker is not created while its cost does not fit,
    * and tasks needing one wait until a holder is torn down.
    */
-  residentGroups?: string[] | Record<string, number>;
+  residentGroups?: string[] | Record<string, number | ResidentGroupRequest>;
   /** Requeue a worker's in-flight tasks when it fails, rather than failing them. Default true. */
   requeueFailedTasks?: boolean;
   /** Restarts allowed before the pool gives up and emits `worker.restart_limit_exceeded`. Default 3. */
@@ -256,6 +268,11 @@ export class WorkerManager extends EventTarget {
   /** Group id -> units one worker of this pool holds while it exists. */
   residentGroups: Record<string, number>;
   /**
+   * Group id -> what a worker asks of that group, for the groups declared with
+   * a request. Passed to `canRun` and `onStart` as their `request`.
+   */
+  residentRequests: Record<string, unknown> = {};
+  /**
    * The group objects behind {@link residentGroups}, injected by the scheduler -
    * pools are constructed with ids, and only the scheduler owns the registry.
    * Empty until then, which makes resident groups inert for a standalone pool.
@@ -282,12 +299,24 @@ export class WorkerManager extends EventTarget {
   private residentNotify?: ResidentResourceNotifier;
 
   private static _normalizeResidentGroups(
-    declared: string[] | Record<string, number> | undefined
+    declared: string[] | Record<string, number | ResidentGroupRequest> | undefined,
+    requests: Record<string, unknown>
   ): Record<string, number> {
     if (!declared) return {};
-    const costs: Record<string, number> = Array.isArray(declared)
-      ? Object.fromEntries(declared.map(id => [id, 1]))
-      : { ...declared };
+    const costs: Record<string, number> = {};
+    if (Array.isArray(declared)) {
+      for (const id of declared) costs[id] = 1;
+    } else {
+      for (const [id, value] of Object.entries(declared)) {
+        if (value !== null && typeof value === 'object') {
+          const { cost = 1, ...request } = value;
+          costs[id] = cost;
+          requests[id] = request;
+        } else {
+          costs[id] = value;
+        }
+      }
+    }
     for (const [id, cost] of Object.entries(costs)) {
       if (!Number.isInteger(cost) || cost <= 0) {
         throw new Error(
@@ -324,6 +353,15 @@ export class WorkerManager extends EventTarget {
           `a worker in this pool could never start`
         );
       }
+      // A request is validated by its group, so an impossible one throws here
+      // rather than leaving every worker of the pool waiting forever
+      const request = this.residentRequests[id];
+      if (request !== undefined) {
+        if (typeof group.checkRequest !== 'function') {
+          throw new Error(`residentGroups['${id}'] has a request, but group "${id}" takes none`);
+        }
+        group.checkRequest(request, cost);
+      }
     }
     this.residentRegistry = registry;
     this.residentNotify = notify;
@@ -333,7 +371,7 @@ export class WorkerManager extends EventTarget {
   canHoldAnotherWorker(): boolean {
     return Object.entries(this.residentGroups).every(([id, cost]) => {
       const group = this.residentRegistry[id];
-      return !group || group.canRun(undefined, cost);
+      return !group || group.canRun(undefined, cost, this.residentRequests[id]);
     });
   }
 
@@ -355,7 +393,7 @@ export class WorkerManager extends EventTarget {
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       const group = this.residentRegistry[id];
       if (!group) continue;
-      const grant = group.onStart?.(undefined, cost);
+      const grant = group.onStart?.(undefined, cost, this.residentRequests[id]);
       taken.push(id);
       if (grant === undefined) continue;
       holding.raw.set(id, grant);
@@ -466,7 +504,7 @@ export class WorkerManager extends EventTarget {
     this.inline = options.inline ?? false;
     this.config = options.config ?? {};
     this.groups = options.groups ?? [];
-    this.residentGroups = WorkerManager._normalizeResidentGroups(options.residentGroups);
+    this.residentGroups = WorkerManager._normalizeResidentGroups(options.residentGroups, this.residentRequests);
     this.requeueFailedTasks = options.requeueFailedTasks ?? true; // Default to requeue as specified
     this.maxWorkerRestarts = options.maxWorkerRestarts ?? 3; // Default: 3 restarts per worker
     this.cancelGraceMs = validateGraceMs(options.cancelGraceMs ?? 2000, 'cancelGraceMs');

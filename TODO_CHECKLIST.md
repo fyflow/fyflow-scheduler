@@ -67,11 +67,19 @@ Next:
   with the protocol in both bootstraps. `UnitGroup` granting any free unit,
   task-held and resident. The new `grants` suite is threaded on both runtimes,
   plus a browser spec.
-- **Phase 2, next.** Requests for specific units: a candidate set `from` and a
+- **Phase 2, done.** Requests for specific units: a candidate set `from` and a
   soft `prefer`, one wait queue per candidate set, FIFO across sets on a
-  release, and resident head-of-line scoped to overlapping sets.
+  release, and resident head-of-line scoped to overlapping sets. Benchmark
+  against phase 1, 10K tasks, three alternating pairs: `canRun` per task down
+  by about 1 on every shape; throughput medians two-group -9.4% (spread
+  40.7-41.8K base, 36.9-40.6K head), keyed-wide -5%, the rest within noise -
+  inside the ±10% band, two-group near its edge. The units shape: 12 `canRun`
+  per task, flat to 200K.
+- **Next:** a task blocked on resident capacity waits for a resident release
+  even when an existing worker of its pool has a free slot - with
+  `idleTimeout: 0` it waits forever. Pre-existing, found building phase 2.
 
-**Status**: 🟡 In Progress (phase 1 done)
+**Status**: 🟡 In Progress (phases 1 and 2 done)
 
 ### 0.6.0: release notes
 

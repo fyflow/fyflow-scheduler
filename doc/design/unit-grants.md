@@ -1,11 +1,25 @@
 # Units with identities — plan
 
-> **Status: open, in progress on `admission-rework` (2026-11-04).** Answers
-> fyflow-app's "scheduler pass 2 #2", P3. Phase 1 is built: grants, `UnitGroup`
-> granting any unit, task-held and resident. The contract is in `AGENTS.md`
-> §4 and §5. Phase 2, requests for specific units ("Requesting specific units"
-> below), is next. Delete this in the release commit that ships both; move
-> anything durable to `AGENTS.md` first.
+> **Status: built on `admission-rework` (2026-11-04), not yet released.**
+> Answers fyflow-app's "scheduler pass 2 #2", P3. Phase 1: grants, `UnitGroup`
+> granting any unit, task-held and resident. Phase 2: requests for specific
+> units ("Requesting specific units" below). The contract is in `AGENTS.md`
+> §4 and §5. Delete this in the release commit that ships them; move anything
+> durable to `AGENTS.md` first.
+>
+> Decisions made building phase 2:
+> - A task's request is `task.units[groupId]`, or a group's `requestFrom`.
+>   It is resolved with the resource keys, so at `addTask` (where a bad one
+>   throws) and again per attempt; `UnitGroup` caches what it resolved per
+>   request object.
+> - A pool's request is the object form of `residentGroups`, validated when
+>   the scheduler binds the pool; a group without `checkRequest` that is given
+>   one throws.
+> - A set is a queue-id suffix, as a key is, but is never shown as `key`. A
+>   release on a group with sets queues one sweep, which admits from the
+>   queue whose head blocked first, until no head fits.
+> - Measured: 12 `canRun`, 1 blocked and 1 unblocked per task with 30% pinned,
+>   flat from 10K to 200K tasks (the admission suite asserts it).
 >
 > Decisions made building phase 1, against the open questions below:
 > - A task's `context.grants` **does** include its worker's resident grants,

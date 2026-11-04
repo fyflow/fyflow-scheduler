@@ -117,6 +117,16 @@ class GrantsTestSuite {
     this.results.push(await this.runTest('A Grant That Cannot Be Copied Fails The Task And Frees The Units', () => this.testUncloneable()));
     this.results.push(await this.runTest('A Forced Stop Frees The Unit Only Once The Thread Is Dead', () => this.testForcedStop()));
     this.results.push(await this.runTest('UnitGroup Validates, And Refuses A Double Release', () => this.testValidation()));
+    // Requests for specific units. Wake-ups run with the heartbeat off: with it
+    // on, the periodic retry rescues a missed wake and the bug shows up only as
+    // latency
+    this.results.push(await this.runTest('Requests: A Pinned Waiter Does Not Hold Up Any-Unit Tasks', () => this.testPinnedDoesNotBlockAny()));
+    this.results.push(await this.runTest('Requests: A Freed Unit Goes To The Oldest Waiter That Can Use It', () => this.testOldestWaiterWins()));
+    this.results.push(await this.runTest('Requests: from Is A Candidate Set, prefer Never Blocks', () => this.testFromAndPrefer()));
+    this.results.push(await this.runTest('Requests: Waiters Carry Their Request, In Events And The Admission Queue', () => this.testRequestVisible()));
+    this.results.push(await this.runTest('Requests: A Resident Pool Takes Its Units From Its Set', () => this.testResidentFrom()));
+    this.results.push(await this.runTest('Requests: A Pool Pinned To A Busy Unit Does Not Block One Wanting A Free One', () => this.testResidentDisjointSets()));
+    this.results.push(await this.runTest('Requests: Bad Requests Throw Up Front', () => this.testRequestValidation()));
 
     const totalDuration = performance.now() - this.startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -145,12 +155,12 @@ class GrantsTestSuite {
 
   // --- helpers ---------------------------------------------------------------
 
-  private setup(inline: boolean, groups: Record<string, any>, options: any = {}, url = this.workerUrl) {
+  private setup(inline: boolean, groups: Record<string, any>, options: any = {}, url = this.workerUrl, schedulerOptions: any = {}) {
     const pool = new WorkerManager(url, {
       maxThreads: 1, maxConcurrentTasks: 4, inline, idleTimeout: 0, ...options
     });
     this.pools.push(pool);
-    const scheduler = new FyflowScheduler({ G: pool }, groups);
+    const scheduler = new FyflowScheduler({ G: pool }, groups, schedulerOptions);
     this.schedulers.push(scheduler);
     return { pool, scheduler };
   }
@@ -497,6 +507,190 @@ class GrantsTestSuite {
     const pool = new WorkerManager(this.workerUrl, { inline: true, residentGroups: { gpu: 3 } });
     this.pools.push(pool);
     throws('a resident cost above the units', () => new FyflowScheduler({ G: pool }, { gpu: new UnitGroup(2, { id: 'gpu' }) }), 'exceeds the group limit');
+  }
+  // --- requests --------------------------------------------------------------
+
+  private static readonly NO_HEARTBEAT = { periodicRetryIntervalMs: 1_000_000_000 };
+
+  /** An inline pool already warm, so tasks wait on the group and never for a worker. */
+  private async unitScheduler(units: string[]) {
+    const gpu = new UnitGroup(units, { id: 'gpu' });
+    const { pool, scheduler } = this.setup(true, { gpu }, { groups: ['gpu'], maxConcurrentTasks: 32 },
+      this.workerUrl, GrantsTestSuite.NO_HEARTBEAT);
+    await this.succeed(scheduler, this.task('warm'));
+    const acquired: Array<{ id: string; unit: string }> = [];
+    scheduler.addEventListener('resource.acquired', (e: any) => acquired.push({ id: e.detail.holderId, unit: e.detail.grant?.[0] }));
+    return { gpu, pool, scheduler, acquired };
+  }
+
+  private pinned(id: string, units: string[] | undefined, payload: any = {}, prefer?: string[]) {
+    const request: any = {};
+    if (units) request.from = units;
+    if (prefer) request.prefer = prefer;
+    return this.task(id, payload, Object.keys(request).length ? { units: { gpu: request } } : {});
+  }
+
+  private async testPinnedDoesNotBlockAny(): Promise<void> {
+    const { scheduler, acquired } = await this.unitScheduler(['g0', 'g1']);
+    const moves: string[] = [];
+    scheduler.addEventListener('resource.blocked', (e: any) => { if (e.detail.holderId === 'p2') moves.push('blocked'); });
+    scheduler.addEventListener('resource.unblocked', (e: any) => { if (e.detail.holderId === 'p2') moves.push(e.detail.reason); });
+    const p1 = this.succeed(scheduler, this.pinned('p1', ['g1'], { holdMs: 200 }));
+    const p2 = this.succeed(scheduler, this.pinned('p2', ['g1']));            // waits: g1 is out
+    const anys = [1, 2, 3, 4].map(i => this.succeed(scheduler, this.pinned(`a${i}`, undefined, { holdMs: 15 })));
+    await Promise.all(anys);
+    // Each "any" task ran on g0 in turn, while p2 still waited for g1
+    if (acquired.some(a => a.id === 'p2')) throw new Error('p2 started before p1 released g1');
+    const anyUnits = acquired.filter(a => a.id.startsWith('a')).map(a => a.unit);
+    if (anyUnits.length !== 4 || anyUnits.some(u => u !== 'g0')) throw new Error(`any-unit tasks ran on ${anyUnits}`);
+    const [, r2] = await Promise.all([p1, p2]);
+    if (!same(r2.task.gpu, ['g1'])) throw new Error(`p2 was pinned to g1 and got ${JSON.stringify(r2.task.gpu)}`);
+    // Never looked at while g0 came and went: one wait, one admission. A wake
+    // that ignored its request admitted it on every g0 release, only for it
+    // to bounce back to the tail - losing its place each time
+    if (moves.join(',') !== 'blocked,admitted') throw new Error(`p2 moved ${moves.join(',')}`);
+  }
+
+  private async testOldestWaiterWins(): Promise<void> {
+    // The pinned waiter arrives first: when g1 frees, it gets it, not the
+    // younger "any" waiter that could use it just as well
+    {
+      const { scheduler, acquired } = await this.unitScheduler(['g0', 'g1']);
+      const runs = [
+        this.succeed(scheduler, this.pinned('h0', ['g0'], { holdMs: 200 })),
+        this.succeed(scheduler, this.pinned('h1', ['g1'], { holdMs: 60 })),
+        this.succeed(scheduler, this.pinned('pin', ['g1'], { holdMs: 10 })),
+        this.succeed(scheduler, this.pinned('any', undefined, { holdMs: 10 }))
+      ];
+      await Promise.all(runs);
+      const order = acquired.filter(a => a.id === 'pin' || a.id === 'any').map(a => `${a.id}:${a.unit}`).join(',');
+      if (order !== 'pin:g1,any:g1') throw new Error(`pinned first: ${order}, expected pin:g1,any:g1`);
+    }
+    // The other way round: the older "any" waiter takes g1, and the pinned one
+    // gets it next, before h0 frees g0
+    {
+      const { scheduler, acquired } = await this.unitScheduler(['g0', 'g1']);
+      const runs = [
+        this.succeed(scheduler, this.pinned('h0', ['g0'], { holdMs: 200 })),
+        this.succeed(scheduler, this.pinned('h1', ['g1'], { holdMs: 60 })),
+        this.succeed(scheduler, this.pinned('any', undefined, { holdMs: 30 })),
+        this.succeed(scheduler, this.pinned('pin', ['g1'], { holdMs: 10 }))
+      ];
+      await Promise.all(runs);
+      const order = acquired.filter(a => a.id !== 'warm').map(a => `${a.id}:${a.unit}`).join(',');
+      if (order !== 'h0:g0,h1:g1,any:g1,pin:g1') throw new Error(`any first: ${order}`);
+    }
+  }
+
+  private async testFromAndPrefer(): Promise<void> {
+    const { scheduler } = await this.unitScheduler(['g0', 'g1', 'g2']);
+    const preferred = await this.succeed(scheduler, this.pinned('pref', undefined, {}, ['g2']));
+    if (!same(preferred.task.gpu, ['g2'])) throw new Error(`prefer g2, free: got ${JSON.stringify(preferred.task.gpu)}`);
+
+    // g2 held: prefer is ignored, not waited for
+    const holder = this.succeed(scheduler, this.pinned('hold', ['g2'], { holdMs: 80 }));
+    const t0 = Date.now();
+    const fallback = await this.succeed(scheduler, this.pinned('pref2', undefined, {}, ['g2']));
+    if (!same(fallback.task.gpu, ['g0']) || Date.now() - t0 > 60) {
+      throw new Error(`prefer g2, busy: got ${JSON.stringify(fallback.task.gpu)} after ${Date.now() - t0} ms`);
+    }
+    // from: one of a set - g2 is busy, so g1
+    const either = await this.succeed(scheduler, this.pinned('either', ['g1', 'g2']));
+    if (!same(either.task.gpu, ['g1'])) throw new Error(`from g1/g2 with g2 busy: got ${JSON.stringify(either.task.gpu)}`);
+    // prefer inside from
+    const both = await this.succeed(scheduler, this.pinned('both', ['g0', 'g1'], {}, ['g1']));
+    if (!same(both.task.gpu, ['g1'])) throw new Error(`from g0/g1 prefer g1: got ${JSON.stringify(both.task.gpu)}`);
+    await holder;
+  }
+
+  private async testRequestVisible(): Promise<void> {
+    const { scheduler } = await this.unitScheduler(['g0', 'g1']);
+    const blocked: any[] = [];
+    scheduler.addEventListener('resource.blocked', (e: any) => blocked.push(e.detail));
+    const runs = [
+      this.succeed(scheduler, this.pinned('h', ['g1'], { holdMs: 60 })),
+      this.succeed(scheduler, this.pinned('w', ['g1'])),
+      this.succeed(scheduler, this.pinned('h2', ['g0'], { holdMs: 60 })),
+      this.succeed(scheduler, this.pinned('w2', undefined))
+    ];
+    const queue = scheduler.getAdmissionQueue('gpu').gpu ?? [];
+    const w = queue.find(e => e.holderId === 'w');
+    const w2 = queue.find(e => e.holderId === 'w2');
+    if (!w || !same(w.request, { from: ['g1'] }) || w.key !== undefined || w.position !== 0) {
+      throw new Error(`the pinned waiter is listed as ${JSON.stringify(w)}`);
+    }
+    if (!w2 || w2.request !== undefined || w2.position !== 0) throw new Error(`the any waiter is listed as ${JSON.stringify(w2)}`);
+    const event = blocked.find(d => d.holderId === 'w');
+    if (!event || !same(event.request, { from: ['g1'] }) || event.key !== undefined) {
+      throw new Error(`resource.blocked for the pinned waiter: ${JSON.stringify(event)}`);
+    }
+    await Promise.all(runs);
+  }
+
+  private async testResidentFrom(): Promise<void> {
+    for (const inline of KINDS) {
+      // Cost 2 from three, one of which another pool holds: the two others
+      const gpu = new UnitGroup(['g0', 'g1', 'g2'], { id: 'gpu' });
+      const other = new WorkerManager(this.workerUrl, { inline, maxThreads: 1, maxConcurrentTasks: 1, idleTimeout: 0, residentGroups: { gpu: { from: ['g1'] } } });
+      const pinned = new WorkerManager(this.workerUrl, { inline, maxThreads: 1, maxConcurrentTasks: 1, idleTimeout: 0, residentGroups: { gpu: { cost: 2, from: ['g0', 'g1', 'g2'] } } });
+      this.pools.push(other, pinned);
+      const scheduler = new FyflowScheduler({ O: other, P: pinned }, { gpu });
+      this.schedulers.push(scheduler);
+      const o = await this.succeed(scheduler, new FyflowTask({ id: 'o', workerType: 'O', payload: {} }));
+      const p = await this.succeed(scheduler, new FyflowTask({ id: 'p', workerType: 'P', payload: {} }));
+      if (!same(o.ctor.gpu, ['g1'])) throw new Error(`${kindOf(inline)}: the g1-pinned pool got ${JSON.stringify(o.ctor.gpu)}`);
+      if (!same(p.ctor.gpu, ['g0', 'g2'])) throw new Error(`${kindOf(inline)}: cost 2 from g0/g1/g2, g1 held: got ${JSON.stringify(p.ctor.gpu)}`);
+    }
+  }
+
+  private async testResidentDisjointSets(): Promise<void> {
+    const gpu = new UnitGroup(['g0', 'g1'], { id: 'gpu' });
+    // A wants a second worker on g0, which its first holds; B wants g1, free
+    const a = new WorkerManager(this.workerUrl, { inline: true, maxThreads: 2, maxConcurrentTasks: 1, idleTimeout: 0, residentGroups: { gpu: { from: ['g0'] } } });
+    const b = new WorkerManager(this.workerUrl, { inline: true, maxThreads: 1, maxConcurrentTasks: 1, idleTimeout: 0, residentGroups: { gpu: { from: ['g1'] } } });
+    this.pools.push(a, b);
+    const scheduler = new FyflowScheduler({ A: a, B: b }, { gpu }, GrantsTestSuite.NO_HEARTBEAT);
+    this.schedulers.push(scheduler);
+
+    const a1 = this.succeed(scheduler, new FyflowTask({ id: 'a1', workerType: 'A', payload: { holdMs: 150 } }));
+    // Waits for a worker on g0. Fire-and-forget: it is not this test's concern
+    // when it runs, only that B is not queued behind it
+    scheduler.addTask(new FyflowTask({ id: 'a2', workerType: 'A', payload: {} }));
+    const waiting = scheduler.getAdmissionQueue('gpu').gpu ?? [];
+    if (!waiting.some(w => w.holderId === 'a2' && w.lifetime === 'resident')) {
+      throw new Error(`precondition: a2 should wait for a worker on g0, queue ${JSON.stringify(waiting)}`);
+    }
+    // B's set does not overlap A's waiter's, so it is not behind it
+    const t0 = Date.now();
+    const b1 = await this.succeed(scheduler, new FyflowTask({ id: 'b1', workerType: 'B', payload: {} }));
+    if (Date.now() - t0 > 80 || !same(b1.ctor.gpu, ['g1'])) {
+      throw new Error(`B waited ${Date.now() - t0} ms behind A's waiter, and got ${JSON.stringify(b1.ctor?.gpu)}`);
+    }
+    await a1;
+  }
+
+  private async testRequestValidation(): Promise<void> {
+    const throws = (what: string, fn: () => unknown, includes: string) => {
+      try { fn(); } catch (e: any) {
+        if (!String(e?.message).includes(includes)) throw new Error(`${what}: threw "${e?.message}", expected "${includes}"`);
+        return;
+      }
+      throw new Error(`${what}: did not throw`);
+    };
+    const { scheduler } = this.setup(true, { gpu: new UnitGroup(['g0', 'g1'], { id: 'gpu' }) }, { groups: ['gpu'] });
+    throws('an unknown unit at addTask', () => scheduler.addTask(this.pinned('bad', ['g9'])), 'has no unit "g9"');
+    throws('an unknown preferred unit', () => scheduler.addTask(this.pinned('bad2', undefined, {}, ['g9'])), 'has no unit "g9"');
+    throws('a request that is not an object', () => scheduler.addTask(this.task('bad3', {}, { units: { gpu: 'g0' } })), 'must be an object');
+    if (scheduler.stats.queued !== 0) throw new Error('a rejected task was queued');
+
+    const make = (residentGroups: any, groups: any) => () => {
+      const pool = new WorkerManager(this.workerUrl, { inline: true, residentGroups });
+      this.pools.push(pool);
+      return new FyflowScheduler({ G: pool }, groups);
+    };
+    throws('a resident unit that does not exist', make({ gpu: { from: ['g9'] } }, { gpu: new UnitGroup(['g0'], { id: 'gpu' }) }), 'has no unit "g9"');
+    throws('a resident cost above its set', make({ gpu: { cost: 2, from: ['g0'] } }, { gpu: new UnitGroup(['g0', 'g1'], { id: 'gpu' }) }), 'can never be granted');
+    throws('a request to a group that takes none', make({ vram: { from: ['x'] } }, { vram: { id: 'vram', type: 'x', canRun: () => true, getMetrics: () => ({ limit: 4 }) } }), 'takes none');
   }
 }
 

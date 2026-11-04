@@ -23,7 +23,7 @@
 
 import {
   WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup,
-  KeyedConcurrentLimitGroup
+  KeyedConcurrentLimitGroup, UnitGroup
 } from '../../index.ts';
 import { runTest, type RunTestOptions, type TestResult } from '../harness.ts';
 import { KeyedCounterGroup, instrument } from '../fixtures/keyedCounterGroup.ts';
@@ -167,6 +167,7 @@ class AdmissionTestSuite {
     await this.run('Global Group Admission Cost Is Flat', () => this.testCostFlat('global'));
     await this.run('Keyed Admission Cost Is Flat In Queue Depth', () => this.testCostFlat('keyed'));
     await this.run('Two-Group Admission Cost Is Flat', () => this.testCostFlat('two-group'));
+    await this.run('Unit Admission Cost Is Flat, With 30% Pinned', () => this.testCostFlat('units'));
     await this.run('A Full Pool Takes Only What A Release Freed', () => this.testFullPoolTakesOne());
     await this.run('Wake: A Task-Held Waiter Short Of A Worker Moves To The Resident Queue', () => this.testShortOfWorkerMoves());
     await this.run('A Resident Head Whose Own Group Is Full Keeps Its Place', () => this.testResidentHeadKeepsPlace());
@@ -643,7 +644,7 @@ class AdmissionTestSuite {
    * apart: flat is a ratio near 1, and the quadratic shape doubles with each
    * doubling of depth.
    */
-  private async testCostFlat(shape: 'global' | 'keyed' | 'two-group') {
+  private async testCostFlat(shape: 'global' | 'keyed' | 'two-group' | 'units') {
     const small = await this.measureShape(shape, 1);
     const large = await this.measureShape(shape, 8);
     const ratio = large.canRunPerTask / small.canRunPerTask;
@@ -658,12 +659,14 @@ class AdmissionTestSuite {
     }
   }
 
-  private async measureShape(shape: 'global' | 'keyed' | 'two-group', scale: number) {
+  private async measureShape(shape: 'global' | 'keyed' | 'two-group' | 'units', scale: number) {
     const groups: Record<string, any> = shape === 'global'
       ? { g: new ConcurrentLimitGroup(7, 'g') }
       : shape === 'keyed'
         ? { k: new KeyedCounterGroup(2, 'k') }
-        : { A: new ConcurrentLimitGroup(4, 'A'), B: new ConcurrentLimitGroup(4, 'B') };
+        : shape === 'units'
+          ? { u: new UnitGroup(8, { id: 'u' }) }
+          : { A: new ConcurrentLimitGroup(4, 'A'), B: new ConcurrentLimitGroup(4, 'B') };
     const counters = Object.values(groups).map(g => instrument(g));
     const s = this.track(new FyflowScheduler({ W: this.pool({ maxConcurrentTasks: 50 }) }, groups));
     let blocked = 0;
@@ -674,6 +677,8 @@ class AdmissionTestSuite {
       const config: Record<string, any> =
         shape === 'global' ? { workerGroups: ['g'] }
         : shape === 'keyed' ? { workerGroups: ['k'], limitKey: `key${i % 10}` }
+        // 30% pinned to one unit each: eight wait sets plus "any"
+        : shape === 'units' ? { workerGroups: ['u'], ...(i % 10 < 3 ? { units: { u: { from: [i % 8] } } } : {}) }
         : { workerGroups: i % 3 === 0 ? ['A', 'B'] : i % 3 === 1 ? ['A'] : ['B'] };
       return new FyflowTask({ id: `t${i}`, workerType: 'W', payload: { countConcurrency: true, taskId: i }, ...config });
     });
