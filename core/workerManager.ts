@@ -414,7 +414,7 @@ export class WorkerManager extends EventTarget {
   // Direct execution without internal queueing
   async enqueueNoQueue(taskId: string, payload: any): Promise<any> {
     // Find an available thread
-    let targetThread = this.threads.find(t =>
+    const targetThread = this.threads.find(t =>
       t.canAcceptTask && t.canAcceptTask()
     );
 
@@ -423,8 +423,6 @@ export class WorkerManager extends EventTarget {
     if (!targetThread && this.threads.length < this.maxThreads
         && this._acquireResident()) {
       const newThread = this._newWorker(this.config);
-
-      this._bindResidentHolder(newThread.id);
 
       // Set up event listeners
       this._setupWorkerEventListeners(newThread);
@@ -438,7 +436,14 @@ export class WorkerManager extends EventTarget {
       // meanwhile. Awaiting the thread first, as this once did, left its slot
       // showing free for that await, so the next task in the same dispatch
       // loop took it and this one bounced off a full worker.
-      targetThread = newThread;
+      const running = newThread.runTask(taskId, payload);
+
+      // Announced last, once the worker is counted in `threads` and holds its
+      // task: resource.acquired can reach a listener that re-enters the
+      // scheduler, and announced any earlier, a task dispatched from there saw
+      // room for another worker and the pool created more than maxThreads.
+      this._bindResidentHolder(newThread.id);
+      return running;
     }
 
     if (!targetThread) {
@@ -644,14 +649,15 @@ export class WorkerManager extends EventTarget {
 
     const thread = this._newWorker(this.config);
 
-    this._bindResidentHolder(thread.id);
-
     // Set up event listeners first
     this._setupWorkerEventListeners(thread);
 
     // Add worker to pool and start idle timer if needed
     this.threads.push(thread);
     this.startIdleTimer(); // Start idle timer when first worker is added
+
+    // Announced once it is in `threads`: see enqueueNoQueue
+    this._bindResidentHolder(thread.id);
     return thread;
   }
 

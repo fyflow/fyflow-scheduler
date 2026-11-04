@@ -49,6 +49,14 @@ task naming several keys (a C:→D: copy touches both disks).
 
 ## Phase 0 — make "concurrency limits are hard caps" the contract
 
+> **Done** on `admission-rework`. The contract is in `AGENTS.md` §1. The audit
+> found finding 1 was not quite right: re-entry from `resource.acquired` could
+> overshoot a second group, and from a resident acquire, `maxThreads`. Both
+> fixed; a third re-entry bug, a task failing for good when its slot was taken,
+> fixed too. Details in the `TODO_CHECKLIST.md` archive. For the release notes:
+> strengthening the contract breaks no consumer, and downstream code that
+> defends against an overshoot can drop it.
+
 A prerequisite here, and required by `unit-grants.md`, which cannot tolerate
 overshoot at all.
 

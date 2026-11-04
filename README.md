@@ -415,8 +415,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   is terminated (default 2000). A forced stop is not counted as a restart
 
 **ConcurrentLimitGroup(limit, id?)**
-- Resource constraint with a concurrent execution limit. Optimistic: may briefly
-  exceed the limit by up to `maxThreads × maxConcurrentTasks` under contention
+- Resource constraint with a concurrent execution limit. A hard cap: no more
+  tasks hold it than its limit
 
 **RateLimitGroup(windows, id?)**
 - Time-window throttling, e.g. `[{ limit: 10, windowMs: 1000 }]`. Multiple

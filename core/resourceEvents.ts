@@ -99,7 +99,7 @@ export interface ResourceEventDetail {
   timestamp: number;
   /**
    * Group state **after** the operation, one entry per gauge the group
-   * declares. Never clamped: an optimistic group may read above its limit.
+   * declares. Never clamped: a group may read above a limit lowered under running tasks.
    */
   readings: GaugeReading[];
 }

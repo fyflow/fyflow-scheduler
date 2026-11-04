@@ -104,6 +104,9 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Worker Config From The Pool', () => this.docWorkerConfig()));
     this.results.push(await this.runTest('Doc: Concurrent Limit Group', () => this.docConcurrentGroup()));
     this.results.push(await this.runTest('Doc: Rate Limit Group', () => this.docRateLimitGroup()));
+    this.results.push(await this.runTest('Doc: A Concurrency Limit Is A Hard Cap, Even Re-entered', () => this.docHardCap()));
+    this.results.push(await this.runTest('Doc: A Rate Group Caps Starts Per Window', () => this.docRateCapsStarts()));
+    this.results.push(await this.runTest('Doc: Lowering A Limit Keeps Running Tasks', () => this.docLoweredLimit()));
     this.results.push(await this.runTest('Doc: Resource Metrics And Stats', () => this.docResourceMonitoring()));
     this.results.push(await this.runTest('Doc: Progress Reporting', () => this.docProgress()));
     this.results.push(await this.runTest('Doc: A Log Channel With emit()', () => this.docLogChannel()));
@@ -246,9 +249,10 @@ class DocsTestSuite {
     // with no group at all.
     const scheduler = this.makeScheduler({ groups: ['cpu'], maxThreads: 4, maxConcurrentTasks: 4 }, { cpu });
 
-    let inFlight = 0, peak = 0;
-    scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
-    scheduler.addEventListener('task.completed', () => { inFlight--; });
+    // Read from the group, not by counting task.running against task.completed,
+    // which overshoots (AGENTS.md §1)
+    let peak = 0;
+    scheduler.addEventListener('resource.acquired', () => { peak = Math.max(peak, cpu.getMetrics().running); });
 
     const tasks = Array.from({ length: 8 }, (_, i) => new FyflowTask({
       id: `doc-cpu-${i}`, workerType: 'DocsWorker',
@@ -258,14 +262,94 @@ class DocsTestSuite {
 
     if (scheduler.stats.done !== 8) throw new Error(`Expected 8 done, got ${scheduler.stats.done}`);
 
-    // Groups are optimistic, so a brief overshoot is expected - but nothing near
-    // the pool's own capacity of 16
-    if (peak > 6) {
-      throw new Error(`Group did not constrain concurrency: peak ${peak} against a limit of 2`);
+    // A hard cap, and reached: a peak below 2 would mean the group, not the
+    // pool, was never the bound
+    if (peak !== 2) {
+      throw new Error(`Expected the group to peak at its limit of 2, got ${peak}`);
     }
     if (cpu.getMetrics().running !== 0) {
       throw new Error(`Expected group drained, got ${cpu.getMetrics().running} running`);
     }
+  }
+
+  /**
+   * AGENTS.md §1: no more tasks hold a ConcurrentLimitGroup than its limit,
+   * including when a listener re-enters the scheduler from resource.acquired.
+   * Tasks need one or both of two groups, and every acquire of A adds a task
+   * needing only B - the order in which a task dispatched from inside another's
+   * acquisition could take B between that task's check and its own acquire.
+   */
+  private async docHardCap(): Promise<void> {
+    const A = new ConcurrentLimitGroup(3, 'A');
+    const B = new ConcurrentLimitGroup(2, 'B');
+    const scheduler = this.makeScheduler({ maxThreads: 4, maxConcurrentTasks: 8 }, { A, B });
+    let peakA = 0, peakB = 0, added = 0;
+    const children: Promise<any>[] = [];
+    const task = (id: string, groups: string[]) => new FyflowTask({
+      id, workerType: 'DocsWorker', workerGroups: groups, payload: { id, value: 1, awaitMs: 5 }
+    });
+    scheduler.addEventListener('resource.acquired', (e: any) => {
+      peakA = Math.max(peakA, A.getMetrics().running);
+      peakB = Math.max(peakB, B.getMetrics().running);
+      if (e.detail.groupId === 'A' && added < 40) {
+        children.push(scheduler.addTask(task(`child-${added++}`, ['B']), { createPromise: true }) as Promise<any>);
+      }
+    });
+    const parents = Array.from({ length: 40 }, (_, i) => task(`parent-${i}`, i % 2 ? ['A', 'B'] : ['A']));
+    await Promise.all(scheduler.addTasks(parents, { createPromise: true }) as Promise<any>[]);
+    await Promise.all(children);
+    if (peakA > 3 || peakB > 2) throw new Error(`Limits exceeded: A peaked at ${peakA}/3, B at ${peakB}/2`);
+    if (peakA !== 3 || peakB !== 2) throw new Error(`Limits never reached (A ${peakA}/3, B ${peakB}/2) - the test proves nothing`);
+  }
+
+  /**
+   * AGENTS.md §1: a rate group caps starts - no more than `limit` within any
+   * `windowMs` - and not how many run at once.
+   */
+  private async docRateCapsStarts(): Promise<void> {
+    const windowMs = 150;
+    const api = new RateLimitGroup([{ limit: 3, windowMs }], 'api');
+    const scheduler = this.makeScheduler({ groups: ['api'], maxThreads: 4, maxConcurrentTasks: 4 }, { api });
+    const starts: number[] = [];
+    scheduler.addEventListener('resource.acquired', (e: any) => starts.push(e.detail.timestamp));
+    const tasks = Array.from({ length: 9 }, (_, i) => new FyflowTask({
+      id: `rate-${i}`, workerType: 'DocsWorker', payload: { id: `rate-${i}`, value: i, awaitMs: 20 }
+    }));
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+    starts.sort((a, b) => a - b);
+    if (starts.length !== 9) throw new Error(`Expected 9 acquires, got ${starts.length}`);
+    // The event's timestamp is read just after the group's own clock, so allow
+    // a millisecond at the window's edge
+    for (const end of starts) {
+      const inWindow = starts.filter(t => t > end - windowMs + 1 && t <= end).length;
+      if (inWindow > 3) throw new Error(`${inWindow} starts within ${windowMs}ms ending at +${end - starts[0]}ms; limit 3`);
+    }
+  }
+
+  /**
+   * AGENTS.md §1: lowering `limit` under running tasks keeps their units, and
+   * admits nothing new until the count is below the new limit.
+   */
+  private async docLoweredLimit(): Promise<void> {
+    const cpu = new ConcurrentLimitGroup(4, 'cpu');
+    const scheduler = this.makeScheduler({ groups: ['cpu'], maxThreads: 4, maxConcurrentTasks: 4 }, { cpu });
+    const admittedOver: number[] = [];
+    scheduler.addEventListener('resource.acquired', () => {
+      const running = cpu.getMetrics().running;
+      if (cpu.limit === 1 && running > 1) admittedOver.push(running);
+    });
+    const tasks = Array.from({ length: 8 }, (_, i) => new FyflowTask({
+      id: `low-${i}`, workerType: 'DocsWorker', payload: { id: `low-${i}`, value: i, awaitMs: 40 }
+    }));
+    const all = Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+    await new Promise(r => setTimeout(r, 10));
+    if (cpu.getMetrics().running !== 4) throw new Error(`Expected 4 running before lowering, got ${cpu.getMetrics().running}`);
+    cpu.limit = 1;
+    // The four already running keep their units: the reading sits above the limit
+    if (cpu.read()[0].value !== 4) throw new Error(`Expected the reading to stay at 4, got ${cpu.read()[0].value}`);
+    await all;
+    if (admittedOver.length > 0) throw new Error(`Admitted while over the lowered limit: ${admittedOver.join(', ')}`);
+    if (scheduler.stats.done !== 8) throw new Error(`Expected 8 done, got ${scheduler.stats.done}`);
   }
 
   private async docRateLimitGroup(): Promise<void> {
@@ -968,9 +1052,12 @@ class DocsTestSuite {
       const scheduler = new FyflowScheduler({ DocsWorker: pool }, { cpu: group });
       this.schedulers.push(scheduler);
 
-      let inFlight = 0, peak = 0;
+      // In flight, from events: the undeclared run never acquires the group,
+      // so the group's own count cannot measure it
+      let inFlight = 0, peak = 0, held = 0;
       scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
       scheduler.addEventListener('task.completed', () => { inFlight--; });
+      scheduler.addEventListener('resource.acquired', () => { held = Math.max(held, group.getMetrics().running); });
 
       const tasks = Array.from({ length: 40 }, (_, i) => new FyflowTask({
         id: `grp-${declare}-${i}`,
@@ -978,7 +1065,7 @@ class DocsTestSuite {
         payload: { id: `grp-${i}`, value: i, awaitMs: 25 }
       }));
       await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
-      return peak;
+      return declare ? held : peak;
     };
 
     const undeclared = await peakWith(false);
@@ -989,8 +1076,8 @@ class DocsTestSuite {
     if (undeclared <= 4) {
       throw new Error(`An undeclared group appears to constrain now (peak ${undeclared}) - docs need updating`);
     }
-    // Declared: bounded by the limit, allowing for documented optimistic overshoot
-    if (declared > 4) {
+    // Declared: the limit is a hard cap
+    if (declared !== 2) {
       throw new Error(`Declared group did not constrain: peak ${declared} for a limit of 2`);
     }
   }

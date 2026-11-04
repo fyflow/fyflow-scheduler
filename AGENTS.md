@@ -30,15 +30,35 @@ A", either await A and then add B, or have A spawn B (§7).
 | Not available | Use instead |
 |---|---|
 | Task dependencies (`dependsOn`, `parents`, `children`) | Await a task, or spawn from inside a worker (§7) |
-| `StrictLimitGroup`, token/semaphore acquisition | `ConcurrentLimitGroup` (soft) or `RateLimitGroup` |
+| `StrictLimitGroup`, token/semaphore acquisition | `ConcurrentLimitGroup`, which is already a hard cap, or `RateLimitGroup` |
 | `DagScheduler`, `DagTask` | `FyflowScheduler`, `FyflowTask` |
 | Priorities, cron/scheduled tasks, persistence | Not implemented |
 | `context.log()`, `task.log`, log levels | `context.emit('log', ...)` and `task.message` (§6, recipe in §10) |
 | Cancelling a whole run, or a task's descendants, in one call | `scheduler.cancel(id)` per task (§5, recipe in §10) |
 
-Both group types are **optimistic**: a limit can be briefly exceeded by up to
-`maxThreads × maxConcurrentTasks` under race conditions. Nothing here guarantees
-a hard cap.
+**Concurrency limits are hard caps.** No more tasks hold a `ConcurrentLimitGroup`
+than its limit, counted from `onStart` to `onFinish`. A task's groups are checked
+and acquired in one synchronous turn, and every `resource.*` event goes out after
+the acquires it reports, so a listener that re-enters the scheduler - `addTask`
+dispatches synchronously - cannot slip a task in between.
+
+**A rate group caps starts.** No more than `limit` tasks start within any
+`windowMs`. Completions count against the window as well, so it can admit fewer;
+it does not cap how many run at once - pair it with a `ConcurrentLimitGroup` for
+that. `KeyedRateLimitGroup` applies the same per key.
+
+Two things look like an overshoot and are not:
+
+- **Counting events.** `task.running` minus `task.completed` can read above the
+  limit: a task's units are released before its `task.completed` fires, and the
+  freed unit can be refilled first. Read `group.getMetrics().running` instead.
+- **Lowering a limit at runtime.** `group.limit = n` takes effect at the next
+  admission. Tasks already running keep their units, and nothing new is admitted
+  until the count is below `n`.
+
+Re-entering the scheduler from inside a group's own methods (`canRun`,
+`onStart`, `onFinish`) or from the group's own `EventTarget` events is not
+supported: those run in the middle of admission.
 
 ---
 
@@ -620,9 +640,10 @@ Two rules that are part of the contract, not implementation detail:
 
 - **An unrecognised `kind` renders as `level`**, using `value` and `limit`.
   Without this, adding a third kind later breaks every viewer already deployed.
-- **Readings are never clamped.** Groups are optimistic, so a `level` reading may
-  exceed its limit; clamping would make the event disagree with `getMetrics()`
-  exactly when the disagreement matters.
+- **Readings are never clamped.** A `level` reading can still exceed its limit -
+  after a limit is lowered under running tasks (§1), or from a custom group -
+  and clamping would make the event disagree with `getMetrics()` exactly when
+  the disagreement matters.
 
 `ResourceGroup.type` is `string`, not a closed union, so a group defined outside
 this library can name itself. Do not `switch` exhaustively on it — that is what
@@ -1082,7 +1103,7 @@ resources, until `run()` returns.
 | Compile error extending `BaseWorker` | `setup()` / `teardown()` not implemented — both are abstract |
 | Task ends in `user_action`, not `failed` | Non-optional task, retries exhausted |
 | Memory grows in a long-running process | Completed tasks are retained; set `maxCompletedTasks` |
-| Limit briefly exceeded | Groups are optimistic by design (§1) |
+| A limit looks exceeded | Counted from `task.running`/`task.completed`, which overshoot - read `group.getMetrics().running`. Or the limit was lowered while tasks held it (§1) |
 | A resource group has no effect at all | The pool never declared it. Registering a group on the scheduler is not enough - add it to the pool's `groups` or the task's `workerGroups` |
 | `Missing limit key for group "x"` | The task belongs to a `KeyedRateLimitGroup` but has no `limitKey`, and the group's `keyFrom` returned nothing |
 | `Task "x" was cancelled - create a new FyflowTask to run it again` | `addTask` with a task object that was cancelled. A new `FyflowTask` may reuse the id |

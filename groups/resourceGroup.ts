@@ -54,8 +54,9 @@ export interface GaugeSpec {
  * The dynamic half - carried on every resource event, and the state *after*
  * whatever the event reports.
  *
- * `value` is not clamped: groups are optimistic, so a `level` reading may
- * exceed its limit. Clamping would make the event disagree with `getMetrics()`.
+ * `value` is not clamped: a `level` reading can exceed its limit - after the
+ * limit is lowered under running tasks, or from a custom group. Clamping would
+ * make the event disagree with `getMetrics()`.
  */
 export interface GaugeReading {
   /** Matches a {@link GaugeSpec.id} from the same group. */

@@ -64,8 +64,8 @@ interface KeyState {
  * over the limit wait in a per-key blocked queue, so a saturated key never
  * delays tasks belonging to another key.
  *
- * Like the other groups this is optimistic: a key's limit can be briefly
- * exceeded by up to `maxThreads x maxConcurrentTasks` under race conditions.
+ * No more than a window's `limit` tasks of one key start within its
+ * `windowMs`; completions count against the window too.
  */
 export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
   readonly id: string;

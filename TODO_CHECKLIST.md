@@ -17,15 +17,6 @@ below.
 fyflow-app's pass 2 (`../fyflow-app/.scratch/mu-upstream-adoption/requests/fyflow-scheduler.pass2.md`)
 is planned. The reply has not been sent yet.
 
-#### 🔵 Concurrency limits are hard caps: make it the documented contract
-Phase 0 of `doc/design/keyed-concurrent-limit.md`, and a prerequisite for both
-tasks below. The code already acquires in the same synchronous turn as the check,
-and `testLimitsHoldAtScale` asserts the peak. Only the docs (`AGENTS.md` §1 and
-§9, `README.md`) still call groups "optimistic". Audit every `onStart` path,
-reword the docs, and add a mutation-checked docs test.
-
-**Status**: 🔵 Not Started
-
 #### 🔵 `KeyedConcurrentLimitGroup` (scheduler pass 2 #1, P3)
 Phase A of `doc/design/keyed-concurrent-limit.md`: a concurrency limit counted
 per key, with an optional `limitFor(key)`, immediate key eviction and per-key
@@ -156,9 +147,11 @@ the event count peaked at 319, the count inside `run()` at 160. Under a group
 limit of 7 the overshoot is 1. No limit is broken - releasing before emitting is
 the "transitions complete before events" rule - but a consumer gauging
 concurrency from events sees false overshoots. Several docs tests count this way
-and only pass because they run few tasks. Proposed: document it in `AGENTS.md`
-next to the events, pointing at `group.running` and `scheduler.stats.running`
-instead, with a docs test; change the docs tests that count from events.
+and only pass because they run few tasks. Now documented in `AGENTS.md`
+§1, pointing at `group.getMetrics().running`, and the two docs tests that bounded a
+group by counting events read the group instead. Left: a docs test for the
+claim itself, and the remaining event-counting tests (inline concurrency, keyed
+isolation), which bound pool capacity or a lower bound and pass either way.
 
 **Status**: 🔵 Not Started
 
@@ -399,6 +392,7 @@ another day does not.
 The following tasks have been completed and verified:
 
 ### ✅ Recently Completed (2026)
+- **Concurrency limits are hard caps (phase 0 of `doc/design/keyed-concurrent-limit.md`)** - `AGENTS.md` §1, the §9 row, `README.md` and the group doc comments called groups "optimistic", able to overshoot by `maxThreads x maxConcurrentTasks`; they now state the contract: no more tasks hold a `ConcurrentLimitGroup` than its limit, a rate group caps starts per window (not concurrency), counting events can overshoot, and a lowered limit keeps running tasks' units. The audit of every `onStart` path found the claim was not quite true, through re-entry: `resource.acquired` fired between one group's acquire and the next, so a task added from that listener took a group the first had checked but not yet taken (B at limit 1 held 2); and a worker's resident acquire was announced before it joined `threads`, so a task added there made the pool outgrow `maxThreads` (1 -> 2). Both fixed by finishing every transition before its events. Found on the way, older than all of this: a task whose pool slot was taken by a task added from its own `resource.acquired` failed for good in `user_action` ("No worker thread available") - now requeued as the capacity race it is. Re-entry from a group's own methods or `EventTarget` events is declared unsupported rather than guarded. Three docs tests (hard cap under re-entry, rate caps starts, lowered limit), two existing docs tests moved from counting events to the group's reading, four admission tests; mutations caught: no `canRun` at dispatch, interleaved acquire events, resident announced early.
 - **A burst onto a threaded pool no longer bounces off new workers** - a new thread took its first task a microtask after `enqueueNoQueue` created it, so for that microtask its slot showed free; the next task in the same dispatch loop took it, and the first was put back, its groups released, and retried after the 10 ms capacity-race backoff. One bounce per new worker: 3 extra `resource.acquired`/`released` pairs for 4 threads, 7 for 8, start times spread 30-60 ms. A fresh thread now takes its task in the same turn, as an inline one always did, which leaves nothing that awaits between dispatch and the thread: the polling wait, the pool's `enqueuing` map and `initializingThreads` are gone, and the cancellation suite's "on its way to a new thread" place with them (six places now, not seven). Measured on the same bursts: no extra acquires, the last task starts as early or earlier (8 x 1: 88-119 ms against 110-131 ms), start times 3-6 ms apart rather than 10-80, the first can start later since every worker now starts at once; `benchmark:quick` threaded scenarios unchanged run alone (2.37 s against 2.38 s). Investigated as a suspected double count of initialising workers (`threads` + `initializingThreads`) serialising start-ups, which it is not - start-ups overlap. Test: "A Burst Onto An Empty Threaded Pool Dispatches Each Task Once" (admission).
 - **A worker becoming ready now dispatches** - tasks that arrived while a pool's only worker was starting found no free slot and no room for another worker, and the worker becoming ready ran no dispatch, so they waited for the next settle or the heartbeat: with `maxThreads: 1, maxConcurrentTasks: 8` the second task waited out the whole first task. Inline pools did the same. The scheduler now runs its dispatch loop a microtask after `worker.initialization.completed`. Two heartbeat-off tests in the admission suite (threaded and inline), both failing without the fix. Found during admission R2; R1 and earlier behaved the same.
 - **A browser performance spec no longer asserts a timing order** - "should measure Web Worker vs inline performance" required the Web Worker run to be the slower one, a race that failed once on WebKit in a full run. The overhead is now reported as a test annotation, and the spec shuts its two schedulers down, which it never did.

@@ -174,6 +174,10 @@ class AdmissionTestSuite {
     // Guards
     await this.run('Limits And Fold Invariants Hold Under Mixed Contention', () => this.testMixedContention());
     await this.run('Re-entrant Cancel And Add From resource.acquired Settle Everything', () => this.testReentrantListeners());
+    await this.run('A Task Whose Slot Is Taken From resource.acquired Is Requeued, Not Failed', () => this.testSlotTakenRequeues(false));
+    await this.run('A Task Whose Slot Is Taken From resource.acquired Is Requeued, Not Failed (threaded)', () => this.testSlotTakenRequeues(true));
+    await this.run('Adding From A Resident Acquire Creates No Worker Past maxThreads', () => this.testResidentReentryMaxThreads(false));
+    await this.run('Adding From A Resident Acquire Creates No Worker Past maxThreads (threaded)', () => this.testResidentReentryMaxThreads(true));
 
     const totalDuration = performance.now() - startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -767,6 +771,53 @@ class AdmissionTestSuite {
    * task cancelled after the retry loop collected it, is covered by the
    * cancellation suite's "Cancel From An Admitted Unblock".
    */
+  /**
+   * resource.acquired goes out before the task reaches a worker. A listener
+   * adding a task there dispatches it at once, into the slot the first was
+   * about to take - which then found no worker and no room for one, and failed
+   * for good, ending in `user_action`. It did nothing wrong: it is requeued.
+   */
+  private async testSlotTakenRequeues(threaded: boolean) {
+    const g = new ConcurrentLimitGroup(5, 'g');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool({ maxThreads: 1, maxConcurrentTasks: 1, inline: !threaded }) }, { g }
+    ));
+    let child: Promise<unknown> | undefined;
+    s.addEventListener('resource.acquired', () => {
+      child ??= s.addTask(this.task('child', {}, 10), { createPromise: true }) as Promise<unknown>;
+    });
+    const first = s.addTask(this.task('first', { workerGroups: ['g'] }, 10), { createPromise: true }) as Promise<unknown>;
+    const outcome = await first.then(() => 'done', (e: any) => `failed: ${e?.message ?? e}`);
+    await child;
+    if (outcome !== 'done') throw new Error(`"first" ${outcome} (state ${s.tasks.get('first')?.state})`);
+    if (g.getMetrics().running !== 0) throw new Error(`g still holds ${g.getMetrics().running}`);
+  }
+
+  /**
+   * A worker's resident acquire is announced from inside its creation. A
+   * listener adding a task there re-enters the dispatch loop, which must
+   * already count the new worker: announced before it joined the pool, the
+   * nested dispatch saw room for another and the pool outgrew maxThreads.
+   */
+  private async testResidentReentryMaxThreads(threaded: boolean) {
+    const R = new ConcurrentLimitGroup(10, 'R');
+    const pool = this.pool({ maxThreads: 1, maxConcurrentTasks: 1, inline: !threaded, residentGroups: { R: 1 } });
+    const s = this.track(new FyflowScheduler({ W: pool }, { R }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    let peakWorkers = 0, added = 0;
+    const children: Promise<unknown>[] = [];
+    s.addEventListener('resource.acquired', (e: any) => {
+      peakWorkers = Math.max(peakWorkers, pool.getWorkerIds().length);
+      if (e.detail.groupId === 'R' && added < 3) {
+        children.push(s.addTask(this.task(`child-${added++}`, {}, 5), { createPromise: true }) as Promise<unknown>);
+      }
+    });
+    await s.addTask(this.task('first', {}, 20), { createPromise: true });
+    await Promise.all(children);
+    const workers = Math.max(peakWorkers, pool.getWorkerIds().length);
+    if (workers > 1) throw new Error(`maxThreads 1, but the pool had ${workers} workers`);
+    if (R.getMetrics().running > 1) throw new Error(`R held ${R.getMetrics().running} units for one worker`);
+  }
+
   private async testReentrantListeners() {
     const g = new ConcurrentLimitGroup(2, 'g');
     const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['g'] }) }, { g }));

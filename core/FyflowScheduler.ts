@@ -960,9 +960,14 @@ export class FyflowTask {
       task._resourceKeys = keys;
       task._resourcesPreAllocated = true;
 
+      // Every group first, then the events. A resource.acquired listener can
+      // re-enter the scheduler - addTask dispatches synchronously - and with
+      // the events in between, a task dispatched from there passed canRun on a
+      // group this one had checked but not yet taken, and both took it: a
+      // concurrency group held more than its limit.
+      for (const { id, group } of entries) group.onStart(group.keyed ? keys[id] : undefined);
       entries.forEach(({ id, group }) => {
         const key = group.keyed ? keys[id] : undefined;
-        group.onStart(key);
         // After the mutation, so `readings` are the state a fold should land on
         if (this._resourceObserved) {
           this._emitResource('resource.acquired', group, {
@@ -998,8 +1003,15 @@ export class FyflowTask {
             return;
           }
 
-          // Handle race condition: thread filled up between check and dispatch
-          if (error.message === 'Worker at maximum concurrent task capacity') {
+          // The capacity race: the pool's room went between the check and the
+          // hand-over. A worker filled up, or there was none and no room for
+          // one - the second is what a resource.acquired listener adding a
+          // task causes, since that task is dispatched into the slot this one
+          // was about to take. Neither is the task's fault; it used to fail
+          // the second way for good, in user_action.
+          const message = typeof error?.message === 'string' ? error.message : '';
+          if (message === 'Worker at maximum concurrent task capacity'
+              || message.startsWith('No worker thread available')) {
             // Being cancelled: it ends here rather than going back in the queue
             if (task.cancellation) {
               this._onTaskFailed(task, error, pool, token);

@@ -7,21 +7,16 @@ import type {
 } from './resourceGroup.ts';
 
 /**
- * ConcurrentLimitGroup - Optimistic resource limits with soft concurrency control
+ * ConcurrentLimitGroup - at most `limit` tasks hold it at once.
  *
- * Uses optimistic allocation: checks capacity at dispatch, acquires at execution.
- * May temporarily exceed limit by up to maxThreads × maxConcurrentTasks due to race conditions.
- *
- * Best for:
- * - CPU scheduling (soft limit, temporary overshoot acceptable)
- * - Throughput limiting (approximate rate control)
- * - Load balancing (advisory limits)
- *
- * Note: May temporarily exceed limit by up to maxThreads × maxConcurrentTasks due to race conditions.
+ * A hard cap: the scheduler checks and acquires a task's groups in one
+ * synchronous turn, so no more tasks hold this group than its limit, counted
+ * from `onStart` to `onFinish`. Lowering `limit` under running tasks keeps
+ * their units; nothing new is admitted until the count is below it.
  *
  * Example:
  * ```typescript
- * const cpuLimit = new ConcurrentLimitGroup(8, 'cpu'); // ~8 concurrent, may briefly exceed
+ * const cpuLimit = new ConcurrentLimitGroup(8, 'cpu'); // at most 8 at once
  * ```
  */
 export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
@@ -81,17 +76,15 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
     }
 
     /**
-     * Never clamped - an optimistic group can sit above its limit, and hiding
-     * that would make the reading disagree with {@link getMetrics}.
+     * Never clamped - a limit lowered under running tasks leaves the group
+     * above it, and hiding that would make the reading disagree with
+     * {@link getMetrics}.
      */
     read(): GaugeReading[] {
       return [{ id: 'units', value: this.running, limit: this.limit }];
     }
 
     onStart(_key?: string, cost: number = 1) {
-      // Increment running count
-      // Note: May temporarily exceed limit by 1 due to race conditions when multiple
-      // workers start tasks simultaneously, but this is acceptable and resolves quickly
       this.running += cost;
       this.stats.totalAcquired += cost;
 
