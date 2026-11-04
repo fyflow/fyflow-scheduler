@@ -278,6 +278,16 @@ export default class MyWorker extends BaseWorker {
     return sum;
   }
   ```
+- `grants` says *which* units a group gave this work, where a group returns
+  one - a `UnitGroup` (§5) names its units. `context.grants.gpu` is the task
+  attempt's, e.g. `['gpu1']`; `this.workerContext.grants.gpu` is the worker's
+  resident one, set **before the constructor runs**, so `setup()` can load onto
+  the right device. A task's `context.grants` includes its worker's resident
+  grants too, its own winning on a clash. It is per attempt: a retry or a
+  requeue is granted afresh and may get a different unit, so read it on every
+  attempt rather than caching it. Always an object, `{}` when nothing was
+  granted, and frozen one level down - a copy, on inline pools too. Optional in
+  the type, so a context you build by hand in a unit test still compiles
 - One instance is created per worker, lazily, and reused across tasks. Instance
   state persists between tasks — do not assume a fresh object per task.
 - Throwing from `run()` fails that task. Throwing from `setup()` fails the
@@ -293,6 +303,7 @@ export default class MyWorker extends BaseWorker {
 import {
   FyflowScheduler, FyflowTask, WorkerManager,   // core
   ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup,
+  UnitGroup,                                    // units with names
   BaseWorker, WorkerTerminationError,           // worker authoring
   CancelledError                                // what a cancelled task rejects with
 } from 'fyflow-scheduler';
@@ -305,6 +316,7 @@ import type {
   TaskMessageDetail, WorkerMessageDetail, MessageOptions,     // emitted events
   ResourceGroup, ResourceGroupMetrics, ResourceGroupStats,
   RateWindow, KeyedRateLimitGroupOptions, KeyedConcurrentLimitGroupOptions, KeyedTaskLike,
+  UnitGroupOptions, UnitRequest, UnitId,
   GaugeKind, GaugeSpec, GaugeReading, GaugeDescription,       // gauges
   ResourceLifetime, HolderKind, ResourceReleaseReason,        // resource events
   ResourceUnblockReason, ResourceEventDetail,
@@ -446,7 +458,11 @@ this task plus everything it spawns (§7).
 
 Management: `getWorkerIds()`, `getWorkerStatus(id)`, `getAllWorkerStatuses()`,
 `restartWorker(id, newConfig?)`, `replaceWorker(...)` (alias),
-`updateWorkerConfig(id, config)`, `getResidentUsage()`, `shutdown()`.
+`updateWorkerConfig(id, config)`, `getResidentUsage()`, `getResidentGrants(id)`
+(what a worker's resident groups granted it, as its `workerContext.grants`
+shows it), `shutdown()`. `restartWorker` returns the old worker's resident
+units and takes fresh ones for the replacement; one that no longer fits is not
+created, and the next dispatch creates a worker once there is room.
 
 #### `residentGroups` — resources a worker holds by existing
 
@@ -569,9 +585,10 @@ new ConcurrentLimitGroup(limit: number, id?: string)
 new RateLimitGroup(windows: { limit: number, windowMs: number }[], id?: string)
 new KeyedRateLimitGroup(windows, { id?, keyFrom?, idleKeyTtlMs? })
 new KeyedConcurrentLimitGroup(limit: number, { id?, keyFrom?, limitFor? })
+new UnitGroup(units: (string | number)[] | number, { id? })
 ```
 
-All four expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
+All five expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
 `read()` for gauges (below). Tasks over a limit wait in a blocked queue and are
 retried — never dropped. Multiple rate-limit windows are enforced together.
 
@@ -682,6 +699,76 @@ throttle the single-disk stream.
 
 ---
 
+#### Units with names
+
+`UnitGroup` is a concurrency limit whose units are told apart: two accelerator
+cards, licence seats, a port range. A holder takes free units, and the work is
+told **which**:
+
+```typescript
+const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });   // new UnitGroup(2): units 0 and 1
+
+const pool = new WorkerManager(url, { groups: ['gpu'], inline: true });
+const scheduler = new FyflowScheduler({ GpuWorker: pool }, { gpu });
+
+// in the worker
+async run(payload: any, context?: TaskWorkerContext) {
+  const [card] = context!.grants!.gpu as string[];             // 'gpu0' or 'gpu1'
+}
+```
+
+- **What it grants is an array, always**, at a cost of 1 too: `['gpu1']`. The
+  lowest-index free unit is granted
+- A hard cap (§1), like `ConcurrentLimitGroup`; `limit` is the number of units,
+  fixed for the group's lifetime. Not keyed
+- **Resident: one worker per device.** In `residentGroups` each worker holds
+  its `cost` units from creation to teardown, and sees them in
+  `this.workerContext.grants` from its constructor on:
+
+  ```typescript
+  const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+  new WorkerManager(modelUrl, { maxThreads: 2, residentGroups: { gpu: 1 } })
+  // two workers, one card each: setup() loads onto this.workerContext.grants.gpu[0]
+  ```
+
+  A cost above 1 grants that many units, all named. Teardown frees exactly the
+  units the worker held, and a replacement worker gets its own
+- `getBusyUnits()`, `getFreeUnits()`, `isBusy(unit)` read its state;
+  `getMetrics()` counts units like `ConcurrentLimitGroup`
+- `onFinish` throws on a unit it did not grant, or one already free, and
+  `onStart` throws if asked for more units than are free. Admission is a hard
+  cap, so neither happens through the scheduler; they surface a bug rather than
+  absorb it
+
+##### A custom group can grant too
+
+Any group's `onStart` may return a value - a **grant** - and the scheduler
+carries it to the work, under the group's id. Returning nothing grants nothing,
+which is every group written before grants existed:
+
+```typescript
+interface ResourceGroup {
+  canRun(key?: string, cost?: number, request?: unknown): boolean;
+  onStart?(key?: string, cost?: number, request?: unknown): unknown;   // a return value is the grant
+  onFinish?(key?: string, cost?: number, grant?: unknown): void;
+}
+```
+
+- `onFinish` gets **the original**, the very object `onStart` returned, so a
+  group can use identity. The work and the events get a copy
+- The grant must survive `structuredClone`. It is copied once, at acquire, on
+  inline pools as well, so a value that cannot be copied fails the same way
+  everywhere: the task fails with an error naming the group, and the units are
+  released. For a resident group the worker is never created, and the task
+  that would have created it fails
+- For a keyed group the entry is per key, `context.grants[id]` being
+  `{ [key]: grant }` - for a task naming one key too, so the shape depends on
+  the group and never on how many keys a task has
+- `request` is reserved for a group that defines a request language; the
+  scheduler passes nothing there yet
+
+---
+
 #### Gauges — how a group describes itself
 
 A group's state is not always one number. `RateLimitGroup` enforces *10/sec AND
@@ -708,6 +795,7 @@ group.read(key?)   // GaugeReading[]            dynamic: id, value, limit, reset
 | `RateLimitGroup` | one `window` per configured window, ids `window-0`, `window-1`, … |
 | `KeyedRateLimitGroup` | the same windows, **per key** — `read()` requires a key and returns `[]` without one |
 | `KeyedConcurrentLimitGroup` | 1 × `level`, id `units`, **per key**, each reading against that key's own limit — `read()` requires a key, as above |
+| `UnitGroup` | 1 × `level`, id `units`. *Which* units are busy is not a number: it is the `grant` on `resource.acquired` / `resource.released`, and `getBusyUnits()` |
 | anything else | 1 × `level` derived from `getMetrics()` |
 
 **Both methods are optional.** A group implementing only `canRun`, `onStart`,
@@ -919,6 +1007,7 @@ interface ResourceEventDetail {
   workerType: string;              // the POOL KEY - see the warning below
   cost:       number;              // units taken. Always 1 except for a weighted resident hold
   key?:       string;              // the bucket, for keyed groups - one per event, even for a task naming several
+  grant?:     unknown;             // acquired/released only: what the group granted, e.g. ['gpu1']. Absent if it grants nothing
   timestamp:  number;
   readings:   GaugeReading[];      // group state AFTER the operation
 }

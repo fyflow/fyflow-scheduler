@@ -129,6 +129,15 @@ Deno.test("import.meta.url is not mistaken for a specifier", () => {
   assertEquals(externalImports(source), []);
 });
 
+Deno.test("the words from and import inside a string are not imports", () => {
+  // groups/unitGroup.ts really does carry the first of these
+  const source = `
+for (const field of ['from', 'prefer'] as const) {}
+const words = ["import", "x"];
+`;
+  assertEquals(externalImports(source), []);
+});
+
 Deno.test("every flavour of external specifier is caught", () => {
   const source = `
 import { join } from "jsr:@std/path@^1.1.2";

@@ -442,6 +442,15 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   starts only when both have room
 - A key is dropped as soon as nothing holds it
 
+**UnitGroup(units, options?)**
+- A limit whose units have names - two GPUs, licence seats - and the work is
+  told which it got: `context.grants.gpu` is `['gpu1']` in `run()`
+- In `residentGroups` it gives one worker per device: each worker holds its
+  units for its lifetime and reads them from `this.workerContext.grants`, from
+  its constructor on
+- `new UnitGroup(2)` names its units `0` and `1`. Any custom group can grant
+  too, by returning a value from `onStart` - see `AGENTS.md` §5
+
 **Worker management** (on a `WorkerManager`)
 - `getWorkerIds()`: ids of the workers that currently exist (created lazily)
 - `getWorkerStatus(id)` / `getAllWorkerStatuses()`: `{ id, state, tasksCompleted,
@@ -450,6 +459,7 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   worker, optionally with new config. The replacement gets a new id
 - `updateWorkerConfig(id, config)`: merge config into a live worker
 - `getResidentUsage()`: units this pool currently holds in each resident group
+- `getResidentGrants(id)`: what a worker's resident groups granted it
 - `shutdown()`: terminate the pool
 
 **Worker self-termination** — a worker can ask to be torn down, e.g. after

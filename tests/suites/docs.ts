@@ -15,6 +15,7 @@ import {
   RateLimitGroup,
   KeyedRateLimitGroup,
   KeyedConcurrentLimitGroup,
+  UnitGroup,
   WorkerTerminationError,
   CancelledError
 } from '../../index.ts';
@@ -135,6 +136,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
     this.results.push(await this.runTest('Doc: Keyed Concurrency Limit Per Disk', () => this.docKeyedConcurrentLimit()));
     this.results.push(await this.runTest('Doc: Several Keys Per Task', () => this.docSeveralKeysPerTask()));
+    this.results.push(await this.runTest('Doc: Units With Names', () => this.docUnitsWithNames()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
@@ -1182,6 +1184,54 @@ class DocsTestSuite {
     let threw = '';
     try { scheduler.addTask(copy('nowhere', '', '')); } catch (e: any) { threw = e.message; }
     if (!threw.includes('Missing limit key for group "disk"')) throw new Error(`An empty list should throw, got "${threw}"`);
+  }
+
+  // RECIPE: AGENTS.md section 5, "Units with names" - both snippets, and the
+  // claims under them: an array at a cost of 1, lowest index first, distinct
+  // units, one worker per device seeing its card from the constructor on, a
+  // custom group's original back in onFinish
+  private async docUnitsWithNames(): Promise<void> {
+    const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+    if (new UnitGroup(2).units.join(',') !== '0,1') throw new Error('new UnitGroup(2) is not units 0 and 1');
+    const scheduler = this.makeScheduler({ groups: ['gpu'], maxThreads: 1, maxConcurrentTasks: 4 }, { gpu });
+    const run = (id: string, awaitMs = 20) => scheduler.addTask(new FyflowTask({
+      id, workerType: 'DocsWorker', payload: { id, value: 1, reportGrants: true, awaitMs }
+    }), { createPromise: true }) as Promise<any>;
+
+    const [a, b] = await Promise.all([run('a', 40), run('b', 40)]);
+    if (a.card !== 'gpu0' || b.card !== 'gpu1') throw new Error(`Lowest index first: a ran on ${a.card}, b on ${b.card}`);
+    if (!Array.isArray(a.grants.gpu) || a.grants.gpu.length !== 1) throw new Error(`Not an array of one: ${JSON.stringify(a.grants)}`);
+    if (!Object.isFrozen(a.grants)) throw new Error('context.grants is not frozen');
+
+    // Resident: one worker per device, each seeing its card from construction
+    const card = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+    const resident = this.makeScheduler({ maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: 1 } }, { gpu: card });
+    const rs = await Promise.all([0, 1, 2, 3].map(i => resident.addTask(new FyflowTask({
+      id: `r${i}`, workerType: 'DocsWorker', payload: { value: 1, reportGrants: true, awaitMs: 30 }
+    }), { createPromise: true }) as Promise<any>));
+    const cards = new Set(rs.map(r => r.worker?.gpu?.[0]));
+    if (cards.size !== 2 || !cards.has('gpu0') || !cards.has('gpu1')) throw new Error(`Workers held ${[...cards]}`);
+    if (!rs.every(r => r.grants.gpu?.[0] === r.worker.gpu[0])) throw new Error('A task did not see its worker\'s card');
+    await resident.shutdown();
+    if (card.getBusyUnits().length !== 0) throw new Error(`Units left busy after shutdown: ${card.getBusyUnits()}`);
+
+    // A custom group: what onStart returns is carried, and comes back as itself
+    const issued: object[] = [];
+    let sameBack = 0;
+    const seats = {
+      id: 'seat', type: 'seat', running: 0,
+      canRun() { return true; },
+      onStart() { const g = { seat: issued.length }; issued.push(g); return g; },
+      onFinish(_k?: string, _c?: number, grant?: unknown) { if (issued.includes(grant as object)) sameBack++; },
+      getMetrics() { return { limit: 1, running: 0, available: 1, utilization: 0 }; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; }
+    };
+    const custom = this.makeScheduler({ groups: ['seat'] }, { seat: seats });
+    const r = await custom.addTask(new FyflowTask({
+      id: 'c', workerType: 'DocsWorker', payload: { value: 1, reportGrants: true }
+    }), { createPromise: true }) as any;
+    if ((r.grants.seat as any)?.seat !== 0) throw new Error(`The custom grant did not arrive: ${JSON.stringify(r.grants)}`);
+    if (sameBack !== 1) throw new Error('onFinish did not get the original grant back');
   }
 
   private async docKeyedRateLimit(): Promise<void> {

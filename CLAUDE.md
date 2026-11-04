@@ -82,8 +82,15 @@ capacity.
 
 **`groups/`** — `ConcurrentLimitGroup` (a hard concurrency cap), `RateLimitGroup`
 (overlapping time windows), `KeyedRateLimitGroup` (per-key quotas),
-`KeyedConcurrentLimitGroup` (a concurrency cap per key), all behind
-the `ResourceGroup` interface with optional gauge `describe()`/`read()`.
+`KeyedConcurrentLimitGroup` (a concurrency cap per key), `UnitGroup` (named
+units, telling the work which it got), all behind the `ResourceGroup` interface
+with optional gauge `describe()`/`read()`.
+
+A group's `onStart` may return a **grant**. The scheduler keeps the original
+for `onFinish`, and copies it once with `structuredClone`, on inline pools too.
+The copy reaches the work as `context.grants`. Task grants travel with the
+`run` message. Resident grants travel in `init`, which is why they are known
+before the worker's constructor runs.
 
 Groups come in two lifetimes. **Task-scoped** groups are acquired at dispatch and
 released at settle. **Resident** groups (`residentGroups`, with a per-worker
@@ -98,7 +105,7 @@ cheaper pools overtake it.
 # Deno
 deno task check          # type check (includes scripts/)
 deno task test           # all suites
-deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation|admission
+deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation|admission|grants
 deno task examples       # run every example on Deno, then the bundled ones on Node
 deno task jsr:smoke      # stage only the publishable files and run a real worker against them
 deno lint .
@@ -117,7 +124,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Ten suites, 265 tests, all in the default `deno task test` run:
+Eleven suites, 278 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -128,8 +135,9 @@ Ten suites, 265 tests, all in the default `deno task test` run:
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 26 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
+| grants | 12 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, uncloneable grants, the forced stop |
 | cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
-| docs | 48 | **executes every snippet in README.md and AGENTS.md** |
+| docs | 49 | **executes every snippet in README.md and AGENTS.md** |
 | admission | 36 | wake paths with the heartbeat off (including a worker becoming ready), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task; 1 known gap (R3) |
 
 `deno task test:scripts` is separate and not included in `deno task test`. It
@@ -224,7 +232,7 @@ no build step, but only if it is erasable. `AGENTS.md` §3 documents the
 conditions and the docs suite tests them.
 
 **`publish.exclude` in `deno.json` is an allowlist** (`**` plus `!` exceptions),
-so a new published module must be added explicitly. It currently ships 19 files.
+so a new published module must be added explicitly. It currently ships 20 files.
 
 **The package must have no dependencies.** `scripts/` uses `@std/path` and is
 kept out of the package by the allowlist alone — Deno has no devDependencies — so

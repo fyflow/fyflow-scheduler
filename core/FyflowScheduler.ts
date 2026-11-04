@@ -8,7 +8,7 @@ import type {
 } from './resourceEvents.ts';
 import { TaskQueue } from './taskQueue.ts';
 import type { TaskMessageDetail } from './workerInterface.ts';
-import { AttemptStoppedError, CancelledError } from './workerInterface.ts';
+import { AttemptStoppedError, CancelledError, freezeShallow } from './workerInterface.ts';
 import { validateGraceMs } from './workerManager.ts';
 
 /**
@@ -120,6 +120,15 @@ export class FyflowTask {
      * if the payload changed meanwhile.
      */
     _resourceKeys?: Record<string, string[]>;
+    /**
+     * What each hold's `onStart` returned, for the holds that returned
+     * something: `raw` goes back to `onFinish` as it was, `copy` is what the
+     * work and the events see. Per attempt - a retry or requeue is granted
+     * afresh.
+     */
+    _grants?: Map<string, { raw: unknown; copy: unknown }>;
+    /** `context.grants` for this attempt, built from {@link _grants}. */
+    _grantView?: Record<string, unknown>;
     /**
      * Set while this attempt is being settled, so the same outcome arriving from
      * both the pool's `task.failed` event and the task promise settles once.
@@ -542,6 +551,46 @@ export class FyflowTask {
         for (const key of keys[entry.id] ?? []) holds.push({ id: entry.id, group: entry.group, key });
       }
       return holds;
+    }
+
+    /** Where a hold's grant is kept on the task: per (group, key). */
+    private static _holdId(groupId: string, key: string | undefined): string {
+      return key === undefined ? groupId : `${groupId}${BLOCKED_QUEUE_SEPARATOR}${key}`;
+    }
+
+    /**
+     * Copy this attempt's grants and build `context.grants` from them: per
+     * group, the grant itself - or, for a keyed group, `{ [key]: grant }`, so
+     * the shape depends on the group and never on how many keys a task has.
+     *
+     * Copied once, here, on inline pools as well: what the work sees is the
+     * same whether or not a thread boundary is crossed, the rule `emit()`
+     * follows. Frozen, one level down, because the copy is shared by the work
+     * and the events.
+     *
+     * @returns the error for a grant that cannot be copied, which fails the
+     *   attempt. Its units are still released: the original is kept.
+     */
+    private _copyGrants(task: FyflowTask, holds: Array<{ id: string; group: any; key: string | undefined }>): Error | undefined {
+      const view: Record<string, unknown> = {};
+      let error: Error | undefined;
+      for (const { id, group, key } of holds) {
+        const grant = task._grants!.get(FyflowScheduler._holdId(id, key));
+        if (!grant) continue;
+        try {
+          grant.copy = freezeShallow(structuredClone(grant.raw));
+        } catch (e: any) {
+          error ??= new Error(
+            `Resource group "${id}" granted a value that cannot be copied with structuredClone: ${e?.message ?? e}`
+          );
+          continue;
+        }
+        if (group.keyed) ((view[id] ??= {}) as Record<string, unknown>)[key!] = grant.copy;
+        else view[id] = grant.copy;
+      }
+      for (const value of Object.values(view)) freezeShallow(value);
+      task._grantView = Object.freeze(view);
+      return error;
     }
 
     // Any task waiting on a resource group. Blocked tasks are subtracted from
@@ -996,10 +1045,19 @@ export class FyflowTask {
       // the events in between, a task dispatched from there passed canRun on a
       // group this one had checked but not yet taken, and both took it: a
       // concurrency group held more than its limit.
-      for (const { group, key } of holds) group.onStart(key);
+      for (const hold of holds) {
+        const grant = hold.group.onStart(hold.key);
+        if (grant !== undefined) {
+          (task._grants ??= new Map()).set(FyflowScheduler._holdId(hold.id, hold.key), { raw: grant, copy: undefined });
+        }
+      }
+      // Copied before any event, so the events carry it; a grant that cannot
+      // be copied fails the attempt below, its units released by the settle
+      const grantError = task._grants ? this._copyGrants(task, holds) : undefined;
       holds.forEach(({ id, group, key }) => {
         // After the mutation, so `readings` are the state a fold should land on
         if (this._resourceObserved) {
+          const grant = task._grants?.get(FyflowScheduler._holdId(id, key));
           this._emitResource('resource.acquired', group, {
             groupId: id,
             lifetime: 'task-held',
@@ -1007,7 +1065,8 @@ export class FyflowTask {
             holderId: task.id,
             workerType: task.workerType,
             cost: 1, // _dispatchTask passes no cost, so onStart defaults to 1
-            key
+            key,
+            ...(grant?.copy !== undefined ? { grant: grant.copy } : {})
           });
         }
       });
@@ -1018,9 +1077,13 @@ export class FyflowTask {
         this._settleTask(task, pool, { ok: false, error: new CancelledError(task.id) }, token);
         return;
       }
+      if (grantError) {
+        this._settleTask(task, pool, { ok: false, error: grantError }, token);
+        return;
+      }
 
       // Get/create thread and execute task
-      pool.enqueueNoQueue(task.id, task.payload)
+      pool.enqueueNoQueue(task.id, task.payload, task._grantView)
         .then((result: any) => {
           this._onTaskComplete(task, result, pool, token);
         })
@@ -1088,10 +1151,17 @@ export class FyflowTask {
       // return now - a payload the worker mutated must not send the release to a
       // different key than the acquire
       const holds = this._holdsFor(task, pool);
+      const grants = task._grants;
+      // Taken off the task first: the release reaches listeners, and whatever
+      // they do, these grants are returned once
+      task._grants = undefined;
+      task._grantView = undefined;
 
       // Release all resources first, then retry blocked tasks
       for (const { id, group, key } of holds) {
-        group.onFinish(key);
+        // The original, as onStart returned it: a group may rely on identity
+        const grant = grants?.get(FyflowScheduler._holdId(id, key));
+        group.onFinish(key, 1, grant?.raw);
         if (this._resourceObserved) {
           this._emitResource('resource.released', group, {
             groupId: id,
@@ -1101,6 +1171,7 @@ export class FyflowTask {
             workerType: task.workerType,
             cost: 1,
             key,
+            ...(grant?.copy !== undefined ? { grant: grant.copy } : {}),
             reason: 'settled'
           });
         }
@@ -2035,6 +2106,7 @@ export class FyflowTask {
         workerId: string;
         groupId: string;
         cost: number;
+        grant?: unknown;
         reason?: ResourceReleaseReason;
       }
     ): void {
@@ -2060,6 +2132,7 @@ export class FyflowTask {
           holderId: notice.workerId,
           workerType,
           cost: notice.cost,
+          ...(notice.grant !== undefined ? { grant: notice.grant } : {}),
           ...(notice.type === 'released' ? { reason: notice.reason } : {})
         }
       );

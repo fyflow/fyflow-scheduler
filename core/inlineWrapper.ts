@@ -1,5 +1,5 @@
 import type { WorkerInstanceExtensions, WorkerInstanceState, BaseWorkerContext, TaskWorkerContext } from "./workerInterface.ts";
-import { CancelledError, WorkerTerminationError, isWorkerTerminationError } from "./workerInterface.ts";
+import { CancelledError, WorkerTerminationError, isWorkerTerminationError, mergeGrants } from "./workerInterface.ts";
 import { WorkerMessageChannel } from "./messageChannel.ts";
 import { MessageStream } from "./messageChannel.ts";
 import type { ChannelEvent, MessageOptions, MessageSink } from "./messageChannel.ts";
@@ -55,8 +55,15 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     tasksCompleted = 0;
     errorCount = 0;
     createdAt: number = Date.now();
-    constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}, messages?: MessageOptions) {
+    /** What this worker's resident groups granted it: its `workerContext.grants`. */
+    readonly residentGrants?: Readonly<Record<string, unknown>>;
+
+    constructor(
+        scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}, messages?: MessageOptions,
+        residentGrants?: Readonly<Record<string, unknown>>
+    ) {
         super();
+        this.residentGrants = residentGrants;
         this.messages = new WorkerMessageChannel((events) => this._queueDelivery(events), messages);
         this.scriptUrl = scriptUrl;
         this.idleTimeout = idleTimeout;
@@ -252,7 +259,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
         return {
             workerId: this.id,
             terminateWithError: this.createTerminateWithError(),
-            emit: (name, data) => this.messages.emitWorker(name, data)
+            emit: (name, data) => this.messages.emitWorker(name, data),
+            grants: mergeGrants(this.residentGrants)
         };
     }
 
@@ -439,7 +447,7 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
     }
 
 
-    async runTask(taskId: string, payload: any): Promise<any> {
+    async runTask(taskId: string, payload: any, grants?: Readonly<Record<string, unknown>>): Promise<any> {
         // Measure full task execution time including all coordination overhead
         
         if (!this.canAcceptTask()) {
@@ -523,7 +531,8 @@ export class InlineWrapper extends EventTarget implements WorkerInstanceExtensio
                     }));
                 },
                 emit: (name, data) => this.messages.emitTask(streamFor(), name, data),
-                signal: attempt.controller.signal
+                signal: attempt.controller.signal,
+                grants: mergeGrants(this.residentGrants, grants)
             };
 
             // The attempt's emits close when run() ends, either way, so a stray

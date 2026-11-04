@@ -33,7 +33,9 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     originalScriptUrl: string;
     initializing = false;
     // Internal task queue to prevent worker message queue flooding
-    taskQueue: Array<{taskId: string, payload: any, resolve: Function, reject: Function}> = [];
+    taskQueue: Array<{taskId: string, payload: any, grants?: Readonly<Record<string, unknown>>, resolve: Function, reject: Function}> = [];
+    /** What this worker's resident groups granted it; sent with init. */
+    readonly residentGrants?: Readonly<Record<string, unknown>>;
 
     // WorkerInstanceState implementation
     state: 'initializing' | 'healthy' | 'busy' | 'failed' | 'terminated' = 'initializing';
@@ -61,8 +63,12 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
     messageSink?: MessageSink;
 
     //DENO SPECIFIC USE OF WORKER, node uses worker_threads
-    constructor(scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}, messages?: MessageOptions) {
+    constructor(
+      scriptUrl: string, idleTimeout = 5000, maxConcurrentTasks = 1, config = {}, messages?: MessageOptions,
+      residentGrants?: Readonly<Record<string, unknown>>
+    ) {
       super();
+      this.residentGrants = residentGrants;
       //ideally we shim this
       this.originalScriptUrl = (scriptUrl || "").toString();
       // Compile-time path selection - will be replaced during build
@@ -573,12 +579,14 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
           workerUrl: absoluteWorkerUrl,
           workerId: this.id,
           gate: this.messageGate,
-          messages: this.messageOptions
+          messages: this.messageOptions,
+          // Before the constructor runs, so setup() knows its units
+          ...(this.residentGrants ? { grants: this.residentGrants } : {})
         });
       });
     }
   
-    async runTask(taskId: string, payload: any): Promise<any> {
+    async runTask(taskId: string, payload: any, grants?: Readonly<Record<string, unknown>>): Promise<any> {
       if (!this.canAcceptTask()) {
         throw new Error("Worker at maximum concurrent task capacity");
       }
@@ -586,7 +594,7 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
       // Queue task FIRST (synchronously) to update canAcceptTask() immediately
       // This prevents race conditions where multiple tasks are dispatched before queue updates
       return new Promise((resolve, reject) => {
-        this.taskQueue.push({ taskId, payload, resolve, reject });
+        this.taskQueue.push({ taskId, payload, grants, resolve, reject });
 
         // Ensure worker is initialized before processing tasks.
         // This used to be `await` inside an async promise executor, where a
@@ -622,7 +630,11 @@ export class ThreadWrapper extends EventTarget implements WorkerInstanceExtensio
         this.callbacks.set(task.taskId, { resolve: task.resolve, reject: task.reject });
         this.taskStartTimes.set(task.taskId, performance.now()); // Record execution start time
         this.runningTaskData.set(task.taskId, {id: task.taskId, payload: task.payload}); // Track task data for requeuing
-        this.worker?.postMessage({ taskId: task.taskId, payload: task.payload, action: 'run' });
+        // Grants only when there are any: most tasks have none, and the
+        // message is cloned for every task
+        this.worker?.postMessage(task.grants
+          ? { taskId: task.taskId, payload: task.payload, action: 'run', grants: task.grants }
+          : { taskId: task.taskId, payload: task.payload, action: 'run' });
       }
     }
   

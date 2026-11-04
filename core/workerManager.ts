@@ -1,7 +1,7 @@
 import { ThreadWrapper } from "./threadWrapper.ts";
 import { InlineWrapper } from "./inlineWrapper.ts";
 import type { TaskMessageDetail, WorkerStatus } from "./workerInterface.ts";
-import { AttemptStoppedError } from "./workerInterface.ts";
+import { AttemptStoppedError, freezeShallow } from "./workerInterface.ts";
 import { resolveMessageOptions } from "./messageChannel.ts";
 import type { ChannelEvent, MessageOptions } from "./messageChannel.ts";
 
@@ -37,14 +37,24 @@ export function validateGraceMs(value: unknown, name: string): number {
  * would be a double count rather than a convenience.
  */
 export type ResidentResourceNotice =
-  | { type: 'acquired'; workerId: string; groupId: string; cost: number }
+  | { type: 'acquired'; workerId: string; groupId: string; cost: number; grant?: unknown }
   | {
       type: 'released';
       workerId: string;
       groupId: string;
       cost: number;
+      grant?: unknown;
       reason: 'worker-teardown' | 'shutdown';
     };
+
+/**
+ * One worker's resident holding: what each group's `onStart` returned, kept
+ * to hand back to its `onFinish`, and the frozen copies the worker sees.
+ */
+interface ResidentHolding {
+  raw: Map<string, unknown>;
+  view: Record<string, unknown>;
+}
 
 /** Injected by the scheduler at {@link WorkerManager._bindResidentGroups}. */
 export type ResidentResourceNotifier = (notice: ResidentResourceNotice) => void;
@@ -252,14 +262,19 @@ export class WorkerManager extends EventTarget {
    */
   private residentRegistry: Record<string, any> = {};
   /**
-   * Ids of workers whose resident cost this pool holds. Keyed by worker rather
-   * than counted, so releasing is idempotent: a failed worker is released by
-   * `_releaseWorkerGroupResources` while it is still in `threads`, and must not
-   * be released a second time if the idle sweep also reaches it.
+   * Workers whose resident cost this pool holds, with what each was granted.
+   * Keyed by worker rather than counted, so releasing is idempotent: a failed
+   * worker is released by `_releaseWorkerGroupResources` while it is still in
+   * `threads`, and must not be released a second time if the idle sweep also
+   * reaches it.
    */
-  private residentHolders = new Set<string>();
-  /** Acquired, but the worker object does not exist yet. Same synchronous turn. */
-  private residentPending = 0;
+  private residentHolders = new Map<string, ResidentHolding>();
+  /**
+   * Acquired, but the worker object does not exist yet - same synchronous
+   * turn. A FIFO, because each holding carries its own grants, and an unbound
+   * one must give back its own.
+   */
+  private residentPending: ResidentHolding[] = [];
   /**
    * Injected alongside the registry. Undefined for a standalone pool, and for
    * one the scheduler bound before this existed.
@@ -326,14 +341,43 @@ export class WorkerManager extends EventTarget {
    * Take one worker's resident cost from every group, or nothing at all.
    * Synchronous, and called in the same turn as the capacity check, so no other
    * pool can interleave between the two.
+   *
+   * @returns the holding, queued as pending until {@link _bindResidentHolder},
+   *   or false when it does not fit.
+   * @throws when a group grants a value `structuredClone` cannot copy. What
+   *   was taken is given back first; the worker is never created.
    */
-  private _acquireResident(): boolean {
+  private _acquireResident(): ResidentHolding | false {
     if (!this.canHoldAnotherWorker()) return false;
+    const holding: ResidentHolding = { raw: new Map(), view: {} };
+    const taken: string[] = [];
+    let error: Error | undefined;
     for (const [id, cost] of Object.entries(this.residentGroups)) {
-      this.residentRegistry[id]?.onStart?.(undefined, cost);
+      const group = this.residentRegistry[id];
+      if (!group) continue;
+      const grant = group.onStart?.(undefined, cost);
+      taken.push(id);
+      if (grant === undefined) continue;
+      holding.raw.set(id, grant);
+      try {
+        holding.view[id] = freezeShallow(structuredClone(grant));
+      } catch (e: any) {
+        error = new Error(
+          `Resident group "${id}" granted a value that cannot be copied with structuredClone: ${e?.message ?? e}`
+        );
+        break;
+      }
     }
-    this.residentPending++;
-    return true;
+    if (error) {
+      // Nothing was announced, so nothing is announced on the way back either
+      for (const id of taken) {
+        this.residentRegistry[id].onFinish?.(undefined, this.residentGroups[id], holding.raw.get(id));
+      }
+      throw error;
+    }
+    Object.freeze(holding.view);
+    this.residentPending.push(holding);
+    return holding;
   }
 
   /**
@@ -345,15 +389,15 @@ export class WorkerManager extends EventTarget {
    * acquired and never bound is a bug, not a state worth modelling.
    */
   private _bindResidentHolder(workerId: string) {
-    if (this.residentPending === 0) return;
-    this.residentPending--;
-    this.residentHolders.add(workerId);
+    const holding = this.residentPending.shift();
+    if (!holding) return;
+    this.residentHolders.set(workerId, holding);
 
     if (!this.residentNotify) return;
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       // Only groups the registry actually knows were charged by _acquireResident
       if (this.residentRegistry[id]) {
-        this.residentNotify({ type: 'acquired', workerId, groupId: id, cost });
+        this.residentNotify({ type: 'acquired', workerId, groupId: id, cost, grant: holding.view[id] });
       }
     }
   }
@@ -363,33 +407,44 @@ export class WorkerManager extends EventTarget {
     workerId: string,
     reason: 'worker-teardown' | 'shutdown' = 'worker-teardown'
   ) {
-    if (!this.residentHolders.delete(workerId)) return;
+    const holding = this.residentHolders.get(workerId);
+    if (!holding) return;
+    this.residentHolders.delete(workerId);
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       const group = this.residentRegistry[id];
       if (!group) continue;
-      group.onFinish?.(undefined, cost);
-      this.residentNotify?.({ type: 'released', workerId, groupId: id, cost, reason });
+      // Its own grant, as the group returned it
+      group.onFinish?.(undefined, cost, holding.raw.get(id));
+      this.residentNotify?.({ type: 'released', workerId, groupId: id, cost, grant: holding.view[id], reason });
     }
   }
 
   /** Give everything back, holders and any unbound acquisition. */
   private _releaseAllResident() {
-    for (const workerId of [...this.residentHolders]) {
+    for (const workerId of [...this.residentHolders.keys()]) {
       this._releaseResidentFor(workerId, 'shutdown');
     }
     // An unbound acquisition never announced itself - emitting a release for it
-    // would leave the fold one release ahead of its acquires forever
-    while (this.residentPending > 0) {
-      this.residentPending--;
+    // would leave the fold one release ahead of its acquires forever. Each
+    // returns its own grants.
+    for (const holding of this.residentPending.splice(0)) {
       for (const [id, cost] of Object.entries(this.residentGroups)) {
-        this.residentRegistry[id]?.onFinish?.(undefined, cost);
+        this.residentRegistry[id]?.onFinish?.(undefined, cost, holding.raw.get(id));
       }
     }
   }
 
+  /**
+   * What a live worker's resident groups granted it, per group id, as its
+   * `workerContext.grants` shows it; undefined for a worker holding nothing.
+   */
+  getResidentGrants(workerId: string): Readonly<Record<string, unknown>> | undefined {
+    return this.residentHolders.get(workerId)?.view;
+  }
+
   /** Units this pool currently holds in each resident group. Test/diagnostic. */
   getResidentUsage(): Record<string, number> {
-    const held = this.residentHolders.size + this.residentPending;
+    const held = this.residentHolders.size + this.residentPending.length;
     const usage: Record<string, number> = {};
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       usage[id] = cost * held;
@@ -422,7 +477,7 @@ export class WorkerManager extends EventTarget {
   }
 
   // Direct execution without internal queueing
-  async enqueueNoQueue(taskId: string, payload: any): Promise<any> {
+  async enqueueNoQueue(taskId: string, payload: any, grants?: Readonly<Record<string, unknown>>): Promise<any> {
     // Find an available thread
     const targetThread = this.threads.find(t =>
       t.canAcceptTask && t.canAcceptTask()
@@ -430,9 +485,13 @@ export class WorkerManager extends EventTarget {
 
     // If no available thread, create one if under limit. A new worker is in
     // `threads` from creation, starting or not, so this counts it.
-    if (!targetThread && this.threads.length < this.maxThreads
-        && this._acquireResident()) {
-      const newThread = this._newWorker(this.config);
+    const holding = !targetThread && this.threads.length < this.maxThreads
+      ? this._acquireResident()
+      : false;
+    if (holding) {
+      // Its resident grants go in at creation: the constructor and setup()
+      // see them, before any task
+      const newThread = this._newWorker(this.config, holding.view);
 
       // Set up event listeners
       this._setupWorkerEventListeners(newThread);
@@ -446,7 +505,7 @@ export class WorkerManager extends EventTarget {
       // meanwhile. Awaiting the thread first, as this once did, left its slot
       // showing free for that await, so the next task in the same dispatch
       // loop took it and this one bounced off a full worker.
-      const running = newThread.runTask(taskId, payload);
+      const running = newThread.runTask(taskId, payload, grants);
 
       // Announced last, once the worker is counted in `threads` and holds its
       // task: resource.acquired can reach a listener that re-enters the
@@ -464,7 +523,7 @@ export class WorkerManager extends EventTarget {
     }
 
     // Execute task directly on thread
-    return targetThread.runTask(taskId, payload);
+    return targetThread.runTask(taskId, payload, grants);
   }
 
   /**
@@ -601,10 +660,12 @@ export class WorkerManager extends EventTarget {
   }
 
   /** Every worker is created here, so each one gets the message options and the current gate. */
-  private _newWorker(config: any): WorkerInstance {
+  private _newWorker(config: any, residentGrants?: Readonly<Record<string, unknown>>): WorkerInstance {
+    // An empty holding is no grants at all
+    const grants = residentGrants && Object.keys(residentGrants).length > 0 ? residentGrants : undefined;
     const worker = this.inline
-      ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config, this.messages)
-      : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config, this.messages);
+      ? new InlineWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config, this.messages, grants)
+      : new ThreadWrapper(this.scriptUrl, this.idleTimeout, this.maxConcurrentTasks, config, this.messages, grants);
     worker.setMessageGate(this.taskMessageGate, this.workerMessageListeners.size > 0);
     worker.messageSink = (events, workerId, workerType) => this._onMessages(events, workerId, workerType);
     return worker;
@@ -654,10 +715,17 @@ export class WorkerManager extends EventTarget {
   }
 
   private _createPredictiveThread(): WorkerInstance | null {
-    // A replacement worker still has to fit in the resident groups.
-    if (!this._acquireResident()) return null;
+    // A replacement worker still has to fit in the resident groups. One whose
+    // grant cannot be copied is not created; the next dispatch reports why.
+    let holding: ResidentHolding | false;
+    try {
+      holding = this._acquireResident();
+    } catch {
+      return null;
+    }
+    if (!holding) return null;
 
-    const thread = this._newWorker(this.config);
+    const thread = this._newWorker(this.config, holding.view);
 
     // Set up event listeners first
     this._setupWorkerEventListeners(thread);
@@ -969,14 +1037,30 @@ export class WorkerManager extends EventTarget {
     const oldWorker = this.threads[workerIndex];
     await oldWorker.terminate();
     this.threads.splice(workerIndex, 1);
+    // The old worker's resident units come back, and the replacement takes
+    // its own: a new worker, with a fresh grant. Its holding used to stay
+    // filed under the dead worker's id until shutdown, and the replacement
+    // held nothing at all.
+    this._releaseResidentFor(oldWorker.id);
+
+    // A replacement that no longer fits is not created; the next dispatch
+    // creates a worker once there is room
+    let holding: ResidentHolding | false;
+    try {
+      holding = this._acquireResident();
+    } catch {
+      holding = false;
+    }
+    if (!holding && Object.keys(this.residentGroups).length > 0) return true;
 
     // Create new worker with updated config
     const config = { ...this.config, ...(newConfig || {}) };
-    const newWorker = this._newWorker(config);
+    const newWorker = this._newWorker(config, holding ? holding.view : undefined);
 
     this._setupWorkerEventListeners(newWorker);
     this.threads.push(newWorker);
     this.startIdleTimer(); // Ensure idle timer is running
+    if (holding) this._bindResidentHolder(newWorker.id);
 
     return true;
   }

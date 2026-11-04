@@ -59,16 +59,19 @@ Next:
 
 **Status**: 🟡 In Progress (R0, R1, R2 done)
 
-#### 🔵 Units with identities (scheduler pass 2 #2, P3)
-`doc/design/unit-grants.md`. Design only, to be built after the keyed group. It
-needs a `UnitGroup`, an `onStart` that returns a grant, `context.grants` and
-`workerContext.grants`, and protocol changes in both bootstraps. Requests for
-specific units (a candidate set `from`, plus a soft `prefer`) need one wait
-queue per candidate set and resident head-of-line admission scoped to
-overlapping sets. They also need admission on wake, so they depend on R2 of the
-admission rework.
+#### 🟡 Units with identities (scheduler pass 2 #2, P3)
+`doc/design/unit-grants.md`, built in two phases on `admission-rework`.
 
-**Status**: 🔵 Not Started
+- **Phase 1, done.** Grants: an `onStart` that returns one, kept for
+  `onFinish`, copied once into `context.grants` and `workerContext.grants`,
+  with the protocol in both bootstraps. `UnitGroup` granting any free unit,
+  task-held and resident. The new `grants` suite is threaded on both runtimes,
+  plus a browser spec.
+- **Phase 2, next.** Requests for specific units: a candidate set `from` and a
+  soft `prefer`, one wait queue per candidate set, FIFO across sets on a
+  release, and resident head-of-line scoped to overlapping sets.
+
+**Status**: 🟡 In Progress (phase 1 done)
 
 ### 0.6.0: release notes
 

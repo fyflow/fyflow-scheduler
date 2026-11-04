@@ -107,18 +107,34 @@ export interface ResourceGroup extends EventTarget {
    *
    * `cost` is how many units the caller intends to take, defaulting to 1. Only
    * concurrency groups weigh it - see {@link ResourceGroup.onStart}.
+   *
+   * `request` is what the holder asked of this group, passed through
+   * unread: the scheduler never interprets it. Only a group that defines a
+   * request language - `UnitGroup`'s `{ from, prefer }` - looks at it.
    */
-  canRun(key?: string, cost?: number): boolean;
+  canRun(key?: string, cost?: number, request?: unknown): boolean;
 
   /**
    * Take `cost` units (default 1). Called synchronously at the moment the
    * scheduler commits to running a task, or to creating a worker that declares
    * the group in `residentGroups`.
+   *
+   * A return value other than `undefined` is a **grant**: what the holder
+   * got, as opposed to how much - which card, which seat. The scheduler hands
+   * a copy to the work (`context.grants[groupId]` for a task,
+   * `workerContext.grants[groupId]` for a resident worker) and the original
+   * back to `onFinish`. It must survive `structuredClone`; one that does not
+   * fails the dispatch, and the units are released. A group returning
+   * nothing grants nothing, which is every group that predates grants.
    */
-  onStart?(key?: string, cost?: number): void;
+  onStart?(key?: string, cost?: number, request?: unknown): unknown;
 
-  /** Return `cost` units (default 1). Must mirror the matching `onStart`. */
-  onFinish?(key?: string, cost?: number): void;
+  /**
+   * Return `cost` units (default 1). Must mirror the matching `onStart`.
+   * `grant` is exactly what that `onStart` returned - the same object, not a
+   * copy - or undefined if it returned nothing.
+   */
+  onFinish?(key?: string, cost?: number, grant?: unknown): void;
 
   // Get current metrics
   getMetrics(): ResourceGroupMetrics;

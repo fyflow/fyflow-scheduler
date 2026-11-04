@@ -1,10 +1,24 @@
 # Units with identities — plan
 
-> **Status: open (2026-11-03). Design only; build after `keyed-concurrent-limit.md`
-> has shipped,** whose phase 0 (limits are hard caps) this depends on. Specific
-> unit requests also depend on `admission-rework.md` R2 (admission on wake). Answers
-> fyflow-app's "scheduler pass 2 #2", P3. Delete once shipped or declined;
-> move anything durable to `AGENTS.md` first.
+> **Status: open, in progress on `admission-rework` (2026-11-04).** Answers
+> fyflow-app's "scheduler pass 2 #2", P3. Phase 1 is built: grants, `UnitGroup`
+> granting any unit, task-held and resident. The contract is in `AGENTS.md`
+> §4 and §5. Phase 2, requests for specific units ("Requesting specific units"
+> below), is next. Delete this in the release commit that ships both; move
+> anything durable to `AGENTS.md` first.
+>
+> Decisions made building phase 1, against the open questions below:
+> - A task's `context.grants` **does** include its worker's resident grants,
+>   with the task's own winning on a clash. A pool listing one group in both
+>   `groups` and `residentGroups` is not rejected.
+> - A keyed group's entry is `{ [key]: grant }`, for one key too, so the shape
+>   depends on the group and never on how many keys a task has.
+> - The copy is frozen one level down, on threads too (re-frozen on arrival),
+>   because it is shared by the work and the events.
+> - `restartWorker` used to leave the old worker's resident holding filed
+>   under its dead id, and give the replacement nothing. It now returns the old
+>   holding and takes a fresh one, skipping the replacement if it no longer
+>   fits.
 
 ## The request
 

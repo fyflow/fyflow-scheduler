@@ -16,6 +16,8 @@ export { KeyedRateLimitGroup } from "./groups/keyedRateLimitGroup.ts";
 export type { KeyedRateLimitGroupOptions, KeyedTaskLike } from "./groups/keyedRateLimitGroup.ts";
 export { KeyedConcurrentLimitGroup } from "./groups/keyedConcurrentLimitGroup.ts";
 export type { KeyedConcurrentLimitGroupOptions } from "./groups/keyedConcurrentLimitGroup.ts";
+export { UnitGroup } from "./groups/unitGroup.ts";
+export type { UnitGroupOptions, UnitRequest, UnitId } from "./groups/unitGroup.ts";
 export type {
   ResourceGroup,
   ResourceGroupMetrics,

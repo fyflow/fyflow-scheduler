@@ -95,6 +95,13 @@ export interface ResourceEventDetail {
   cost: number;
   /** The bucket, for keyed groups. */
   key?: string;
+  /**
+   * What the group granted, on `resource.acquired` and `resource.released`
+   * only, and only for a group that returns one - a `UnitGroup`'s units, e.g.
+   * `['gpu1']`, so a viewer can show which card is busy. The same copy the work
+   * sees, frozen one level down. Absent for every group that grants nothing.
+   */
+  grant?: unknown;
   /** `Date.now()` at emit, matching every other timestamp in the library. */
   timestamp: number;
   /**
