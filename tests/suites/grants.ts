@@ -7,7 +7,7 @@
 // under Node: a grant crosses the thread boundary twice, with the task's run
 // message and, for a resident worker, with its init.
 
-import { WorkerManager, FyflowScheduler, FyflowTask, UnitGroup } from '../../index.ts';
+import { WorkerManager, FyflowScheduler, FyflowTask, UnitGroup, ConcurrentLimitGroup } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 
 // Node.js process declaration for cross-platform compatibility
@@ -128,6 +128,8 @@ class GrantsTestSuite {
     this.results.push(await this.runTest('Requests: A Freed Unit Goes To The Oldest Waiter That Can Use It', () => this.testOldestWaiterWins()));
     this.results.push(await this.runTest('Requests: from Is A Candidate Set, prefer Never Blocks', () => this.testFromAndPrefer()));
     this.results.push(await this.runTest('Requests: Waiters Carry Their Request, In Events And The Admission Queue', () => this.testRequestVisible()));
+    this.results.push(await this.runTest('Requests: Waiters Name Their Queue, Listed In Turn Order', () => this.testWaitSetVisible()));
+    this.results.push(await this.runTest('Requests: A Cost-Only Pool Entry Is Not A Request', () => this.testCostOnlyEntry()));
     this.results.push(await this.runTest('Requests: A Resident Pool Takes Its Units From Its Set', () => this.testResidentFrom()));
     this.results.push(await this.runTest('Requests: A Pool Pinned To A Busy Unit Does Not Block One Wanting A Free One', () => this.testResidentDisjointSets()));
     this.results.push(await this.runTest('Requests: A Pool With More Threads Than Cards Runs On The Cards It Has', () => this.testMoreThreadsThanCards()));
@@ -631,6 +633,57 @@ class GrantsTestSuite {
       throw new Error(`resource.blocked for the pinned waiter: ${JSON.stringify(event)}`);
     }
     await Promise.all(runs);
+  }
+
+  /**
+   * A group with wait sets queues its waiters per set, each numbered from 0.
+   * `waitSet` names the queue - absent for the group's plain queue - so a
+   * position reads as "within (key, waitSet)". The sets are listed in turn
+   * order, by when their head arrived, which is the order a release serves
+   * them in. They used to be listed by the set's internal id, with nothing
+   * telling the queues apart.
+   */
+  private async testWaitSetVisible(): Promise<void> {
+    const { scheduler } = await this.unitScheduler(['g0', 'g1']);
+    const blocked = new Map<string, any>();
+    scheduler.addEventListener('resource.blocked', (e: any) => blocked.set(e.detail.holderId, e.detail));
+    const runs = [
+      this.succeed(scheduler, this.pinned('h0', ['g0'], { holdMs: 60 })),
+      this.succeed(scheduler, this.pinned('h1', ['g1'], { holdMs: 60 })),
+      // Arrival order: the g1 queue's head first, then two in the plain
+      // queue - "any", and a prefer, which never blocks - then g0's
+      this.succeed(scheduler, this.pinned('p1', ['g1'])),
+      this.succeed(scheduler, this.pinned('a1', undefined)),
+      this.succeed(scheduler, this.pinned('a2', undefined, {}, ['g1'])),
+      this.succeed(scheduler, this.pinned('p0', ['g0']))
+    ];
+    const queue = scheduler.getAdmissionQueue('gpu').gpu ?? [];
+    const listed = queue.map(w => `${w.holderId}@${w.position}`).join(',');
+    if (listed !== 'p1@0,a1@0,a2@1,p0@0') throw new Error(`listed as ${listed}`);
+    const set = (id: string) => queue.find(w => w.holderId === id)?.waitSet;
+    if (set('p1') === undefined || set('p0') === undefined || set('p1') === set('p0')) {
+      throw new Error(`pinned waiters' sets: p1 ${set('p1')}, p0 ${set('p0')}`);
+    }
+    if (set('a1') !== undefined || set('a2') !== undefined) throw new Error(`plain queue named: ${set('a1')}, ${set('a2')}`);
+    // The events name the same queues, so a fold can number them the same way
+    for (const w of queue) {
+      if (blocked.get(w.holderId)?.waitSet !== w.waitSet) {
+        throw new Error(`${w.holderId}: resource.blocked says ${blocked.get(w.holderId)?.waitSet}, the snapshot ${w.waitSet}`);
+      }
+    }
+    await Promise.all(runs);
+  }
+
+  /**
+   * `{ cost: 2 }` in `residentGroups` is `2` written as an object, and works
+   * for a group that takes no requests. The empty rest used to be stored as
+   * a request, so it threw "has a request, but group takes none".
+   */
+  private async testCostOnlyEntry(): Promise<void> {
+    const vram = new ConcurrentLimitGroup(4, 'vram');
+    const { pool, scheduler } = this.setup(true, { vram }, { residentGroups: { vram: { cost: 2 } } });
+    await this.succeed(scheduler, this.task('t'));
+    if (pool.getResidentUsage().vram !== 2) throw new Error(`usage ${JSON.stringify(pool.getResidentUsage())}`);
   }
 
   private async testResidentFrom(): Promise<void> {

@@ -115,6 +115,15 @@ export interface ResourceEventDetail {
    * `UnitGroup` waiter pinned to a unit carries `{ from: ['gpu1'] }`.
    */
   request?: unknown;
+  /**
+   * Which of the group's queues the waiter is in, on `resource.blocked` and
+   * `resource.unblocked`, for a group that queues per wait set - a
+   * `UnitGroup` queues per candidate set. Opaque: compare it, do not parse
+   * it. Absent for the group's plain queue, which holds every waiter that
+   * made no request or one that does not narrow the units (`prefer` alone).
+   * `queuePosition` counts within (`key`, `waitSet`).
+   */
+  waitSet?: string;
   /** `Date.now()` at emit, matching every other timestamp in the library. */
   timestamp: number;
   /**
@@ -169,12 +178,15 @@ export interface AdmissionWaiter {
   cost: number;
   /**
    * 0-based **within its own queue**, and the head gates everything behind it.
-   * A keyed group has one queue per key, so several waiters in the same group
-   * can each be at position 0 - pair this with `key`.
+   * A keyed group has one queue per key, and a `UnitGroup` one per wait set,
+   * so several waiters in the same group can each be at position 0 - pair
+   * this with `key` and `waitSet`.
    */
   position: number;
   /** The bucket, for keyed groups. */
   key?: string;
   /** What it asked of the group, when it made a request - as on `resource.blocked`. */
   request?: unknown;
+  /** Its queue, for a group with wait sets - as on `resource.blocked`. Absent for the plain queue. */
+  waitSet?: string;
 }

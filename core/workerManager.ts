@@ -311,7 +311,9 @@ export class WorkerManager extends EventTarget {
         if (value !== null && typeof value === 'object') {
           const { cost = 1, ...request } = value;
           costs[id] = cost;
-          requests[id] = request;
+          // `{ cost: 2 }` is `2` written as an object: no request. Stored
+          // anyway, the empty rest made a group taking none throw
+          if (Object.keys(request).length > 0) requests[id] = request;
         } else {
           costs[id] = value;
         }

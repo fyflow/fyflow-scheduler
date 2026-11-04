@@ -92,12 +92,14 @@ Next:
   - the free-slot admission drained a pool's resident queue into its ready
     queue during a capacity-race backoff;
   - any `onStart` return value was a grant, so an `async onStart` failed
-    every task - grants are now opt-in, `grants: true`.
-- **Open, from the same review:** admission positions are per wait set with
-  nothing naming the set; a `{ cost }`-only object in `residentGroups` is
-  read as a request; `UnitGroup` caches a resolved request per object.
-  `onStart` throwing part-way through a task's acquires is not handled
-  (pre-existing).
+    every task - grants are now opt-in, `grants: true`;
+  - admission positions were per wait set with nothing naming the set -
+    `waitSet` on the waiter and on blocked/unblocked, and the sets listed in
+    turn order;
+  - a `{ cost }`-only object in `residentGroups` was read as a request.
+- **Left as is:** `UnitGroup` caches a resolved request per object, so one
+  mutated after `addTask` is not re-read - the caller's to avoid. `onStart`
+  throwing part-way through a task's acquires is not handled (pre-existing).
 
 **Status**: 🟡 In Progress (phases 1 and 2 done)
 

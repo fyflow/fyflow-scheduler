@@ -2498,13 +2498,19 @@ export class FyflowTask {
       task: FyflowTask,
       pool: any,
       groupId: string
-    ): { lifetime: ResourceLifetime; cost: number; request?: unknown } {
+    ): { lifetime: ResourceLifetime; cost: number; request?: unknown; waitSet?: string } {
       const taskHeld = this._groupsForTask(task, pool).some(entry => entry.id === groupId);
       const request = taskHeld ? task._requests?.[groupId] : pool?.residentRequests?.[groupId];
-      const holding: { lifetime: ResourceLifetime; cost: number; request?: unknown } = taskHeld
+      const holding: { lifetime: ResourceLifetime; cost: number; request?: unknown; waitSet?: string } = taskHeld
         ? { lifetime: 'task-held', cost: 1 }
         : { lifetime: 'resident', cost: pool?.residentGroups?.[groupId] ?? 1 };
-      if (request !== undefined) holding.request = request;
+      if (request !== undefined) {
+        holding.request = request;
+        // The queue it waits in, derived as its queue id is: requests that
+        // differ can share one - "any" and a prefer both wait in the plain queue
+        const waitSet = FyflowScheduler._waitSetOf(this.groups[groupId], request);
+        if (waitSet !== undefined) holding.waitSet = waitSet;
+      }
       return holding;
     }
 
@@ -2827,7 +2833,9 @@ export class FyflowTask {
      * composite queue id does not leak. A keyed group has one sub-queue per
      * key; they are concatenated in key order, each with its own positions, so
      * the result is deterministic and reproducible from the
-     * `resource.blocked` / `resource.unblocked` stream.
+     * `resource.blocked` / `resource.unblocked` stream. A group with wait sets
+     * has one per set, named by `waitSet`, concatenated in the order their
+     * heads arrived - reproducible from the stream too.
      *
      * Cost is `O(total blocked tasks)` and it is not capped - the panel this
      * exists for is the starvation case, which is exactly when the queue is
@@ -2840,7 +2848,7 @@ export class FyflowTask {
      */
     getAdmissionQueue(groupId?: string): Record<string, AdmissionWaiter[]> {
       // Collected per (group, key) first so sub-queues can be ordered by key
-      const byGroup = new Map<string, Array<{ key?: string; suffix?: string; waiters: AdmissionWaiter[] }>>();
+      const byGroup = new Map<string, Array<{ key?: string; suffix?: string; waiters: AdmissionWaiter[]; headSeq: number }>>();
 
       for (const [queueId, queue] of this.blockedQueues) {
         if (queue.length === 0) continue;
@@ -2863,15 +2871,18 @@ export class FyflowTask {
         });
 
         const subQueues = byGroup.get(id) ?? [];
-        subQueues.push({ key, suffix, waiters });
+        subQueues.push({ key, suffix, waiters, headSeq: queue.at(0)?._blockedSeq ?? 0 });
         byGroup.set(id, subQueues);
       }
 
       const admission: Record<string, AdmissionWaiter[]> = {};
       for (const [id, subQueues] of byGroup) {
         // Map iteration order is queue-creation order, which a consumer folding
-        // the stream cannot reproduce. Key order can be.
-        subQueues.sort((a, b) => (a.suffix ?? '').localeCompare(b.suffix ?? ''));
+        // the stream cannot reproduce. Key order can be - and for a group with
+        // wait sets, the order its heads arrived in, which is also the order
+        // a release serves its queues in.
+        if (FyflowScheduler._hasWaitSets(this.groups[id])) subQueues.sort((a, b) => a.headSeq - b.headSeq);
+        else subQueues.sort((a, b) => (a.suffix ?? '').localeCompare(b.suffix ?? ''));
         admission[id] = subQueues.flatMap(sub => sub.waiters);
       }
       return admission;

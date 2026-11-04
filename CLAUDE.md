@@ -124,7 +124,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Eleven suites, 297 tests, all in the default `deno task test` run:
+Eleven suites, 299 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -135,7 +135,7 @@ Eleven suites, 297 tests, all in the default `deno task test` run:
 | resident-groups | 12 | resident admission, weighted costs, affinity |
 | resource-events | 26 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
-| grants | 23 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, opt-in grants, uncloneable grants, the forced stop, re-entry while a worker is created; requests for particular units, per-set queues, FIFO across sets, resident requests |
+| grants | 25 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, opt-in grants, uncloneable grants, the forced stop, re-entry while a worker is created; requests for particular units, per-set queues, FIFO across sets, resident requests |
 | cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
 | docs | 51 | **executes every snippet in README.md and AGENTS.md** |
 | admission | 42 | wake paths with the heartbeat off (including a worker becoming ready, and a free slot for a task waiting on a new worker), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task, unit requests, a group throwing at dispatch; 1 known gap (R3) |

@@ -1280,6 +1280,9 @@ class DocsTestSuite {
     const waiter = scheduler.getAdmissionQueue().gpu?.find((w: any) => w.holderId === 'p2');
     if (JSON.stringify(waiter?.request) !== '{"from":["gpu1"]}') throw new Error(`The waiter's request: ${JSON.stringify(scheduler.getAdmissionQueue())}`);
     if (waiter?.key !== undefined) throw new Error(`A set showed as a key: ${waiter?.key}`);
+    // Its queue is named, the same on the event, so a position reads within it
+    if (typeof waiter?.waitSet !== 'string') throw new Error(`The pinned waiter's queue is not named: ${JSON.stringify(waiter)}`);
+    if (blocked.find(d => d.holderId === 'p2')?.waitSet !== waiter.waitSet) throw new Error('resource.blocked names another queue');
     const [r1, r2, ra] = await Promise.all([first, second, any]);
     if (r1.card !== 'gpu1' || r2.card !== 'gpu1') throw new Error(`Pinned tasks ran on ${r1.card}, ${r2.card}`);
     if (ra.card !== 'gpu0') throw new Error(`The "any" task ran on ${ra.card}`);
@@ -1327,6 +1330,10 @@ class DocsTestSuite {
       this.makeScheduler({ residentGroups: { gpu: { cost: 3, from: ['gpu0', 'gpu1'] } } }, { gpu: new UnitGroup(['gpu0', 'gpu1', 'gpu2'], { id: 'gpu' }) });
     } catch (e: any) { threw = e.message; }
     if (!threw) throw new Error('A pool cost above its from should throw at construction');
+
+    // { cost: 2 } is 2 written as an object, for any group
+    const vram = this.makeScheduler({ residentGroups: { vram: { cost: 2 } } }, { vram: new ConcurrentLimitGroup(4, 'vram') });
+    await vram.addTask(new FyflowTask({ id: 'v', workerType: 'DocsWorker', payload: { value: 1 } }), { createPromise: true });
   }
 
   private async docKeyedRateLimit(): Promise<void> {

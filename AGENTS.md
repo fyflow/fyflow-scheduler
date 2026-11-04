@@ -796,8 +796,15 @@ new WorkerManager(modelUrl, { maxThreads: 2, residentGroups: { gpu: { cost: 1, f
   only pools whose sets overlap its own; one that wants a free unit goes ahead
 - A waiter's request is on its `resource.blocked` and `resource.unblocked`
   (`request`), and on its `getAdmissionQueue()` entry. It is never a `key`:
-  the queues per set are an internal arrangement, and `key` stays the bucket
-  of a keyed group
+  `key` stays the bucket of a keyed group
+- **The queue it waits in is `waitSet`**, on the same events and entry: an
+  opaque string, to compare and never parse, and absent for the group's plain
+  queue. Each queue is numbered from 0, so read a position as "within
+  (`key`, `waitSet`)". Requests that differ can share a queue: no request and
+  `prefer` alone both wait in the plain one. `getAdmissionQueue()` lists the
+  queues in turn order - by when their head arrived, which is the order a
+  release serves them in
+- `{ cost: 2 }` with no request is `2` written as an object, for any group
 
 ##### A custom group can grant too
 
@@ -1079,6 +1086,7 @@ interface ResourceEventDetail {
   key?:       string;              // the bucket, for keyed groups - one per event, even for a task naming several
   grant?:     unknown;             // acquired/released only: what the group granted, e.g. ['gpu1']. Absent if it grants nothing
   request?:   unknown;             // blocked/unblocked only: what the waiter asked for, e.g. { from: ['gpu1'] }
+  waitSet?:   string;              // blocked/unblocked only: which of a UnitGroup's queues - opaque; absent for the plain queue
   timestamp:  number;
   readings:   GaugeReading[];      // group state AFTER the operation
 }
@@ -1150,11 +1158,14 @@ interface AdmissionWaiter {
   position:   number;                    // 0-based; 0 is the head, and it is admitted first
   key?:       string;                    // the bucket, for keyed groups
   request?:   unknown;                   // what it asked of the group, if anything - e.g. { from: ['gpu1'] }
+  waitSet?:   string;                    // which of a UnitGroup's queues it is in; absent for the plain queue
 }
 ```
 
 Keyed by **group id**, with the bucket on the waiter. A keyed group has one
-sub-queue per key; they are concatenated in key order, each numbered from 0. A
+sub-queue per key; they are concatenated in key order, each numbered from 0.
+A `UnitGroup` has one per wait set, concatenated in the order their heads
+arrived, each numbered from 0 (§5). A
 group with an empty queue is absent rather than present-and-empty.
 
 It lists **every** waiter. A task is admitted from the head when the group frees
