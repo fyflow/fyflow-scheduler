@@ -148,6 +148,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: The Forced Stop', () => this.docForcedStop()));
     this.results.push(await this.runTest('Doc: Cancelled Tasks In Events And Descendants', () => this.docCancelEvents()));
     this.results.push(await this.runTest('Doc: Resident Admission Is Head-Of-Line For Arrivals', () => this.docResidentArrivalsQueue()));
+    this.results.push(await this.runTest('Doc: A Task Waiting For A New Worker Takes A Free Slot', () => this.docResidentWaiterTakesSlot()));
     this.results.push(await this.runTest('Doc: A Two-Group Waiter Migrates, And Every Waiter Is Listed', () => this.docTwoGroupMigrates()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
@@ -2054,6 +2055,34 @@ class DocsTestSuite {
     });
     await Promise.all([small, big, cheap]);
     if (order.join() !== 'Big,Cheap') throw new Error(`Workers created in order [${order}], expected [Big,Cheap]`);
+  }
+
+  // AGENTS.md section 4, resident groups: a task waiting for a new worker
+  // takes a slot its pool's existing worker frees, from behind another pool's
+  // head, and a pool allowed more workers than its units runs on those it has.
+  // idleTimeout 0 and the heartbeat off, so nothing else could start it.
+  private async docResidentWaiterTakesSlot(): Promise<void> {
+    const vram = new ConcurrentLimitGroup(1, 'vram');
+    const pool = (maxThreads: number) => new WorkerManager(this.workerUrl, {
+      maxThreads, maxConcurrentTasks: 1, inline: true, idleTimeout: 0, residentGroups: { vram: 1 }
+    });
+    const scheduler = new FyflowScheduler({ A: pool(2), B: pool(1) }, { vram }, { periodicRetryIntervalMs: 1_000_000_000 });
+    this.schedulers.push(scheduler);
+    const task = (id: string, workerType: string) => new FyflowTask({ id, workerType, payload: { id, value: 1, awaitMs: 20 } });
+
+    const a1 = scheduler.addTask(task('a1', 'A'), { createPromise: true });
+    scheduler.addTask(task('b1', 'B'));                                     // waits for a unit A's worker keeps
+    const a2 = scheduler.addTask(task('a2', 'A'), { createPromise: true }); // waits for a second A worker
+    const waiting = (scheduler.getAdmissionQueue('vram').vram ?? []).map(w => w.holderId);
+    if (waiting.join() !== 'b1,a2') throw new Error(`vram queue is [${waiting}], expected [b1,a2]`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('a2 never ran')), 1000); });
+    try { await Promise.race([Promise.all([a1, a2]), timeout]); } finally { clearTimeout(timer); }
+    if (this.poolThreads(scheduler, 'A') !== 1) throw new Error(`A has ${this.poolThreads(scheduler, 'A')} workers, expected 1`);
+  }
+
+  private poolThreads(scheduler: FyflowScheduler, type: string): number {
+    return (scheduler as any).workerPools[type].threads.length;
   }
 
   // AGENTS.md section 6: a task waiting on two groups is listed once, under the

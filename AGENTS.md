@@ -492,7 +492,11 @@ new WorkerManager(url, { residentGroups: ['vram'] })
 
 A worker is not created while its cost does not fit, and tasks needing one wait
 until a holder is torn down — which happens on the normal idle-timeout path, so
-a pool with work arriving keeps its worker and its loaded model.
+a pool with work arriving keeps its worker and its loaded model — **or until a
+worker the pool already has frees a slot**, whichever comes first. A task
+waiting for a new worker takes that slot from wherever it is in the queue: it
+no longer needs resident capacity, so it overtakes nobody. A pool allowed more
+workers than its units can hold runs on the workers it has.
 
 Admission is **head-of-line**: a waiting expensive pool is not overtaken by
 cheaper ones. That holds for new arrivals too - a task that would need a new
@@ -1167,7 +1171,8 @@ Two mechanisms, and knowing which applies explains the latency you see:
   starts as soon as one finishes. A worker torn down wakes its resident groups'
   queues the same way, a microtask later. A task waiting on two groups waits in
   the queue of the one it is short of, so whichever release it needs is the one
-  that wakes it.
+  that wakes it. A task waiting for a new worker is also admitted when one of
+  its pool's existing workers settles a task and has a slot free.
 - **On the heartbeat**, every `periodicRetryIntervalMs` (default 50ms), for
   everything with no such signal: a **rate-limit window** rolling over, and a
   group whose limit you **raised** by hand. Neither raises an event when it

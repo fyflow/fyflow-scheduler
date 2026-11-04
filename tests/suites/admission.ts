@@ -142,6 +142,8 @@ class AdmissionTestSuite {
     await this.run('Wake: Cancelling A Holder Admits The Next Waiter', () => this.testWakeOnCancel());
     await this.run('Wake: The Second Group\'s Release Admits A Two-Group Waiter', () => this.testWakeTwoGroups());
     await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF));
+    await this.run('Wake: A Waiter For A New Worker Takes A Slot Freed On One Its Pool Has', () => this.testResidentWaiterTakesFreeSlot(false));
+    await this.run('Wake: A Waiter For A New Worker Takes A Free Slot From Behind Another Pool\'s Head', () => this.testResidentWaiterTakesFreeSlot(true));
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (threaded)', () => this.testWakeOnWorkerReady(true));
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (inline)', () => this.testWakeOnWorkerReady(false));
     await this.run('A Burst Onto An Empty Threaded Pool Dispatches Each Task Once', () => this.testBurstNoBounce());
@@ -516,6 +518,44 @@ class AdmissionTestSuite {
     // On the heartbeat a waiter may wait a full interval, plus a dispatch
     this.assertPrompt('q', await freed, startedAt, heartbeatMs === HEARTBEAT_OFF ? WAKE_BOUND_MS : heartbeatMs + WAKE_BOUND_MS);
     await done;
+  }
+
+  /**
+   * A task that would create a worker, with no resident capacity for one,
+   * waits in the resident queue. A slot freeing on a worker its pool already
+   * has needs no resident capacity, so the task takes it - it used to wait for
+   * a resident release, which with `idleTimeout: 0` never comes.
+   *
+   * Behind another pool's head that does not fit, too: head-of-line orders
+   * waiters for resident capacity, and this one no longer needs any, so taking
+   * the slot overtakes nobody.
+   */
+  private async testResidentWaiterTakesFreeSlot(behindAnotherPool: boolean) {
+    const gpu = new ConcurrentLimitGroup(1, 'gpu');
+    const pool = (maxThreads: number) => this.pool({
+      maxThreads, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 0
+    });
+    const s = this.track(new FyflowScheduler(
+      { A: pool(2), B: pool(1) }, { gpu }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const freed = this.when(s, 'task.completed', d => d?.id === 'a1');
+    const a1 = s.addTask(this.task('a1', { workerType: 'A' }, 30), { createPromise: true });
+    // B arrives first, so it heads the queue: it needs a worker, and A's holds the only unit
+    if (behindAnotherPool) s.addTask(this.task('b1', { workerType: 'B' }, 5));
+    const start = this.started(s, 'a2');
+    const a2 = s.addTask(this.task('a2', { workerType: 'A' }, 5), { createPromise: true });
+    const queue = (s.getAdmissionQueue('gpu').gpu ?? []).map(w => w.holderId).join(',');
+    const expected = behindAnotherPool ? 'b1,a2' : 'a2';
+    if (queue !== expected) throw new Error(`precondition: the resident queue is "${queue}", expected "${expected}"`);
+
+    const startedAt = await this.startsWithin(start, 'a2');
+    this.assertPrompt('a2', await freed, startedAt);
+    await Promise.all([a1, a2]);
+    if (behindAnotherPool) {
+      // B still waits: A's worker holds the unit for good
+      const left = (s.getAdmissionQueue('gpu').gpu ?? []).map(w => w.holderId).join(',');
+      if (left !== 'b1') throw new Error(`B should still be waiting alone, queue "${left}"`);
+    }
   }
 
   private async testWakeOnRateWindow(heartbeatMs: number) {

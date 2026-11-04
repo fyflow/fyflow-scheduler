@@ -126,6 +126,7 @@ class GrantsTestSuite {
     this.results.push(await this.runTest('Requests: Waiters Carry Their Request, In Events And The Admission Queue', () => this.testRequestVisible()));
     this.results.push(await this.runTest('Requests: A Resident Pool Takes Its Units From Its Set', () => this.testResidentFrom()));
     this.results.push(await this.runTest('Requests: A Pool Pinned To A Busy Unit Does Not Block One Wanting A Free One', () => this.testResidentDisjointSets()));
+    this.results.push(await this.runTest('Requests: A Pool With More Threads Than Cards Runs On The Cards It Has', () => this.testMoreThreadsThanCards()));
     this.results.push(await this.runTest('Requests: Bad Requests Throw Up Front', () => this.testRequestValidation()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -653,9 +654,8 @@ class GrantsTestSuite {
     this.schedulers.push(scheduler);
 
     const a1 = this.succeed(scheduler, new FyflowTask({ id: 'a1', workerType: 'A', payload: { holdMs: 150 } }));
-    // Waits for a worker on g0. Fire-and-forget: it is not this test's concern
-    // when it runs, only that B is not queued behind it
-    scheduler.addTask(new FyflowTask({ id: 'a2', workerType: 'A', payload: {} }));
+    // Waits for a worker on g0 - and runs on A's first once a1 is done
+    const a2 = this.succeed(scheduler, new FyflowTask({ id: 'a2', workerType: 'A', payload: {} }));
     const waiting = scheduler.getAdmissionQueue('gpu').gpu ?? [];
     if (!waiting.some(w => w.holderId === 'a2' && w.lifetime === 'resident')) {
       throw new Error(`precondition: a2 should wait for a worker on g0, queue ${JSON.stringify(waiting)}`);
@@ -667,6 +667,34 @@ class GrantsTestSuite {
       throw new Error(`B waited ${Date.now() - t0} ms behind A's waiter, and got ${JSON.stringify(b1.ctor?.gpu)}`);
     }
     await a1;
+    const r2 = await a2;
+    if (!same(r2.ctor.gpu, ['g0'])) throw new Error(`a2 ran on a worker holding ${JSON.stringify(r2.ctor?.gpu)}`);
+  }
+
+  /**
+   * A pool allowed three workers but only two cards: two workers, on the two
+   * cards, and every task runs on one of them. The third worker can never be
+   * created, so the tasks waiting for it take the first free slot instead.
+   */
+  private async testMoreThreadsThanCards(): Promise<void> {
+    for (const inline of [true, false]) {
+      const gpu = new UnitGroup(['g0', 'g1', 'g2'], { id: 'gpu' });
+      const pool = new WorkerManager(this.workerUrl, {
+        inline, maxThreads: 3, maxConcurrentTasks: 1, idleTimeout: 0, residentGroups: { gpu: { from: ['g0', 'g1'] } }
+      });
+      this.pools.push(pool);
+      const scheduler = new FyflowScheduler({ G: pool }, { gpu }, GrantsTestSuite.NO_HEARTBEAT);
+      this.schedulers.push(scheduler);
+      const results = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+        this.succeed(scheduler, new FyflowTask({ id: `t${i}`, workerType: 'G', payload: { holdMs: 20 } }))));
+      const cards = new Set(results.map(r => JSON.stringify(r.ctor.gpu)));
+      if (cards.size !== 2 || !cards.has('["g0"]') || !cards.has('["g1"]')) {
+        throw new Error(`${kindOf(inline)}: workers held ${[...cards].join(' ')}`);
+      }
+      if (pool.threads.length !== 2) throw new Error(`${kindOf(inline)}: ${pool.threads.length} workers`);
+      if (gpu.isBusy('g2')) throw new Error(`${kindOf(inline)}: g2 was taken`);
+      await scheduler.shutdown();
+    }
   }
 
   private async testRequestValidation(): Promise<void> {

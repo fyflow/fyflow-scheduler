@@ -503,6 +503,7 @@ export class FyflowTask {
       if (!queue.includes(task)) {
         queue.push(task);
         task._blockedSeq = ++this.blockedSeq;
+        this._noteResidentWait(task);
         if (this._resourceObserved) {
           this._emitResource('resource.blocked', short.group, {
             groupId: short.id,
@@ -570,6 +571,81 @@ export class FyflowTask {
 
     /** Arrival order across every blocked queue - see {@link FyflowTask._blockedSeq}. */
     private blockedSeq = 0;
+
+    /**
+     * Tasks waiting in a resident queue - for a worker their pool cannot yet
+     * create - per worker type, oldest first, with the `_blockedSeq` of that
+     * wait. Pruned lazily: an entry is live only while its task is still
+     * blocked with that same seq, since every push takes a new one. Kept so a
+     * free slot finds its pool's waiters without walking queues that may hold
+     * thousands of other pools' tasks.
+     */
+    private _residentWaits = new Map<string, Map<FyflowTask, number>>();
+    private _admittingResidentRoom = false;
+
+    private _noteResidentWait(task: FyflowTask): void {
+      let waits = this._residentWaits.get(task.workerType);
+      if (!waits) this._residentWaits.set(task.workerType, waits = new Map());
+      // Re-inserted, so the map stays in seq order
+      waits.delete(task);
+      waits.set(task, task._blockedSeq!);
+    }
+
+    /**
+     * Admit waiters for a new worker whose pool has a free slot on a worker it
+     * already has. Run at the end of every dispatch loop, so after a settle.
+     *
+     * Such a task needs no resident capacity any more, so it leaves the
+     * resident queue from wherever it is. Head-of-line orders waiters for
+     * resident capacity, and this one takes none, so it overtakes nobody. It
+     * used to wait for a resident release instead: with `idleTimeout: 0` the
+     * pool's workers keep their units for good, so one that held the only unit
+     * stalled its own pool's next task forever.
+     */
+    private _admitResidentWaitersWithRoom(): void {
+      if (this._residentWaits.size === 0 || this._admittingResidentRoom) return;
+      if (!this._hasBlockedTasks()) {
+        // Every entry is stale; drop them, and the tasks they hold on to
+        this._residentWaits.clear();
+        return;
+      }
+      this._admittingResidentRoom = true;
+      try {
+        for (const [workerType, waits] of this._residentWaits) {
+          const pool = this.workerPools[workerType];
+          while (waits.size > 0 && pool && !this._needsNewWorker(pool)) {
+            const [task, seq] = waits.entries().next().value!;
+            waits.delete(task);
+            if (task._queuedIn !== 'blocked' || task._blockedSeq !== seq) continue;
+            this._admitOutOfTurn(task, pool);
+          }
+          if (waits.size === 0) this._residentWaits.delete(workerType);
+        }
+      } finally {
+        this._admittingResidentRoom = false;
+      }
+    }
+
+    /** Take a resident waiter out of its queue, wherever it is, and admit or move it. */
+    private _admitOutOfTurn(task: FyflowTask, pool: any): void {
+      const queueId = task._blockedQueueId!;
+      const queue = this.blockedQueues.get(queueId);
+      if (!queue) return;
+      const { groupId } = this._splitQueueId(queueId);
+      const group = this.groups[groupId];
+      // Another of its holds full: wait there, where a release can admit it
+      const refusing = this._holdsFor(task, pool).find(hold => !hold.group.canRun(hold.key, 1, hold.request));
+      if (refusing) {
+        this._migrate(task, pool, queue, groupId, undefined, refusing);
+      } else {
+        // Not tombstoned: unlike a cancelled task it may come back to this
+        // queue, where a tombstone would hide it
+        if (queue.at(0) === task) queue.shift();
+        else queue.remove(task);
+        this._admitWaiter(task, pool, group, groupId, undefined);
+      }
+      this._dropBlockedQueueIfEmpty(queueId);
+    }
 
     /**
      * Resolve the bucket for every keyed group this task belongs to.
@@ -984,6 +1060,8 @@ export class FyflowTask {
           }
         }
       }
+
+      this._admitResidentWaitersWithRoom();
 
       // Clear periodic retry if no more tasks queued or blocked
       const hasReadyTasks = Array.from(this.readyQueuesByWorker.values()).some(q => q.length > 0);
@@ -1808,7 +1886,7 @@ export class FyflowTask {
           // it - including ones that need no worker - until the heartbeat.
           const resident = this._residentGroupsForPool(pool);
           const short = resident.find(({ group: g, cost, request: r }) => !g.canRun(undefined, cost, r)) ?? resident[0];
-          this._migrate(task, pool, blockedTasks, groupId, key, { ...short, key: undefined });
+          this._migrate(task, pool, blockedTasks, groupId, key, { ...short, key: undefined }, true);
           exits++;
           continue;
         }
@@ -1831,51 +1909,62 @@ export class FyflowTask {
           continue;
         }
 
-        // Exit (a): admitted. Into the ready queue first, so stats and
-        // `_queuedIn` are true while its event is out; dispatched from there.
+        // Exit (a): admitted
         blockedTasks.shift();
-        task._blockedQueueId = undefined;
-        const workerQueue = this.readyQueuesByWorker.get(task.workerType)!;
-        workerQueue.unshift(task);
-        task._queuedIn = 'ready';
-        task._admittedByWake = true;
-        this.stats.queued++;
         exits++;
-        if (this._resourceObserved) {
-          this._emitResource('resource.unblocked', group, {
-            groupId,
-            ...this._blockedHoldingFor(task, pool, groupId),
-            holderKind: 'task',
-            holderId: task.id,
-            workerType: task.workerType,
-            key,
-            reason: 'admitted'
-          });
-        }
-
-        // A listener may have cancelled it, or moved things: dispatch it only
-        // if it is still where it was put
-        if (task._queuedIn !== 'ready' || workerQueue.at(0) !== task) continue;
-        workerQueue.shift();
-        task._queuedIn = undefined;
-        const result = this._canDispatchTask(task, pool);
-        if (result === true) {
-          this._dispatchTask(task, pool);
-        } else if (result === false) {
-          // No free slot: it waits for one in the ready queue, which the
-          // pool's next settle drains
-          workerQueue.unshift(task);
-          task._queuedIn = 'ready';
-          parked++;
-        }
-        // 'blocked': a listener changed something and it is queued again, its
-        // events already out
+        if (this._admitWaiter(task, pool, group, groupId, key)) parked++;
       }
 
       // Last, with the queue in its final shape, so a listener re-entering on
       // task.failed sees consistent state
       for (const task of orphaned) this._failOrphanedTask(task, queueId);
       return exits;
+    }
+
+    /**
+     * Exit (a), for a waiter already taken out of its queue. Into the ready
+     * queue first, so stats and `_queuedIn` are true while its event is out;
+     * dispatched from there.
+     *
+     * @returns true if it was left in the ready queue for want of a free slot.
+     */
+    private _admitWaiter(task: FyflowTask, pool: any, group: any, groupId: string, key: string | undefined): boolean {
+      task._blockedQueueId = undefined;
+      const workerQueue = this.readyQueuesByWorker.get(task.workerType)!;
+      workerQueue.unshift(task);
+      task._queuedIn = 'ready';
+      task._admittedByWake = true;
+      this.stats.queued++;
+      if (this._resourceObserved) {
+        this._emitResource('resource.unblocked', group, {
+          groupId,
+          ...this._blockedHoldingFor(task, pool, groupId),
+          holderKind: 'task',
+          holderId: task.id,
+          workerType: task.workerType,
+          key,
+          reason: 'admitted'
+        });
+      }
+
+      // A listener may have cancelled it, or moved things: dispatch it only
+      // if it is still where it was put
+      if (task._queuedIn !== 'ready' || workerQueue.at(0) !== task) return false;
+      workerQueue.shift();
+      task._queuedIn = undefined;
+      const result = this._canDispatchTask(task, pool);
+      if (result === true) {
+        this._dispatchTask(task, pool);
+      } else if (result === false) {
+        // No free slot: it waits for one in the ready queue, which the
+        // pool's next settle drains
+        workerQueue.unshift(task);
+        task._queuedIn = 'ready';
+        return true;
+      }
+      // 'blocked': a listener changed something and it is queued again, its
+      // events already out
+      return false;
     }
 
     /**
@@ -1893,14 +1982,16 @@ export class FyflowTask {
      */
     private _migrate(
       task: FyflowTask, pool: any, from: TaskQueue<FyflowTask>, fromGroupId: string, fromKey: string | undefined,
-      to: Hold
+      to: Hold, toResident = false
     ) {
       const toKey = to.key;
       const toQueueId = this._blockedQueueId(to.id, toKey ?? FyflowScheduler._waitSetOf(to.group, to.request));
-      from.shift();
+      if (from.at(0) === task) from.shift();
+      else from.remove(task);
       const target = this._blockedQueue(toQueueId);
       target.push(task);
       task._blockedSeq = ++this.blockedSeq;
+      if (toResident) this._noteResidentWait(task);
       task._queuedIn = 'blocked';
       task._blockedQueueId = toQueueId;
       if (!this._resourceObserved) return;
