@@ -91,11 +91,14 @@ export interface ResourceGroup extends EventTarget {
   readonly keyed?: boolean;
 
   /**
-   * Key this task belongs to, for keyed groups. Returning undefined or an empty
-   * string makes `addTask` throw - a task with no key would otherwise silently
-   * bypass or share a bucket.
+   * Key this task belongs to, for keyed groups - or several, for a task that
+   * needs more than one: a copy from C: to D: holds both disks. The task is
+   * admitted only when every key has room, and holds one unit of each;
+   * duplicates collapse. Returning undefined, an empty string or an empty list
+   * makes `addTask` throw - a task with no key would otherwise silently bypass
+   * or share a bucket.
    */
-  keyFor?(task: unknown): string | undefined;
+  keyFor?(task: unknown): string | string[] | undefined;
 
   /**
    * Capacity check (synchronous). `key` is supplied only for keyed groups; a

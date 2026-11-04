@@ -5,7 +5,7 @@ import type {
   ResourceGroupMetrics,
   ResourceGroupStats
 } from './resourceGroup.ts';
-import type { KeyedTaskLike } from './keyedRateLimitGroup.ts';
+import { normalizeKeys, type KeyedTaskLike } from './keyedRateLimitGroup.ts';
 
 export interface KeyedConcurrentLimitGroupOptions {
   /** Stable id used in `workerGroups` / pool `groups`. Generated if omitted. */
@@ -17,9 +17,12 @@ export interface KeyedConcurrentLimitGroupOptions {
    * new KeyedConcurrentLimitGroup(4, { id: 'disk', keyFrom: t => t.payload.drive })
    * ```
    *
-   * Returning undefined or an empty string makes `addTask` throw.
+   * Return a list for a task that needs several keys at once - a copy from
+   * C: to D: holds one unit of each disk, and is admitted only when both have
+   * room. Duplicates collapse. Returning undefined, an empty string or an
+   * empty list makes `addTask` throw.
    */
-  keyFrom?: (task: KeyedTaskLike) => string | undefined;
+  keyFrom?: (task: KeyedTaskLike) => string | string[] | undefined;
   /**
    * The limit for one key, when keys should not share one number - an SSD
    * and a USB disk, say. Defaults to the constructor's `limit` for every key.
@@ -66,7 +69,7 @@ export class KeyedConcurrentLimitGroup extends EventTarget implements ResourceGr
   /** Default per-key limit, for every key `limitFor` does not answer differently. */
   readonly limit: number;
 
-  private keyFrom: (task: KeyedTaskLike) => string | undefined;
+  private keyFrom: (task: KeyedTaskLike) => string | string[] | undefined;
   private limitFor?: (key: string) => number;
   private keys = new Map<string, KeyState>();
   private stats = {
@@ -90,12 +93,12 @@ export class KeyedConcurrentLimitGroup extends EventTarget implements ResourceGr
    * Also where `limitFor` is checked, so a bad answer fails the `addTask`
    * rather than a dispatch already under way.
    */
-  keyFor(task: unknown): string | undefined {
-    const raw = this.keyFrom(task as KeyedTaskLike);
-    if (raw === undefined || raw === null || raw === '') return undefined;
-    const key = String(raw);
-    if (!this.keys.has(key)) this._limitFor(key);
-    return key;
+  keyFor(task: unknown): string | string[] | undefined {
+    const keys = normalizeKeys(this.keyFrom(task as KeyedTaskLike));
+    for (const key of typeof keys === 'string' ? [keys] : keys ?? []) {
+      if (!this.keys.has(key)) this._limitFor(key);
+    }
+    return keys;
   }
 
   /**

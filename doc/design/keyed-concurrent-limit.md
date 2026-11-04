@@ -1,9 +1,9 @@
 # Keyed concurrency limits — plan
 
-> **Status: open (2026-11-03).** Answers fyflow-app's "scheduler pass 2 #1".
-> Phase 0 and phase A are accepted for the next release. Phase B is accepted
-> but deferred. Delete this document once phase B ships, or once it is
-> declined. Move anything durable to `AGENTS.md` first.
+> **Status: implemented on `admission-rework`, not yet released (2026-11-04).**
+> Answers fyflow-app's "scheduler pass 2 #1". Phases 0, A and B are all built;
+> the contracts are in `AGENTS.md` §1 and §5. Delete this document in the
+> release commit that ships them.
 
 ## The request
 
@@ -148,10 +148,14 @@ new KeyedConcurrentLimitGroup(limit: number, {
 - Benchmarks: none should move, since there are no scheduler changes. Run
   `benchmark:quick` against the base anyway, per `TODO_CHECKLIST.md`.
 
-## Phase B — several keys per task (deferred)
+## Phase B — several keys per task
 
-Accepted, but not built in the first round. Recorded here so the phase A shape
-leaves room for it.
+> **Done** on `admission-rework`; the contract is in `AGENTS.md` §5, "Several
+> keys per task". Departures from the text below: `getAdmissionQueue` lists a
+> task once, under the key refusing it now - R2's one-queue rule - not under
+> every key; and `task.limitKey` stays a single string, so a list comes from
+> `keyFrom`. The acceptance benchmark is the `keyed-multi` shape: 5.6
+> `canRun` and 1 `blocked` per task at 10K, 50K and 200K.
 
 - `keyFor` may return `string | string[]`. Duplicates are removed: a C:→C: copy
   holds one unit, not two. An empty array is a missing key and throws.

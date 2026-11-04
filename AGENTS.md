@@ -643,8 +643,42 @@ const scheduler = new FyflowScheduler({ CopyWorker: pool }, { disk });
   lists them
 - Not usable in `residentGroups` - rejected at construction
 
-One key per task. A task that touches two disks - a copy from C: to D: - cannot
-name both yet.
+##### Several keys per task
+
+A task that touches two disks - a copy from C: to D: - names both, by returning
+a list from `keyFrom`:
+
+```typescript
+const disk = new KeyedConcurrentLimitGroup(2, {
+  id: 'disk',
+  keyFrom: t => [t.payload.from, t.payload.to]
+});
+
+scheduler.addTask(new FyflowTask({
+  id: 'copy-1', workerType: 'CopyWorker', payload: { from: 'C:', to: 'D:' }
+}));
+```
+
+- **All or nothing.** The task is admitted only when every key has room, and
+  then holds one unit of each. It holds nothing while it waits, so it never
+  blocks a disk it has not got yet, and there is nothing to deadlock on
+- Duplicates collapse - a C: -> C: copy holds one unit - and empty entries are
+  dropped; a list with nothing left throws at `addTask`, like a missing key
+- It waits in the queue of the key refusing it now. Woken while its other key
+  is still full, it moves there (`resource.unblocked` with reason `migrated`),
+  to the back of that key's queue
+- Events are per (group, key): a two-disk copy emits two `resource.acquired`
+  and two `resource.released`, each with its own `key` and readings for that
+  key. `key` on an event is always one string
+- `KeyedRateLimitGroup` takes a list the same way, and counts the task against
+  every key's windows. So can a custom keyed group: `keyFor` may return
+  `string | string[]`
+- Use `keyFrom` for this: `task.limitKey` is a single string
+
+**Not fair to multi-key tasks.** Admission is greedy and nothing reserves a key,
+so a steady stream of single-disk tasks on either disk can keep a two-disk task
+waiting indefinitely. If that matters, give the two-disk work its own pool or
+throttle the single-disk stream.
 
 ---
 
@@ -884,7 +918,7 @@ interface ResourceEventDetail {
   holderId:   string;              // task id, or worker id
   workerType: string;              // the POOL KEY - see the warning below
   cost:       number;              // units taken. Always 1 except for a weighted resident hold
-  key?:       string;              // the bucket, for keyed groups
+  key?:       string;              // the bucket, for keyed groups - one per event, even for a task naming several
   timestamp:  number;
   readings:   GaugeReading[];      // group state AFTER the operation
 }
@@ -922,7 +956,7 @@ which:
 | `reason` | What happened |
 |---|---|
 | `admitted` | Every group it needs has room for it. It is dispatched straight away, or, if its pool has no free slot, waits in the ready queue for one. The ordinary exit |
-| `migrated` | This group freed up, but another group it needs is still full. It moves to the **tail** of that group's queue. The `resource.blocked` for the new queue comes **before** this event, so a fold never sees the task in no queue |
+| `migrated` | This group (or key) freed up, but another group it needs - or another key of the same group, for a task naming several - is still full. It moves to the **tail** of that queue. The `resource.blocked` for the new queue comes **before** this event, so a fold never sees the task in no queue |
 | `superseded` | No longer emitted: it came from a task listed in two queues at once, which cannot happen any more. Kept in the type so code that names it still compiles |
 | `orphaned` | Its worker pool no longer exists. The task is **failed terminally** — `task.failed`, then `user_action` unless it is optional, and its promise rejects. Retries are skipped: the pool is gone |
 | `shutdown` | The scheduler tore down and discarded every remaining waiter |

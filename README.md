@@ -438,6 +438,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - A concurrent limit **per key** - one disk, one database each - so a saturated
   key never delays another. Keyed like `KeyedRateLimitGroup`
 - `options.limitFor(key)` gives a key its own limit, e.g. 1 for a slow disk
+- `keyFrom` may return several keys - a C: -> D: copy holds both disks, and
+  starts only when both have room
 - A key is dropped as soon as nothing holds it
 
 **Worker management** (on a `WorkerManager`)

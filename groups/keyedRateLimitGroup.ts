@@ -14,6 +14,21 @@ export interface KeyedTaskLike {
   payload?: any;
 }
 
+/**
+ * What `keyFrom` returned, as `keyFor` returns it: one key as a string,
+ * several as a list without empty entries, nothing as undefined. Duplicates
+ * are left to the scheduler, which collapses them for every keyed group.
+ * @internal
+ */
+export function normalizeKeys(raw: unknown): string | string[] | undefined {
+  const present = (k: unknown) => k !== undefined && k !== null && k !== '';
+  if (Array.isArray(raw)) {
+    const keys = raw.filter(present).map(k => String(k));
+    return keys.length === 0 ? undefined : keys.length === 1 ? keys[0] : keys;
+  }
+  return present(raw) ? String(raw) : undefined;
+}
+
 export interface KeyedRateLimitGroupOptions {
   /** Stable id used in `workerGroups` / pool `groups`. Generated if omitted. */
   id?: string;
@@ -25,9 +40,11 @@ export interface KeyedRateLimitGroupOptions {
    * new KeyedRateLimitGroup(windows, { id: 'api', keyFrom: t => t.payload.endpoint })
    * ```
    *
-   * Returning undefined or an empty string makes `addTask` throw.
+   * Return a list for a task that needs several buckets at once; it is
+   * admitted only when every one has room. Returning undefined, an empty
+   * string or an empty list makes `addTask` throw.
    */
-  keyFrom?: (task: KeyedTaskLike) => string | undefined;
+  keyFrom?: (task: KeyedTaskLike) => string | string[] | undefined;
   /**
    * How long a key with no running tasks is kept after its last activity.
    * Defaults to twice the largest window, which is the point past which the key
@@ -73,7 +90,7 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
   readonly keyed = true;
 
   private windows: RateWindow[];
-  private keyFrom: (task: KeyedTaskLike) => string | undefined;
+  private keyFrom: (task: KeyedTaskLike) => string | string[] | undefined;
   private idleKeyTtlMs: number;
   private keys = new Map<string, KeyState>();
   private stats = {
@@ -91,10 +108,9 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
     this.idleKeyTtlMs = options.idleKeyTtlMs ?? Math.max(...windows.map(w => w.windowMs)) * 2;
   }
 
-  /** Bucket this task belongs to. The scheduler throws if this returns nothing. */
-  keyFor(task: unknown): string | undefined {
-    const key = this.keyFrom(task as KeyedTaskLike);
-    return key === undefined || key === null || key === '' ? undefined : String(key);
+  /** Bucket(s) this task belongs to. The scheduler throws if this returns nothing. */
+  keyFor(task: unknown): string | string[] | undefined {
+    return normalizeKeys(this.keyFrom(task as KeyedTaskLike));
   }
 
   /**

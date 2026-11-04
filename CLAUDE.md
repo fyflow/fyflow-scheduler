@@ -117,11 +117,11 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Ten suites, 257 tests, all in the default `deno task test` run:
+Ten suites, 265 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| core | 30 | scheduling, groups, pooling, retention, queue scaling, limits at scale, `KeyedConcurrentLimitGroup` |
+| core | 31 | scheduling, groups, pooling, retention, queue scaling, limits at scale, `KeyedConcurrentLimitGroup` |
 | error-handling | 12 | worker failure, restart, requeue |
 | spawning | 13 | dynamic spawning, `onCompleteDescendants()`, draining on shutdown |
 | settlement | 34 | exactly-once settlement, counter cardinality, requeue, self-termination, attempts and backoff |
@@ -129,8 +129,8 @@ Ten suites, 257 tests, all in the default `deno task test` run:
 | resource-events | 26 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
 | cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
-| docs | 47 | **executes every snippet in README.md and AGENTS.md** |
-| admission | 30 | wake paths with the heartbeat off (including a worker becoming ready), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`; 1 known gap (R3) |
+| docs | 48 | **executes every snippet in README.md and AGENTS.md** |
+| admission | 36 | wake paths with the heartbeat off (including a worker becoming ready), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task; 1 known gap (R3) |
 
 `deno task test:scripts` is separate and not included in `deno task test`. It
 unit-tests `scripts/` and the known-gap rules in `tests/harness.ts`.

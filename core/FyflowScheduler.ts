@@ -115,10 +115,11 @@ export class FyflowTask {
     limitKey?: string;
     _resourcesPreAllocated?: boolean; // Flag to track if resources are pre-allocated
     /**
-     * Keys resolved at dispatch, per keyed group id. Held so release uses the
-     * same bucket acquisition used, even if the payload changed meanwhile.
+     * Keys resolved at dispatch, per keyed group id - one or more, without
+     * duplicates. Held so release uses the same buckets acquisition used, even
+     * if the payload changed meanwhile.
      */
-    _resourceKeys?: Record<string, string>;
+    _resourceKeys?: Record<string, string[]>;
     /**
      * Set while this attempt is being settled, so the same outcome arriving from
      * both the pool's `task.failed` event and the task promise settles once.
@@ -495,23 +496,52 @@ export class FyflowTask {
      *   otherwise silently share a bucket with every other keyless task, or skip
      *   the limit entirely - both discovered only once something is throttled.
      */
-    private _resolveResourceKeys(task: FyflowTask, pool: any): Record<string, string> {
-      const keys: Record<string, string> = {};
+    private _resolveResourceKeys(task: FyflowTask, pool: any): Record<string, string[]> {
+      const keys: Record<string, string[]> = {};
 
       for (const { id, group } of this._groupsForTask(task, pool)) {
         if (!group.keyed) continue;
 
-        const key = group.keyFor?.(task);
-        if (key === undefined) {
+        // One key, or several: a copy from C: to D: holds both disks. Empty
+        // entries are dropped and duplicates collapse, so a C: -> C: copy
+        // holds one unit, not two; nothing left is a missing key.
+        const raw = group.keyFor?.(task);
+        const list = Array.isArray(raw) ? raw : [raw];
+        const resolved = [...new Set(
+          list.filter(k => k !== undefined && k !== null && k !== '').map(k => String(k))
+        )];
+        if (resolved.length === 0) {
           throw new Error(
             `Missing limit key for group "${id}" on task "${task.id}". ` +
             `Set task.limitKey, or give the group a keyFrom that derives one.`
           );
         }
-        keys[id] = key;
+        keys[id] = resolved;
       }
 
       return keys;
+    }
+
+    /**
+     * Every (group, key) a task holds or would hold: one entry per key of a
+     * keyed group, one with no key for any other. The unit admission and
+     * release work in - a task naming two disks is two holds, checked
+     * together and acquired together.
+     */
+    private _holdsFor(
+      task: FyflowTask, pool: any, keys: Record<string, string[]> = task._resourceKeys ?? {}
+    ): Array<{ id: string; group: any; key: string | undefined }> {
+      const holds: Array<{ id: string; group: any; key: string | undefined }> = [];
+      for (const entry of this._groupsForTask(task, pool)) {
+        // A keyless hold is the entry itself, `key` absent: this runs for every
+        // waiter a wake examines, and a copy per group showed up as heap
+        if (!entry.group.keyed) {
+          holds.push(entry as { id: string; group: any; key: undefined });
+          continue;
+        }
+        for (const key of keys[entry.id] ?? []) holds.push({ id: entry.id, group: entry.group, key });
+      }
+      return holds;
     }
 
     // Any task waiting on a resource group. Blocked tasks are subtracted from
@@ -839,13 +869,14 @@ export class FyflowTask {
         return true;
       }
 
-      const entries = this._groupsForTask(task, pool);
       const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
       task._resourceKeys = keys;
 
-      // Check if resources are available
-      for (const { id, group } of entries) {
-        const key = group.keyed ? keys[id] : undefined;
+      // Every hold must have room - every group, and every key of a keyed
+      // one. Checked here and acquired by _dispatchTask in the same turn, so
+      // all-or-nothing needs no locking, and with no partial hold there is
+      // nothing to deadlock on.
+      for (const { id, group, key } of this._holdsFor(task, pool, keys)) {
         if (!group.canRun(key)) {
           const blockedOnKey = Boolean(group.keyed);
           // Blocked on this group - and on this key, when the group is keyed
@@ -955,19 +986,18 @@ export class FyflowTask {
       this.stats.running++;
 
       // Acquire resources immediately (thread will be created if needed)
-      const entries = this._groupsForTask(task, pool);
       const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
       task._resourceKeys = keys;
       task._resourcesPreAllocated = true;
+      const holds = this._holdsFor(task, pool, keys);
 
       // Every group first, then the events. A resource.acquired listener can
       // re-enter the scheduler - addTask dispatches synchronously - and with
       // the events in between, a task dispatched from there passed canRun on a
       // group this one had checked but not yet taken, and both took it: a
       // concurrency group held more than its limit.
-      for (const { id, group } of entries) group.onStart(group.keyed ? keys[id] : undefined);
-      entries.forEach(({ id, group }) => {
-        const key = group.keyed ? keys[id] : undefined;
+      for (const { group, key } of holds) group.onStart(key);
+      holds.forEach(({ id, group, key }) => {
         // After the mutation, so `readings` are the state a fold should land on
         if (this._resourceObserved) {
           this._emitResource('resource.acquired', group, {
@@ -1054,15 +1084,13 @@ export class FyflowTask {
     _releaseResourcesForTask(task: FyflowTask, pool: any) {
       if (!task._resourcesPreAllocated) return;
 
-      const entries = this._groupsForTask(task, pool);
       // Release the exact buckets that were acquired, not whatever keyFrom would
       // return now - a payload the worker mutated must not send the release to a
       // different key than the acquire
-      const keys = task._resourceKeys ?? {};
+      const holds = this._holdsFor(task, pool);
 
       // Release all resources first, then retry blocked tasks
-      for (const { id, group } of entries) {
-        const key = group.keyed ? keys[id] : undefined;
+      for (const { id, group, key } of holds) {
         group.onFinish(key);
         if (this._resourceObserved) {
           this._emitResource('resource.released', group, {
@@ -1082,9 +1110,7 @@ export class FyflowTask {
       task._resourceKeys = undefined;
 
       // Retry blocked tasks AFTER all resources are released
-      for (const { id, group } of entries) {
-        this._retryBlockedTasksForGroup(id, group.keyed ? keys[id] : undefined);
-      }
+      for (const { id, key } of holds) this._retryBlockedTasksForGroup(id, key);
     }
 
     /**
@@ -1553,8 +1579,9 @@ export class FyflowTask {
 
         // Waiting here for a worker's resident units, rather than for a group
         // the task itself holds - the same derivation `_blockedHoldingFor` uses
-        const taskGroups = this._groupsForTask(task, pool);
-        const residentWait = !taskGroups.some(({ id }) => id === groupId);
+        // Built once per waiter: the checks below all read it
+        const holds = this._holdsFor(task, pool);
+        const residentWait = !holds.some(({ id }) => id === groupId);
 
         // Its pool's per-worker cost does not fit.
         if (this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false) {
@@ -1569,16 +1596,16 @@ export class FyflowTask {
           // it - including ones that need no worker - until the heartbeat.
           const resident = this._residentGroupsForPool(pool);
           const short = resident.find(({ group: g, cost }) => !g.canRun(undefined, cost)) ?? resident[0];
-          this._migrate(task, pool, blockedTasks, groupId, key, short);
+          this._migrate(task, pool, blockedTasks, groupId, key, { ...short, key: undefined });
           continue;
         }
 
-        // Another of its groups still full: wait there instead. Its release is
-        // what can admit the task now, and this queue's never could - a task
-        // left here waited for the heartbeat.
-        const keys = task._resourceKeys ?? {};
-        const refusing = taskGroups.find(({ id, group: g }) =>
-          id !== groupId && !g.canRun(g.keyed ? keys[id] : undefined)
+        // Another of its holds still full - another group, or another key of
+        // this one: wait there instead. Its release is what can admit the task
+        // now, and this queue's never could - a task left here waited for the
+        // heartbeat.
+        const refusing = holds.find(({ id, group: g, key: k }) =>
+          !(id === groupId && k === key) && !g.canRun(k)
         );
         if (refusing) {
           // Except out of a resident queue. Moved, it gives up its place at the
@@ -1652,9 +1679,9 @@ export class FyflowTask {
      */
     private _migrate(
       task: FyflowTask, pool: any, from: TaskQueue<FyflowTask>, fromGroupId: string, fromKey: string | undefined,
-      to: { id: string; group: any }
+      to: { id: string; group: any; key: string | undefined }
     ) {
-      const toKey = to.group.keyed ? (task._resourceKeys ?? {})[to.id] : undefined;
+      const toKey = to.key;
       const toQueueId = this._blockedQueueId(to.id, toKey);
       from.shift();
       const target = this._blockedQueue(toQueueId);

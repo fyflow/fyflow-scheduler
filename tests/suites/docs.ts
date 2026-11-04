@@ -134,6 +134,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
     this.results.push(await this.runTest('Doc: Keyed Concurrency Limit Per Disk', () => this.docKeyedConcurrentLimit()));
+    this.results.push(await this.runTest('Doc: Several Keys Per Task', () => this.docSeveralKeysPerTask()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
@@ -1137,6 +1138,50 @@ class DocsTestSuite {
       new FyflowScheduler({ DocsWorker: new WorkerManager(this.workerUrl, { inline: true, residentGroups: { disk: 1 } }) }, { disk });
     } catch (e: any) { threw = e.message; }
     if (!threw.includes('is a keyed group')) throw new Error(`Expected residentGroups to reject it, got "${threw}"`);
+  }
+
+  // RECIPE: AGENTS.md section 5, "Several keys per task" - the snippet as
+  // published, with the claims under it: all or nothing, one unit per key
+  // held, duplicates collapsing, an empty list throwing, events per key
+  private async docSeveralKeysPerTask(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(2, {
+      id: 'disk',
+      keyFrom: (t: any) => [t.payload.from, t.payload.to]
+    });
+    const scheduler = this.makeScheduler({ groups: ['disk'], maxThreads: 1, maxConcurrentTasks: 16 }, { disk });
+    const copy = (id: string, from: string, to: string, awaitMs = 30) => new FyflowTask({
+      id, workerType: 'DocsWorker', payload: { id, value: 1, from, to, awaitMs }
+    });
+
+    // Warm the worker, so the tasks below wait on the group, not for a slot
+    await scheduler.addTask(copy('warm', 'W:', 'W:', 1), { createPromise: true });
+
+    const acquired: string[] = [];
+    let heldWhileWaiting = -1;
+    scheduler.addEventListener('resource.acquired', (e: any) => acquired.push(`${e.detail.holderId}:${e.detail.key}`));
+    scheduler.addEventListener('resource.blocked', (e: any) => {
+      if (e.detail.holderId === 'copy-1') heldWhileWaiting = disk.getKeyMetrics('D:').running;
+    });
+
+    // C: is full, so copy-1 waits - holding nothing on D:
+    const runs = [
+      scheduler.addTask(copy('c-a', 'C:', 'C:', 60), { createPromise: true }),
+      scheduler.addTask(copy('c-b', 'C:', 'C:', 60), { createPromise: true }),
+      scheduler.addTask(copy('copy-1', 'C:', 'D:'), { createPromise: true })
+    ] as Promise<any>[];
+    if (heldWhileWaiting !== 0) throw new Error(`copy-1 held ${heldWhileWaiting} of D: while it waited`);
+    if (disk.getKeyMetrics('D:').running !== 0) throw new Error('copy-1 holds D: while it waits on C:');
+    await Promise.all(runs);
+
+    // One unit per key: copy-1 acquired C: and D:, once each; C: -> C: once
+    const mine = acquired.filter(a => a.startsWith('copy-1:')).sort();
+    if (mine.join(',') !== 'copy-1:C:,copy-1:D:') throw new Error(`copy-1 acquired ${mine.join(',')}`);
+    if (acquired.filter(a => a.startsWith('c-a:')).length !== 1) throw new Error('C: -> C: was not one hold');
+    if (disk.getMetrics().activeKeys !== 0) throw new Error(`Keys left: ${disk.getActiveKeys()}`);
+
+    let threw = '';
+    try { scheduler.addTask(copy('nowhere', '', '')); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('Missing limit key for group "disk"')) throw new Error(`An empty list should throw, got "${threw}"`);
   }
 
   private async docKeyedRateLimit(): Promise<void> {

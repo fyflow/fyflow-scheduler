@@ -117,7 +117,8 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('Keyed Concurrent Limit Isolates Keys', () => this.testKeyedConcurrentIsolation()));
     this.results.push(await this.runTest("Keyed Concurrent Limit: limitFor Sets A Key's Own Limit", () => this.testKeyedConcurrentLimitFor()));
     this.results.push(await this.runTest('Keyed Concurrent Limit: Bad Keys, Limits And Resident Use Throw Up Front', () => this.testKeyedConcurrentErrors()));
-    this.results.push(await this.runTest('Keyed Concurrent Limit Holds Per Key At Scale', () => this.testKeyedConcurrentAtScale()));
+    this.results.push(await this.runTest('Keyed Concurrent Limit Holds Per Key At Scale', () => this.testKeyedConcurrentAtScale(false)));
+    this.results.push(await this.runTest('Keyed Concurrent Limit Holds Per Key At Scale, With Two-Key Tasks', () => this.testKeyedConcurrentAtScale(true)));
 
     const totalDuration = performance.now() - this.startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -908,20 +909,29 @@ class CrossPlatformTestSuite {
    * many keys, counted inside run(), per key. Each key's peak must be its
    * limit, never above, and every key must be gone once its tasks are.
    */
-  private async testKeyedConcurrentAtScale(): Promise<void> {
+  private async testKeyedConcurrentAtScale(twoKeys: boolean): Promise<void> {
     const N = 3000, KEYS = 50, LIMIT = 2;
     const counter = ((globalThis as any).__fyflowConcurrency ??= { now: 0, peak: 0 });
     counter.byKey = {};
-    const disk = new KeyedConcurrentLimitGroup(LIMIT, { id: 'disk' });
-    const scheduler = this.keyedScheduler(disk, { maxThreads: 4, maxConcurrentTasks: 64 });
+    // With twoKeys, every fifth task names a second key too, and counts
+    // against both inside run()
+    const keysFor = (i: number) => twoKeys && i % 5 === 0
+      ? [`k${i % KEYS}`, `k${(i + 7) % KEYS}`]
+      : `k${i % KEYS}`;
+    const disk = new KeyedConcurrentLimitGroup(LIMIT, { id: 'disk', keyFrom: (t: any) => t.payload.countKey });
+    // One worker, warmed first: tasks handed to a worker that is still starting
+    // wait there while later tasks of the same key run and finish elsewhere,
+    // so a cold pool can keep a key from ever running two at once
+    const scheduler = this.keyedScheduler(disk, { maxThreads: 1, maxConcurrentTasks: 128 });
     try {
-      const promises = Array.from({ length: N }, (_, i) => {
-        const key = `k${i % KEYS}`;
-        return scheduler.addTask(new FyflowTask({
-          id: `scale-${i}`, workerType: 'TestInlineWorker', limitKey: key,
-          payload: { taskId: i, countConcurrency: true, countKey: key }
-        }), { createPromise: true }) as Promise<any>;
-      });
+      await scheduler.addTask(new FyflowTask({
+        id: 'scale-warm', workerType: 'TestInlineWorker', payload: { taskId: 'warm', countConcurrency: true, countKey: 'warm' }
+      }), { createPromise: true });
+      delete counter.byKey.warm;
+      const promises = Array.from({ length: N }, (_, i) => scheduler.addTask(new FyflowTask({
+        id: `scale-${i}`, workerType: 'TestInlineWorker',
+        payload: { taskId: i, countConcurrency: true, countKey: keysFor(i) }
+      }), { createPromise: true }) as Promise<any>);
       let stallTimer: ReturnType<typeof setTimeout> | undefined;
       const results = await Promise.race([
         Promise.allSettled(promises),
@@ -931,12 +941,21 @@ class CrossPlatformTestSuite {
 
       const rejected = results.filter(r => r.status === 'rejected').length;
       if (rejected > 0) throw new Error(`${rejected} tasks rejected`);
+      if (results.length !== N) throw new Error(`${results.length} results for ${N} tasks`);
       const peaks = Object.entries(counter.byKey as Record<string, { peak: number }>);
       if (peaks.length !== KEYS) throw new Error(`Counted ${peaks.length} keys, expected ${KEYS}`);
       const over = peaks.filter(([, c]) => c.peak > LIMIT);
       if (over.length > 0) throw new Error(`Over the per-key limit of ${LIMIT}: ${over.map(([k, c]) => `${k}=${c.peak}`).join(', ')}`);
-      // Not vacuous: keys actually ran side by side, each up to its limit
-      const under = peaks.filter(([, c]) => c.peak < LIMIT);
+      // Not vacuous: keys actually ran side by side, each up to its limit.
+      // Only keys with single-key traffic: a key that only two-key tasks use
+      // runs two at once only while their other key has both units free, which
+      // greedy admission does not promise (AGENTS.md, several keys per task)
+      const singleKeyed = new Set(Array.from({ length: N }, (_, i) => keysFor(i)).filter(k => typeof k === 'string'));
+      const under = peaks.filter(([k, c]) => singleKeyed.has(k) && c.peak < LIMIT);
+      if (twoKeys) {
+        const both = Array.from({ length: N }, (_, i) => keysFor(i)).filter(k => Array.isArray(k)).length;
+        if (both === 0 || singleKeyed.size === KEYS) throw new Error('The two-key run named no second keys');
+      }
       if (under.length > 0) throw new Error(`Never reached the limit: ${under.map(([k]) => k).join(', ')}`);
       if (counter.peak <= LIMIT) throw new Error(`Only ${counter.peak} ran at once across ${KEYS} keys - keys are not independent`);
       if (disk.getMetrics().activeKeys !== 0) throw new Error(`${disk.getMetrics().activeKeys} keys left after the run`);

@@ -31,7 +31,7 @@
 // commits run back to back on one machine (TODO_CHECKLIST.md). The ratios -
 // canRun/task across sizes - are the signal, and they are machine-independent.
 
-import { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup, KeyedRateLimitGroup } from '../index.ts';
+import { FyflowScheduler, FyflowTask, WorkerManager, ConcurrentLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup } from '../index.ts';
 import { KeyedCounterGroup, instrument } from '../tests/fixtures/keyedCounterGroup.ts';
 import { RuntimeUtils } from './perfUtils.ts';
 
@@ -73,7 +73,7 @@ interface LatencyRow {
   missed: number;
 }
 
-const COST_SHAPES = ['none', 'global', 'keyed', 'keyed-wide', 'two-group', 'keyed-rate'] as const;
+const COST_SHAPES = ['none', 'global', 'keyed', 'keyed-wide', 'two-group', 'keyed-rate', 'keyed-multi'] as const;
 const LATENCY_SHAPES = ['two-group-wake', 'resident-handoff'] as const;
 type CostShape = typeof COST_SHAPES[number];
 
@@ -90,6 +90,8 @@ function pool(extra: Record<string, unknown> = {}) {
 async function measureCost(shape: CostShape, N: number): Promise<CostRow> {
   const groups: Record<string, any> = {};
   let configFor: (i: number) => Record<string, unknown> = () => ({});
+  // Keys carried in the payload, for groups that read them there
+  let keysFor: ((i: number) => string | string[]) | undefined;
   let idealMs = 0;
   switch (shape) {
     case 'none':
@@ -112,6 +114,12 @@ async function measureCost(shape: CostShape, N: number): Promise<CostRow> {
       groups.B = new ConcurrentLimitGroup(4, 'B');
       configFor = i => ({ workerGroups: i % 3 === 0 ? ['A', 'B'] : i % 3 === 1 ? ['A'] : ['B'] });
       break;
+    case 'keyed-multi':
+      // Keyed phase B: 20% of tasks name two keys, held together. Its gate is
+      // canRun/task and events/task flat across sizes
+      groups.k = new KeyedConcurrentLimitGroup(2, { id: 'k', keyFrom: (t: any) => t.payload.keys });
+      keysFor = i => (i % 5 === 0 ? [`key${i % 10}`, `key${(i + 3) % 10}`] : `key${i % 10}`);
+      break;
     case 'keyed-rate': {
       const [limit, windowMs, keys] = [10, 20, 10];
       groups.r = new KeyedRateLimitGroup([{ limit, windowMs }], { id: 'r' });
@@ -131,7 +139,9 @@ async function measureCost(shape: CostShape, N: number): Promise<CostRow> {
   const start = performance.now();
   const promises = [];
   for (let i = 0; i < N; i++) {
-    promises.push(s.addTask(new FyflowTask({ id: `t${i}`, workerType: 'W', payload: { taskId: i, yieldMacrotask: true }, ...configFor(i) }), { createPromise: true }));
+    const payload: Record<string, unknown> = { taskId: i, yieldMacrotask: true };
+    if (keysFor) payload.keys = keysFor(i);
+    promises.push(s.addTask(new FyflowTask({ id: `t${i}`, workerType: 'W', payload, ...(keysFor ? { workerGroups: ['k'] } : configFor(i)) }), { createPromise: true }));
   }
 
   // Samplers start once the tasks are in, so enqueueing is not counted as a stall

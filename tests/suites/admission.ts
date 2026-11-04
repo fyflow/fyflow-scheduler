@@ -22,7 +22,8 @@
 // bundle split.
 
 import {
-  WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup
+  WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup,
+  KeyedConcurrentLimitGroup
 } from '../../index.ts';
 import { runTest, type RunTestOptions, type TestResult } from '../harness.ts';
 import { KeyedCounterGroup, instrument } from '../fixtures/keyedCounterGroup.ts';
@@ -170,6 +171,14 @@ class AdmissionTestSuite {
     await this.run('Wake: A Task-Held Waiter Short Of A Worker Moves To The Resident Queue', () => this.testShortOfWorkerMoves());
     await this.run('A Resident Head Whose Own Group Is Full Keeps Its Place', () => this.testResidentHeadKeepsPlace());
     await this.run('Cancel During A Migration Leaves No Waiter Behind', () => this.testCancelDuringMigration());
+
+    // Several keys per task
+    await this.run('Several Keys: All Or Nothing, And A Move To The Next Key', () => this.testMultiKeyAllOrNothing());
+    await this.run('Several Keys: Duplicates Collapse, None Throws', () => this.testMultiKeyDuplicatesCollapse());
+    await this.run('Several Keys: One Event Per Key, And The Fold Balances', () => this.testMultiKeyEvents());
+    await this.run('Several Keys: Re-entry From The First Key Cannot Take The Second', () => this.testMultiKeyReentry());
+    await this.run('Several Keys: A Keyed Rate Group Counts Each Key', () => this.testMultiKeyRate());
+    await this.run('Several Keys: Cancelled On Its Second Key Leaves Nothing', () => this.testMultiKeyCancel());
 
     // Guards
     await this.run('Limits And Fold Invariants Hold Under Mixed Contention', () => this.testMixedContention());
@@ -816,6 +825,156 @@ class AdmissionTestSuite {
     const workers = Math.max(peakWorkers, pool.getWorkerIds().length);
     if (workers > 1) throw new Error(`maxThreads 1, but the pool had ${workers} workers`);
     if (R.getMetrics().running > 1) throw new Error(`R held ${R.getMetrics().running} units for one worker`);
+  }
+
+  // --- Several keys per task (keyed phase B) ---------------------------------
+
+  /** A task naming `drives`, for a group keyed by `t => t.payload.drives`. */
+  private copy(id: string, drives: string[] | string, delay = 10) {
+    return new FyflowTask({ id, workerType: 'W', workerGroups: ['disk'], payload: { taskId: id, delay, drives } });
+  }
+
+  private disk(limit = 1) {
+    return new KeyedConcurrentLimitGroup(limit, { id: 'disk', keyFrom: (t: any) => t.payload.drives });
+  }
+
+  /**
+   * A C: -> D: copy is admitted only when both disks have room, and holds
+   * nothing while it waits - so a D:-only task runs meanwhile. Woken by C:'s
+   * release with D: still busy, it moves to D:'s queue (another key of the
+   * same group) and starts on D:'s release. Heartbeat off: no polling helps.
+   */
+  private async testMultiKeyAllOrNothing() {
+    const disk = this.disk(1);
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { disk }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const moves: string[] = [];
+    s.addEventListener('resource.blocked', (e: any) => { if (e.detail.holderId === 'copy') moves.push(`blocked:${e.detail.key}`); });
+    s.addEventListener('resource.unblocked', (e: any) => { if (e.detail.holderId === 'copy') moves.push(`unblocked:${e.detail.key}:${e.detail.reason}`); });
+    const copyStart = this.started(s, 'copy');
+    const dFreed = this.when(s, 'task.completed', d => d?.id === 'd-only');
+
+    const done = [
+      s.addTask(this.copy('c-only', 'C:', 40), { createPromise: true }),
+      s.addTask(this.copy('copy', ['C:', 'D:'], 5), { createPromise: true })
+    ];
+    // Holds nothing while it waits on C:, so D: is free for this one
+    if (disk.getKeyMetrics('D:').running !== 0) throw new Error(`The waiting copy holds D: (${disk.getKeyMetrics('D:').running})`);
+    // Still running when C: frees at ~40ms
+    done.push(s.addTask(this.copy('d-only', 'D:', 90), { createPromise: true }));
+    if (disk.getKeyMetrics('D:').running !== 1) throw new Error('d-only did not start beside the waiting copy');
+
+    const startedAt = await this.startsWithin(copyStart, 'copy');
+    this.assertPrompt('copy', await dFreed, startedAt);
+    await Promise.all(done);
+    const expected = 'blocked:C:,blocked:D:,unblocked:C::migrated,unblocked:D::admitted';
+    if (moves.join(',') !== expected) throw new Error(`Moves were ${moves.join(',')}, expected ${expected}`);
+    if (disk.getMetrics().activeKeys !== 0) throw new Error(`Keys left: ${disk.getActiveKeys()}`);
+  }
+
+  /**
+   * A C: -> C: copy is one hold, not two: under a limit of 1 it runs, and
+   * holds 1. Counted twice, it would check C: twice against an empty key and
+   * then take 2 units of a limit of 1.
+   */
+  private async testMultiKeyDuplicatesCollapse() {
+    const disk = this.disk(1);
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { disk }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    let peak = 0, acquires = 0;
+    s.addEventListener('resource.acquired', () => { acquires++; peak = Math.max(peak, disk.getKeyMetrics('C:').running); });
+    const start = this.started(s, 'same');
+    const done = s.addTask(this.copy('same', ['C:', 'C:', ''], 5), { createPromise: true });
+    await this.startsWithin(start, 'same');
+    await done;
+    if (peak !== 1 || acquires !== 1) throw new Error(`C: -> C: held ${peak} unit(s) over ${acquires} acquire(s), expected 1 and 1`);
+
+    let threw = '';
+    try { s.addTask(this.copy('none', ['', ''])); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('Missing limit key for group "disk"')) throw new Error(`An empty key list should throw, got "${threw}"`);
+  }
+
+  /**
+   * One event per (group, key): a two-disk copy acquires and releases each
+   * disk, each event naming its own key, with readings for that key. The fold
+   * over every event ends at zero per key.
+   */
+  private async testMultiKeyEvents() {
+    const disk = this.disk(2);
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { disk }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const events: string[] = [];
+    const fold = new Map<string, number>();
+    for (const name of ['resource.acquired', 'resource.released'] as const) {
+      s.addEventListener(name, (e: any) => {
+        if (e.detail.holderId === 'copy') events.push(`${name.slice(9)}:${e.detail.key}:${e.detail.readings[0]?.value}`);
+        fold.set(e.detail.key, (fold.get(e.detail.key) ?? 0) + (name === 'resource.acquired' ? 1 : -1));
+      });
+    }
+    await Promise.all([
+      s.addTask(this.copy('other', 'D:', 20), { createPromise: true }),
+      s.addTask(this.copy('copy', ['C:', 'D:'], 5), { createPromise: true })
+    ]);
+    // D: reads 2 at the acquire (other + copy), 1 at the copy's release
+    const expected = 'acquired:C::1,acquired:D::2,released:C::0,released:D::1';
+    if (events.join(',') !== expected) throw new Error(`Events were ${events.join(',')}, expected ${expected}`);
+    for (const [key, n] of fold) if (n !== 0) throw new Error(`Fold for ${key} ended at ${n}`);
+  }
+
+  /**
+   * Both of a task's keys are taken before any resource.acquired goes out, so
+   * a task added from the first key's acquire cannot take the second key
+   * between the check and the acquire.
+   */
+  private async testMultiKeyReentry() {
+    const disk = this.disk(1);
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { disk }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    let peakD = 0;
+    let child: Promise<unknown> | undefined;
+    s.addEventListener('resource.acquired', (e: any) => {
+      peakD = Math.max(peakD, disk.getKeyMetrics('D:').running);
+      if (e.detail.holderId === 'copy' && e.detail.key === 'C:') {
+        child ??= s.addTask(this.copy('d-only', 'D:', 5), { createPromise: true }) as Promise<unknown>;
+      }
+    });
+    await s.addTask(this.copy('copy', ['C:', 'D:'], 20), { createPromise: true });
+    await child;
+    if (peakD > 1) throw new Error(`D: held ${peakD} against a limit of 1`);
+  }
+
+  /** The scheduler side is shared, so a keyed rate group takes several keys too. */
+  private async testMultiKeyRate() {
+    const api = new KeyedRateLimitGroup([{ limit: 1, windowMs: 60_000 }], { id: 'disk', keyFrom: (t: any) => t.payload.drives });
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { disk: api }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    await s.addTask(this.copy('both', ['a', 'b'], 1), { createPromise: true });
+    // Each window now holds one request: neither key may start another
+    if (api.canRun('a') || api.canRun('b')) throw new Error(`A two-key task did not count against both keys (a ${api.canRun('a')}, b ${api.canRun('b')})`);
+    if (!api.canRun('c')) throw new Error('An untouched key is full');
+  }
+
+  /**
+   * Cancelled while it waits on its second key, after migrating there: it
+   * leaves that queue and nothing else, and every key is released.
+   */
+  private async testMultiKeyCancel() {
+    const disk = this.disk(1);
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { disk }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const fold = new Map<string, number>();
+    s.addEventListener('resource.blocked', (e: any) => fold.set(e.detail.key, (fold.get(e.detail.key) ?? 0) + 1));
+    s.addEventListener('resource.unblocked', (e: any) => fold.set(e.detail.key, (fold.get(e.detail.key) ?? 0) - 1));
+    const migrated = this.when(s, 'resource.unblocked', d => d?.holderId === 'copy' && d?.reason === 'migrated');
+    const done = [
+      s.addTask(this.copy('c-only', 'C:', 20), { createPromise: true }),
+      s.addTask(this.copy('d-only', 'D:', 200), { createPromise: true })
+    ];
+    const copy = s.addTask(this.copy('copy', ['C:', 'D:'], 5), { createPromise: true }) as Promise<unknown>;
+    copy.catch(() => { /* cancelled */ });
+    await migrated;
+    const queue = (s.getAdmissionQueue('disk').disk ?? []).map(w => `${w.holderId}@${w.key}`);
+    if (queue.join(',') !== 'copy@D:') throw new Error(`Expected the copy waiting on D:, got ${queue}`);
+    await s.cancel('copy');
+    if ((s.getAdmissionQueue('disk').disk ?? []).length !== 0) throw new Error('The copy is still listed');
+    await Promise.all(done);
+    for (const [key, n] of fold) if (n !== 0) throw new Error(`Queue fold for ${key} ended at ${n}`);
+    if (disk.getMetrics().activeKeys !== 0) throw new Error(`Keys left: ${disk.getActiveKeys()}`);
+    if ((s as any).blockedQueues.size !== 0) throw new Error(`${(s as any).blockedQueues.size} blocked queues left`);
   }
 
   private async testReentrantListeners() {
