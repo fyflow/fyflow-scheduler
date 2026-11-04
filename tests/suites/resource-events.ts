@@ -23,7 +23,8 @@ import {
   FyflowTask,
   ConcurrentLimitGroup,
   RateLimitGroup,
-  KeyedRateLimitGroup
+  KeyedRateLimitGroup,
+  KeyedConcurrentLimitGroup
 } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 import type {
@@ -264,6 +265,7 @@ class ResourceEventsTestSuite {
     this.results.push(await this.runTest('Shutdown Unblocks Every Remaining Waiter', () => this.testShutdownUnblocks()));
     this.results.push(await this.runTest('A Retry Is One Acquire/Release Pair Per Attempt', () => this.testRetryPairsPerAttempt()));
     this.results.push(await this.runTest('Keyed Groups Read Per Bucket, Not In Aggregate', () => this.testKeyedReadings()));
+    this.results.push(await this.runTest('A Keyed Concurrency Group Reads Each Key Against Its Own Limit', () => this.testKeyedConcurrentReadings()));
     this.results.push(await this.runTest('S2 - The Five Events Carry A Timestamp', () => this.testTimestamps()));
     this.results.push(await this.runTest('Criterion 4 - Head-Of-Line Is Legible', () => this.testHeadOfLine()));
     this.results.push(await this.runTest('Criterion 4b - The Fold And The Accessor Agree, In Order', () => this.testFoldMatchesAccessor()));
@@ -932,6 +934,52 @@ class ResourceEventsTestSuite {
    * the key it was taken for. The keyless read reports nothing rather than an
    * aggregate that looks like utilisation and cannot say whether anything runs.
    */
+  /**
+   * KeyedConcurrentLimitGroup: one `units` level gauge per key, each against
+   * that key's own limit from `limitFor`. The release that empties a key reads
+   * 0 there, although the key's state is gone by then.
+   */
+  private async testKeyedConcurrentReadings(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(3, { id: 'disk', limitFor: key => (key === 'usb' ? 1 : 3) });
+    const scheduler = this.track(new FyflowScheduler(
+      { A: this.pool({ maxConcurrentTasks: 8, groups: ['disk'] }) },
+      { disk }
+    ));
+    const seen = this.record(scheduler);
+
+    await Promise.all([
+      scheduler.addTask(this.task('ssd-1', 'A', { limitKey: 'ssd' }), { createPromise: true }),
+      scheduler.addTask(this.task('ssd-2', 'A', { limitKey: 'ssd' }), { createPromise: true }),
+      scheduler.addTask(this.task('usb-1', 'A', { limitKey: 'usb' }), { createPromise: true })
+    ]);
+
+    const described = disk.describe().gauges;
+    if (described.length !== 1 || described[0].id !== 'units' || described[0].kind !== 'level' || described[0].limit !== 3) {
+      throw new Error(`describe() should be one level gauge 'units' with the default limit 3, got ${JSON.stringify(described)}`);
+    }
+    const acquires = seen.filter(r => r.name === 'acquired');
+    const releases = seen.filter(r => r.name === 'released');
+    for (const record of [...acquires, ...releases]) {
+      if (!record.detail.key) throw new Error('A keyed event arrived with no key');
+      const [reading, ...rest] = record.detail.readings;
+      if (!reading || rest.length > 0 || reading.id !== 'units') {
+        throw new Error(`Expected one 'units' reading, got ${JSON.stringify(record.detail.readings)}`);
+      }
+      const expected = record.detail.key === 'usb' ? 1 : 3;
+      if (reading.limit !== expected) throw new Error(`${record.detail.key} read limit ${reading.limit}, expected its own ${expected}`);
+    }
+    const ssd = acquires.filter(r => r.detail.key === 'ssd').map(r => r.detail.readings[0].value);
+    const usb = acquires.filter(r => r.detail.key === 'usb').map(r => r.detail.readings[0].value);
+    if (Math.max(...ssd) !== 2) throw new Error(`ssd peaked at ${Math.max(...ssd)}, expected 2`);
+    if (usb.length !== 1 || usb[0] !== 1) throw new Error(`usb read ${usb.join(',')}; ssd's units leaked into it`);
+    // Every key ends at 0, read after its state was dropped
+    for (const key of ['ssd', 'usb']) {
+      const last = releases.filter(r => r.detail.key === key).at(-1);
+      if (last?.detail.readings[0].value !== 0) throw new Error(`${key}'s last release read ${last?.detail.readings[0].value}, expected 0`);
+    }
+    if (disk.read().length !== 0) throw new Error('A keyless read() returned an aggregate rather than nothing');
+  }
+
   private async testKeyedReadings(): Promise<void> {
     const api = new KeyedRateLimitGroup([{ limit: 2, windowMs: 500 }], { id: 'api' });
     const scheduler = this.track(new FyflowScheduler(

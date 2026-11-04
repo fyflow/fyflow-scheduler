@@ -82,6 +82,13 @@ overshoot at all.
 
 ## Phase A — `KeyedConcurrentLimitGroup`, one key per task
 
+> **Done** on `admission-rework`; the contract is in `AGENTS.md` §5,
+> "Per-key concurrency limits". Two departures from the text below:
+> `limitFor` is also checked at `addTask`, in `keyFor`, so a bad answer fails
+> the `addTask` instead of throwing from inside the dispatch loop with the task
+> already out of the ready queue; and the `residentGroups` rejection covers only
+> this group, since other keyed groups have always been accepted there.
+
 ```typescript
 new KeyedConcurrentLimitGroup(limit: number, {
   id?: string,
@@ -201,9 +208,8 @@ leaves room for it.
 
 ## Open questions
 
-- Is `limitFor` re-evaluated for a key that stays alive? Proposal: no, it is
-  read once per key lifetime, so a running copy never sees its own limit move.
-  State this in `AGENTS.md`.
-- `getMetrics().limit` on the aggregate: the sum over active keys, or the
-  default `limit`? The keyed rate group's answer should decide it, for
-  consistency.
+- ~~Is `limitFor` re-evaluated for a key that stays alive?~~ Answered in
+  phase A: no, read once per key lifetime, and stated in `AGENTS.md`.
+- ~~`getMetrics().limit` on the aggregate?~~ Answered in phase A: the default
+  per-key `limit`, as the keyed rate group's `limit` is per key; `available` and
+  `utilization` are against the sum of the active keys' own limits.

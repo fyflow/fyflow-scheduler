@@ -6,6 +6,7 @@ import { WorkerManager, FyflowScheduler, FyflowTask } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 import { ConcurrentLimitGroup } from '../../groups/concurrentLimitGroup.ts';
 import { RateLimitGroup } from '../../groups/rateLimitGroup.ts';
+import { KeyedConcurrentLimitGroup } from '../../groups/keyedConcurrentLimitGroup.ts';
 import { TaskQueue } from '../../core/taskQueue.ts';
 
 // Node.js process declaration for cross-platform compatibility
@@ -111,6 +112,12 @@ class CrossPlatformTestSuite {
     this.results.push(await this.runTest('TaskQueue Keeps FIFO Order', () => this.testTaskQueueOrder()));
     this.results.push(await this.runTest('TaskQueue Stays Linear At Scale', () => this.testTaskQueueScales()));
     this.results.push(await this.runTest('Limits Hold Past Queue Compaction', () => this.testLimitsHoldAtScale()));
+
+    // KeyedConcurrentLimitGroup
+    this.results.push(await this.runTest('Keyed Concurrent Limit Isolates Keys', () => this.testKeyedConcurrentIsolation()));
+    this.results.push(await this.runTest("Keyed Concurrent Limit: limitFor Sets A Key's Own Limit", () => this.testKeyedConcurrentLimitFor()));
+    this.results.push(await this.runTest('Keyed Concurrent Limit: Bad Keys, Limits And Resident Use Throw Up Front', () => this.testKeyedConcurrentErrors()));
+    this.results.push(await this.runTest('Keyed Concurrent Limit Holds Per Key At Scale', () => this.testKeyedConcurrentAtScale()));
 
     const totalDuration = performance.now() - this.startTime;
     this.results = this.results.filter(r => !r.skipped);
@@ -772,6 +779,173 @@ class CrossPlatformTestSuite {
     await runAtScale('pool-only', 8);
     await runAtScale('group', 3, new ConcurrentLimitGroup(3));
   }
+  // --- KeyedConcurrentLimitGroup ---------------------------------------------
+
+  private keyedScheduler(group: KeyedConcurrentLimitGroup, pool: Record<string, any> = {}) {
+    const workerPool = new WorkerManager(this.testInlineWorkerUrl, {
+      maxThreads: 4, maxConcurrentTasks: 8, inline: true, idleTimeout: 0, groups: [group.id], ...pool
+    });
+    return new FyflowScheduler({ TestInlineWorker: workerPool }, { [group.id]: group }, { periodicRetryIntervalMs: 1_000_000_000 });
+  }
+
+  private keyedTask(id: string, key: string | undefined, delay = 60) {
+    return new FyflowTask({ id, workerType: 'TestInlineWorker', limitKey: key, payload: { taskId: id, delay } });
+  }
+
+  /** `performance.now()` when `id` acquires the group. */
+  private acquiredAt(scheduler: FyflowScheduler, id: string): Promise<number> {
+    return new Promise(resolve => {
+      const listener = (e: any) => {
+        if (e.detail.holderId !== id) return;
+        scheduler.removeEventListener('resource.acquired', listener);
+        resolve(performance.now());
+      };
+      scheduler.addEventListener('resource.acquired', listener);
+    });
+  }
+
+  /**
+   * Two keys at limit 2 run 4 at once; a third task on a saturated key waits,
+   * while one on a free key starts straight away. The heartbeat is off, so the
+   * waiter is admitted by its own key's release or not at all.
+   */
+  private async testKeyedConcurrentIsolation(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(2, { id: 'disk' });
+    // One worker, warmed first, so every slot is free from the start: what
+    // holds a task back can only be the group
+    const scheduler = this.keyedScheduler(disk, { maxThreads: 1, maxConcurrentTasks: 8 });
+    try {
+      await scheduler.addTask(this.keyedTask('warm', 'warm', 1), { createPromise: true });
+      const t0 = performance.now();
+      const waiterStart = this.acquiredAt(scheduler, 'c-3');
+      const freeStart = this.acquiredAt(scheduler, 'd-1');
+      const firstDone = new Promise<number>(resolve => scheduler.addEventListener('task.completed', () => resolve(performance.now()), { once: true }));
+      const all = [
+        this.keyedTask('c-1', 'C:'), this.keyedTask('c-2', 'C:'),
+        this.keyedTask('e-1', 'E:'), this.keyedTask('e-2', 'E:'),
+        this.keyedTask('c-3', 'C:', 5), this.keyedTask('d-1', 'D:', 5)
+      ].map(t => scheduler.addTask(t, { createPromise: true }) as Promise<any>);
+
+      if (disk.getMetrics().running !== 5) {
+        throw new Error(`Expected C: 2, E: 2 and D: 1 running at once, got ${disk.getMetrics().running} (${disk.getActiveKeys().join(',')})`);
+      }
+      if (disk.getKeyMetrics('C:').running !== 2 || disk.getKeyMetrics('E:').running !== 2) {
+        throw new Error(`Expected 2 per key, got C: ${disk.getKeyMetrics('C:').running}, E: ${disk.getKeyMetrics('E:').running}`);
+      }
+      // The free key did not queue behind the saturated one
+      if ((await freeStart) - t0 > 20) throw new Error('D: waited behind C:');
+      const queue = scheduler.getAdmissionQueue('disk').disk ?? [];
+      if (queue.length !== 1 || queue[0].holderId !== 'c-3' || queue[0].key !== 'C:') {
+        throw new Error(`Expected only c-3 waiting, on C:, got ${JSON.stringify(queue.map(e => [e.holderId, e.key]))}`);
+      }
+      // Admitted by C:'s release, not before
+      const startedAt = await waiterStart;
+      if (startedAt + 1 < await firstDone) throw new Error('c-3 started before any C: task finished');
+      await Promise.all(all);
+      if (disk.getMetrics().activeKeys !== 0) throw new Error(`Expected every key evicted, ${disk.getActiveKeys().join(',')} left`);
+    } finally {
+      await scheduler.shutdown();
+    }
+  }
+
+  /** `limitFor` gives a key its own limit; every other key gets the default. */
+  private async testKeyedConcurrentLimitFor(): Promise<void> {
+    const asked: string[] = [];
+    const disk = new KeyedConcurrentLimitGroup(3, {
+      id: 'disk', limitFor: key => { asked.push(key); return key === 'usb' ? 1 : 3; }
+    });
+    const scheduler = this.keyedScheduler(disk);
+    try {
+      const all = [
+        ...Array.from({ length: 4 }, (_, i) => this.keyedTask(`usb-${i}`, 'usb', 30)),
+        ...Array.from({ length: 4 }, (_, i) => this.keyedTask(`ssd-${i}`, 'ssd', 30))
+      ].map(t => scheduler.addTask(t, { createPromise: true }) as Promise<any>);
+      const usb = disk.getKeyMetrics('usb'), ssd = disk.getKeyMetrics('ssd');
+      if (usb.running !== 1 || usb.limit !== 1) throw new Error(`usb: ${usb.running} running under limit ${usb.limit}, expected 1 under 1`);
+      if (ssd.running !== 3 || ssd.limit !== 3) throw new Error(`ssd: ${ssd.running} running under limit ${ssd.limit}, expected 3 under 3`);
+      if (disk.read('usb')[0].limit !== 1) throw new Error(`read('usb') limit is ${disk.read('usb')[0].limit}`);
+      await Promise.all(all);
+      if (!asked.includes('usb') || !asked.includes('ssd')) throw new Error(`limitFor was asked for ${asked.join(',')}`);
+
+      // Not cached across eviction: a key that comes back asks again
+      const before = asked.filter(k => k === 'usb').length;
+      await scheduler.addTask(this.keyedTask('usb-again', 'usb', 5), { createPromise: true });
+      if (asked.filter(k => k === 'usb').length === before) throw new Error('limitFor was not asked again after the key was evicted');
+    } finally {
+      await scheduler.shutdown();
+    }
+  }
+
+  /** A bad key or a bad `limitFor` answer throws from `addTask`, before any dispatch. */
+  private async testKeyedConcurrentErrors(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(2, { id: 'disk', limitFor: key => (key === 'bad' ? 0 : 2) });
+    const scheduler = this.keyedScheduler(disk);
+    try {
+      const throwsWith = (fn: () => unknown, text: string) => {
+        try { fn(); } catch (e: any) {
+          if (!String(e?.message).includes(text)) throw new Error(`Threw "${e?.message}", expected "${text}"`);
+          return;
+        }
+        throw new Error(`Did not throw "${text}"`);
+      };
+      throwsWith(() => scheduler.addTask(this.keyedTask('no-key', undefined)), 'Missing limit key for group "disk"');
+      throwsWith(() => scheduler.addTask(this.keyedTask('bad-limit', 'bad')), 'limitFor("bad") returned 0');
+      throwsWith(() => new KeyedConcurrentLimitGroup(0), 'must be a positive integer');
+      // Neither reached a queue or a counter
+      if (disk.getStats().totalAcquired !== 0 || scheduler.stats.queued !== 0) {
+        throw new Error(`A rejected task left state: acquired ${disk.getStats().totalAcquired}, queued ${scheduler.stats.queued}`);
+      }
+
+      const pool = new WorkerManager(this.testInlineWorkerUrl, { inline: true, residentGroups: { disk: 1 } });
+      throwsWith(() => new FyflowScheduler({ TestInlineWorker: pool }, { disk }), 'is a keyed group');
+    } finally {
+      await scheduler.shutdown();
+    }
+  }
+
+  /**
+   * The keyed counterpart of testLimitsHoldAtScale: thousands of tasks over
+   * many keys, counted inside run(), per key. Each key's peak must be its
+   * limit, never above, and every key must be gone once its tasks are.
+   */
+  private async testKeyedConcurrentAtScale(): Promise<void> {
+    const N = 3000, KEYS = 50, LIMIT = 2;
+    const counter = ((globalThis as any).__fyflowConcurrency ??= { now: 0, peak: 0 });
+    counter.byKey = {};
+    const disk = new KeyedConcurrentLimitGroup(LIMIT, { id: 'disk' });
+    const scheduler = this.keyedScheduler(disk, { maxThreads: 4, maxConcurrentTasks: 64 });
+    try {
+      const promises = Array.from({ length: N }, (_, i) => {
+        const key = `k${i % KEYS}`;
+        return scheduler.addTask(new FyflowTask({
+          id: `scale-${i}`, workerType: 'TestInlineWorker', limitKey: key,
+          payload: { taskId: i, countConcurrency: true, countKey: key }
+        }), { createPromise: true }) as Promise<any>;
+      });
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      const results = await Promise.race([
+        Promise.allSettled(promises),
+        new Promise<never>((_, reject) => stallTimer = setTimeout(
+          () => reject(new Error(`stalled at ${scheduler.stats.done}/${N} done`)), 15_000))
+      ]).finally(() => clearTimeout(stallTimer));
+
+      const rejected = results.filter(r => r.status === 'rejected').length;
+      if (rejected > 0) throw new Error(`${rejected} tasks rejected`);
+      const peaks = Object.entries(counter.byKey as Record<string, { peak: number }>);
+      if (peaks.length !== KEYS) throw new Error(`Counted ${peaks.length} keys, expected ${KEYS}`);
+      const over = peaks.filter(([, c]) => c.peak > LIMIT);
+      if (over.length > 0) throw new Error(`Over the per-key limit of ${LIMIT}: ${over.map(([k, c]) => `${k}=${c.peak}`).join(', ')}`);
+      // Not vacuous: keys actually ran side by side, each up to its limit
+      const under = peaks.filter(([, c]) => c.peak < LIMIT);
+      if (under.length > 0) throw new Error(`Never reached the limit: ${under.map(([k]) => k).join(', ')}`);
+      if (counter.peak <= LIMIT) throw new Error(`Only ${counter.peak} ran at once across ${KEYS} keys - keys are not independent`);
+      if (disk.getMetrics().activeKeys !== 0) throw new Error(`${disk.getMetrics().activeKeys} keys left after the run`);
+    } finally {
+      delete counter.byKey;
+      await scheduler.shutdown();
+    }
+  }
+
 
   // A custom heartbeat interval must not stop blocked tasks draining. Releases
   // wake their waiters directly, so this no longer depends on the heartbeat;

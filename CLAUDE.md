@@ -80,8 +80,9 @@ capacity.
 
 **`core/resourceEvents.ts`** — the `resource.*` event payload types.
 
-**`groups/`** — `ConcurrentLimitGroup` (optimistic concurrency), `RateLimitGroup`
-(overlapping time windows), `KeyedRateLimitGroup` (per-key quotas), all behind
+**`groups/`** — `ConcurrentLimitGroup` (a hard concurrency cap), `RateLimitGroup`
+(overlapping time windows), `KeyedRateLimitGroup` (per-key quotas),
+`KeyedConcurrentLimitGroup` (a concurrency cap per key), all behind
 the `ResourceGroup` interface with optional gauge `describe()`/`read()`.
 
 Groups come in two lifetimes. **Task-scoped** groups are acquired at dispatch and
@@ -116,19 +117,19 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Ten suites, 250 tests, all in the default `deno task test` run:
+Ten suites, 257 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| core | 26 | scheduling, groups, pooling, retention, queue scaling, limits at scale |
+| core | 30 | scheduling, groups, pooling, retention, queue scaling, limits at scale, `KeyedConcurrentLimitGroup` |
 | error-handling | 12 | worker failure, restart, requeue |
 | spawning | 13 | dynamic spawning, `onCompleteDescendants()`, draining on shutdown |
 | settlement | 34 | exactly-once settlement, counter cardinality, requeue, self-termination, attempts and backoff |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
-| resource-events | 25 | `resource.*` events, gauges, admission queue |
+| resource-events | 26 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
-| cancellation | 33 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
-| docs | 46 | **executes every snippet in README.md and AGENTS.md** |
+| cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
+| docs | 47 | **executes every snippet in README.md and AGENTS.md** |
 | admission | 30 | wake paths with the heartbeat off (including a worker becoming ready), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`; 1 known gap (R3) |
 
 `deno task test:scripts` is separate and not included in `deno task test`. It
@@ -223,7 +224,7 @@ no build step, but only if it is erasable. `AGENTS.md` §3 documents the
 conditions and the docs suite tests them.
 
 **`publish.exclude` in `deno.json` is an allowlist** (`**` plus `!` exceptions),
-so a new published module must be added explicitly. It currently ships 18 files.
+so a new published module must be added explicitly. It currently ships 19 files.
 
 **The package must have no dependencies.** `scripts/` uses `@std/path` and is
 kept out of the package by the allowlist alone — Deno has no devDependencies — so

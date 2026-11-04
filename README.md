@@ -379,7 +379,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `payload`: Data passed to worker
 - `workerGroups`: Optional resource group names
 - `optional`: Mark task as optional (failures don't block workflow)
-- `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup`)
+- `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup` and
+  `KeyedConcurrentLimitGroup`)
 - `retryPolicy`: `{ maxRetries, backoffMs }`
 - `attemptsSpent`: Attempts already made, so a task re-added after a restart
   keeps its retry budget
@@ -432,6 +433,12 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - Idle keys are evicted after `options.idleKeyTtlMs` (default: twice the largest
   window), so high-cardinality keys do not grow without bound
 - `getKeyMetrics(key)` and `getActiveKeys()` give the per-bucket view
+
+**KeyedConcurrentLimitGroup(limit, options?)**
+- A concurrent limit **per key** - one disk, one database each - so a saturated
+  key never delays another. Keyed like `KeyedRateLimitGroup`
+- `options.limitFor(key)` gives a key its own limit, e.g. 1 for a slow disk
+- A key is dropped as soon as nothing holds it
 
 **Worker management** (on a `WorkerManager`)
 - `getWorkerIds()`: ids of the workers that currently exist (created lazily)

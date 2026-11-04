@@ -12,7 +12,7 @@
 // cancelled + blocked equals the tasks added - because the counters are clamped
 // at 0, which hides a wrong decrement from a "never exceeds" check.
 
-import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, KeyedRateLimitGroup, CancelledError } from '../../index.ts';
+import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup, CancelledError } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 
 // Node.js process declaration for cross-platform compatibility
@@ -70,6 +70,7 @@ class CancellationTestSuite {
 
     this.results.push(await this.runTest('Cancel A Queued Task', () => this.testQueued()));
     this.results.push(await this.runTest('Cancel A Blocked Task', () => this.testBlocked()));
+    this.results.push(await this.runTest('Cancel On A Keyed Concurrency Group Stays On Its Key', () => this.testBlockedKeyedConcurrent()));
     this.results.push(await this.runTest('Cancel During A Retry Backoff', () => this.testBackoff()));
     this.results.push(await this.runTest('Cancel A Running Task: Cancel Wins Over Its Result', () => this.testRunningResultDiscarded()));
     this.results.push(await this.runTest('Cancel A Running Task: No Retry After Its Failure', () => this.testRunningFailureNotRetried()));
@@ -299,6 +300,54 @@ class CancellationTestSuite {
     if (log.includes('running:b1')) throw new Error('b1 ran');
     for (const [holder, balance] of fold) if (balance !== 0) throw new Error(`Fold for ${holder} ended at ${balance}`);
     this.assertAccounted(scheduler, 8, 'end');
+  }
+
+  /**
+   * A KeyedConcurrentLimitGroup's blocked queues are per key. Cancelling a
+   * waiter leaves its key's queue and touches no other key; cancelling a
+   * holder frees a unit of its own key only, which admits that key's next
+   * waiter. Once everything settles every key is evicted.
+   */
+  private async testBlockedKeyedConcurrent(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(1, { id: 'disk' });
+    // The cancel worker honours its signal, so a cancelled holder frees its
+    // unit at once rather than when an uninterruptible inline run() returns
+    const { scheduler } = this.make({ maxConcurrentTasks: 8, groups: ['disk'] }, { disk }, this.cancelWorkerUrl);
+    const log = this.events(scheduler);
+    const reasons: string[] = [];
+    scheduler.addEventListener('resource.unblocked', (e: any) => reasons.push(`${e.detail.holderId}:${e.detail.reason}`));
+    const on = (key: string) => ({ limitKey: key });
+
+    const held = scheduler.addTask(this.task('a-holder', { delay: 400 }, on('a')), { createPromise: true }) as Promise<any>;
+    held.catch(() => { /* cancelled below */ });
+    scheduler.addTask(this.task('b-holder', { delay: 150 }, on('b')));
+    scheduler.addTasks([
+      this.task('a-2', { delay: 5 }, on('a')),
+      this.task('a-3', { delay: 5 }, on('a')),
+      this.task('b-2', { delay: 5 }, on('b'))
+    ]);
+    await sleep(20);
+    const queue = (scheduler.getAdmissionQueue('disk').disk ?? []).map(w => `${w.holderId}@${w.key}`);
+    if (queue.join(',') !== 'a-2@a,a-3@a,b-2@b') throw new Error(`Precondition: admission queue ${queue}`);
+
+    // A waiter: it leaves a's queue, and b's is untouched
+    await scheduler.cancel('a-2');
+    const after = (scheduler.getAdmissionQueue('disk').disk ?? []).map(w => `${w.holderId}@${w.key}`);
+    if (after.join(',') !== 'a-3@a,b-2@b') throw new Error(`After cancelling a-2: ${after}`);
+    if (!reasons.includes('a-2:cancelled')) throw new Error(`Unblock reasons: ${reasons}`);
+
+    // A holder: its unit goes to its own key's next waiter, well before it would have finished
+    await scheduler.cancel('a-holder', { graceMs: 0 });
+    await this.until(() => log.includes('completed:a-3'), 1000);
+    if (log.includes('completed:b-holder')) throw new Error('a-3 waited for b to free up');
+    if (log.includes('running:b-2') && log.indexOf('running:b-2') < log.indexOf('completed:b-holder')) {
+      throw new Error("b-2 started while b's holder still ran");
+    }
+
+    await this.until(() => scheduler.stats.done === 3);
+    if (log.includes('running:a-2')) throw new Error('a-2 ran');
+    if (disk.getMetrics().activeKeys !== 0) throw new Error(`Keys left: ${disk.getActiveKeys()}`);
+    this.assertAccounted(scheduler, 5, 'end');
   }
 
   private async testBackoff(): Promise<void> {

@@ -37,7 +37,8 @@ A", either await A and then add B, or have A spawn B (§7).
 | Cancelling a whole run, or a task's descendants, in one call | `scheduler.cancel(id)` per task (§5, recipe in §10) |
 
 **Concurrency limits are hard caps.** No more tasks hold a `ConcurrentLimitGroup`
-than its limit, counted from `onStart` to `onFinish`. A task's groups are checked
+than its limit, counted from `onStart` to `onFinish` - and no more hold one key of
+a `KeyedConcurrentLimitGroup` than that key's limit. A task's groups are checked
 and acquired in one synchronous turn, and every `resource.*` event goes out after
 the acquires it reports, so a listener that re-enters the scheduler - `addTask`
 dispatches synchronously - cannot slip a task in between.
@@ -291,7 +292,7 @@ export default class MyWorker extends BaseWorker {
 ```typescript
 import {
   FyflowScheduler, FyflowTask, WorkerManager,   // core
-  ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup,
+  ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup,
   BaseWorker, WorkerTerminationError,           // worker authoring
   CancelledError                                // what a cancelled task rejects with
 } from 'fyflow-scheduler';
@@ -303,7 +304,7 @@ import type {
   SpawnTaskConfig, ProgressData,
   TaskMessageDetail, WorkerMessageDetail, MessageOptions,     // emitted events
   ResourceGroup, ResourceGroupMetrics, ResourceGroupStats,
-  RateWindow, KeyedRateLimitGroupOptions, KeyedTaskLike,
+  RateWindow, KeyedRateLimitGroupOptions, KeyedConcurrentLimitGroupOptions, KeyedTaskLike,
   GaugeKind, GaugeSpec, GaugeReading, GaugeDescription,       // gauges
   ResourceLifetime, HolderKind, ResourceReleaseReason,        // resource events
   ResourceUnblockReason, ResourceEventDetail,
@@ -388,7 +389,7 @@ task's too.
 | `retryPolicy` | `{ maxRetries, backoffMs }` | none | A retry starts no earlier than `backoffMs` after the attempt failed, however busy the scheduler is |
 | `attemptsSpent` | `number` | `0` | Attempts already made, e.g. before a restart. Reduces the retries left; a task whose budget is already spent **still runs once**. `TypeError` if not a number, `RangeError` if negative, fractional, `NaN` or infinite |
 | `workerGroups` | `string[]` | `[]` | **Added to** the pool's groups, not a replacement |
-| `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` with no custom `keyFrom` |
+| `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` or `KeyedConcurrentLimitGroup` with no custom `keyFrom` |
 | `handleRejection` | `boolean` | `true` | Silences unhandled rejections for fire-and-forget |
 
 Readable after the run: `state`, `result`, `error`, `attempts`, `attemptNumber`,
@@ -484,7 +485,9 @@ arrivals keeps an expensive waiter out forever. A task for a pool whose worker
 already exists costs nothing extra and is not affected.
 
 Costs must be positive integers and no larger than the group's limit; both are
-rejected at construction, as is an unknown group id. Because the release is
+rejected at construction, as is an unknown group id, and a
+`KeyedConcurrentLimitGroup` - a worker holds its units across tasks, and so
+across keys, so there is no key to hold them under. Because the release is
 driven by the idle sweep, hand-over takes up to `idleTimeout + idleCheckIntervalMs`
 — lower `idleCheckIntervalMs` if that matters. The release itself wakes the
 waiting pool straight away; it does not wait for the heartbeat.
@@ -565,9 +568,10 @@ Use `inline: false` for that.
 new ConcurrentLimitGroup(limit: number, id?: string)
 new RateLimitGroup(windows: { limit: number, windowMs: number }[], id?: string)
 new KeyedRateLimitGroup(windows, { id?, keyFrom?, idleKeyTtlMs? })
+new KeyedConcurrentLimitGroup(limit: number, { id?, keyFrom?, limitFor? })
 ```
 
-All three expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
+All four expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
 `read()` for gauges (below). Tasks over a limit wait in a blocked queue and are
 retried — never dropped. Multiple rate-limit windows are enforced together.
 
@@ -604,6 +608,46 @@ at once.
 
 ---
 
+#### Per-key concurrency limits
+
+`KeyedConcurrentLimitGroup` is a `ConcurrentLimitGroup` **per key**, for a
+resource that comes in independent instances - one disk each, one database
+each - where a single global limit would make work on one hold up work on
+another:
+
+```typescript
+const disk = new KeyedConcurrentLimitGroup(4, {      // 4 at once PER DISK
+  id: 'disk',
+  keyFrom: t => t.payload.drive,
+  limitFor: drive => (drive === 'E:' ? 1 : 4)        // a slow USB disk
+});
+
+const pool = new WorkerManager(url, { groups: ['disk'], inline: true });
+const scheduler = new FyflowScheduler({ CopyWorker: pool }, { disk });
+```
+
+- Keyed exactly like `KeyedRateLimitGroup`: `keyFrom` defaults to
+  `t => t.limitKey`, **a task with no derivable key throws at `addTask`**, and
+  blocked tasks are queued per key, so a saturated disk never delays another
+- A hard cap per key (§1): no more tasks hold a key than its limit
+- **`limitFor(key)`** gives a key its own limit; without it every key gets
+  `limit`. It must return a positive integer, and a bad answer throws at
+  `addTask`. The value is read when a key becomes active - its first running
+  task - and kept until the key is idle again, so a running task never sees its
+  own limit move; a key that comes back reads it afresh
+- **A key is dropped as soon as nothing holds it.** There is no history to keep,
+  so there is no `idleKeyTtlMs`, and high-cardinality keys cost nothing once done
+- `getMetrics()` is the aggregate plus `activeKeys`: `limit` is the default
+  per-key limit, and `available` / `utilization` are against the sum of the
+  active keys' own limits. `getKeyMetrics(key)` gives one key, `getActiveKeys()`
+  lists them
+- Not usable in `residentGroups` - rejected at construction
+
+One key per task. A task that touches two disks - a copy from C: to D: - cannot
+name both yet.
+
+---
+
 #### Gauges — how a group describes itself
 
 A group's state is not always one number. `RateLimitGroup` enforces *10/sec AND
@@ -629,6 +673,7 @@ group.read(key?)   // GaugeReading[]            dynamic: id, value, limit, reset
 | `ConcurrentLimitGroup` | 1 × `level`, id `units` |
 | `RateLimitGroup` | one `window` per configured window, ids `window-0`, `window-1`, … |
 | `KeyedRateLimitGroup` | the same windows, **per key** — `read()` requires a key and returns `[]` without one |
+| `KeyedConcurrentLimitGroup` | 1 × `level`, id `units`, **per key**, each reading against that key's own limit — `read()` requires a key, as above |
 | anything else | 1 × `level` derived from `getMetrics()` |
 
 **Both methods are optional.** A group implementing only `canRun`, `onStart`,
@@ -1105,7 +1150,7 @@ resources, until `run()` returns.
 | Memory grows in a long-running process | Completed tasks are retained; set `maxCompletedTasks` |
 | A limit looks exceeded | Counted from `task.running`/`task.completed`, which overshoot - read `group.getMetrics().running`. Or the limit was lowered while tasks held it (§1) |
 | A resource group has no effect at all | The pool never declared it. Registering a group on the scheduler is not enough - add it to the pool's `groups` or the task's `workerGroups` |
-| `Missing limit key for group "x"` | The task belongs to a `KeyedRateLimitGroup` but has no `limitKey`, and the group's `keyFrom` returned nothing |
+| `Missing limit key for group "x"` | The task belongs to a keyed group (`KeyedRateLimitGroup`, `KeyedConcurrentLimitGroup`) but has no `limitKey`, and the group's `keyFrom` returned nothing |
 | `Task "x" was cancelled - create a new FyflowTask to run it again` | `addTask` with a task object that was cancelled. A new `FyflowTask` may reuse the id |
 | `Promise.all` over a run rejects with `CancelledError` | One of its tasks was cancelled, and a cancelled task's promise rejects. Use `Promise.allSettled`, or catch `CancelledError` |
 | A cancelled threaded task ends `forced`, and its worker is replaced | The worker did not stop within `cancelGraceMs`: check `context.signal`, and yield in CPU-bound loops (§4) |

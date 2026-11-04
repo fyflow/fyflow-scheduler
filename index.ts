@@ -14,6 +14,8 @@ export { RateLimitGroup } from "./groups/rateLimitGroup.ts";
 export type { RateWindow } from "./groups/rateLimitGroup.ts";
 export { KeyedRateLimitGroup } from "./groups/keyedRateLimitGroup.ts";
 export type { KeyedRateLimitGroupOptions, KeyedTaskLike } from "./groups/keyedRateLimitGroup.ts";
+export { KeyedConcurrentLimitGroup } from "./groups/keyedConcurrentLimitGroup.ts";
+export type { KeyedConcurrentLimitGroupOptions } from "./groups/keyedConcurrentLimitGroup.ts";
 export type {
   ResourceGroup,
   ResourceGroupMetrics,

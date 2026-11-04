@@ -21,6 +21,7 @@
         "!groups/concurrentLimitGroup.ts",
         "!groups/rateLimitGroup.ts",
         "!groups/keyedRateLimitGroup.ts",
+        "!groups/keyedConcurrentLimitGroup.ts",
         "!README.md",
         "!LICENSE",
         ".claude",

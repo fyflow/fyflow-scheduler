@@ -14,6 +14,7 @@ import {
   ConcurrentLimitGroup,
   RateLimitGroup,
   KeyedRateLimitGroup,
+  KeyedConcurrentLimitGroup,
   WorkerTerminationError,
   CancelledError
 } from '../../index.ts';
@@ -132,6 +133,7 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Isolates A Saturated Key', () => this.docKeyedIsolation()));
     this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
+    this.results.push(await this.runTest('Doc: Keyed Concurrency Limit Per Disk', () => this.docKeyedConcurrentLimit()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
@@ -1083,6 +1085,60 @@ class DocsTestSuite {
   }
 
   // Each key gets its own bucket, so N keys can run N x limit concurrently
+  // RECIPE: AGENTS.md section 5, "Per-key concurrency limits" - the snippet as
+  // published, then each claim in the list under it
+  private async docKeyedConcurrentLimit(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(4, {      // 4 at once PER DISK
+      id: 'disk',
+      keyFrom: (t: any) => t.payload.drive,
+      limitFor: drive => (drive === 'E:' ? 1 : 4)        // a slow USB disk
+    });
+    const scheduler = this.makeScheduler({ groups: ['disk'], maxThreads: 2, maxConcurrentTasks: 16 }, { disk });
+
+    // Per key, read from the group at every acquire
+    const peak = new Map<string, number>();
+    let total = 0;
+    scheduler.addEventListener('resource.acquired', (e: any) => {
+      const key = e.detail.key;
+      peak.set(key, Math.max(peak.get(key) ?? 0, disk.getKeyMetrics(key).running));
+      total = Math.max(total, disk.getMetrics().running);
+    });
+
+    const tasks = [];
+    for (const drive of ['C:', 'D:', 'E:']) {
+      for (let i = 0; i < 6; i++) {
+        tasks.push(new FyflowTask({
+          id: `copy-${drive}-${i}`, workerType: 'DocsWorker',
+          payload: { id: `copy-${drive}-${i}`, value: i, drive, awaitMs: 30 }
+        }));
+      }
+    }
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+
+    // A hard cap per key, at each key's own limit
+    if (peak.get('C:') !== 4 || peak.get('D:') !== 4) throw new Error(`C: and D: should peak at 4, got ${peak.get('C:')}, ${peak.get('D:')}`);
+    if (peak.get('E:') !== 1) throw new Error(`E: should peak at its limitFor of 1, got ${peak.get('E:')}`);
+    // Per key, not global: the disks ran side by side
+    if (total <= 4) throw new Error(`Only ${total} ran at once across three disks - keys are not independent`);
+    // Dropped as soon as nothing holds it
+    if (disk.getMetrics().activeKeys !== 0 || disk.getActiveKeys().length !== 0) {
+      throw new Error(`Keys left after the run: ${disk.getActiveKeys().join(',')}`);
+    }
+
+    // A task with no derivable key throws at addTask
+    let threw = '';
+    try { scheduler.addTask(new FyflowTask({ id: 'no-drive', workerType: 'DocsWorker', payload: { id: 'x', value: 1 } })); }
+    catch (e: any) { threw = e.message; }
+    if (!threw.includes('Missing limit key for group "disk"')) throw new Error(`Expected a missing-key throw, got "${threw}"`);
+
+    // Not usable in residentGroups
+    threw = '';
+    try {
+      new FyflowScheduler({ DocsWorker: new WorkerManager(this.workerUrl, { inline: true, residentGroups: { disk: 1 } }) }, { disk });
+    } catch (e: any) { threw = e.message; }
+    if (!threw.includes('is a keyed group')) throw new Error(`Expected residentGroups to reject it, got "${threw}"`);
+  }
+
   private async docKeyedRateLimit(): Promise<void> {
     const api = new KeyedRateLimitGroup(
       [{ limit: 2, windowMs: 200 }],

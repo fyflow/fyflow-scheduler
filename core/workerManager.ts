@@ -292,6 +292,16 @@ export class WorkerManager extends EventTarget {
     for (const [id, cost] of Object.entries(this.residentGroups)) {
       const group = registry[id];
       if (!group) throw new Error(`Unknown resident group: ${id}`);
+      // A worker holds resident units across tasks, and so across keys: there
+      // is no key to charge them to. Only this group: other keyed groups have
+      // always been accepted here, under an empty key, and rejecting them now
+      // would break a pool that works today.
+      if (group.type === 'keyed-concurrent') {
+        throw new Error(
+          `residentGroups['${id}'] is a keyed group - a worker holds resident units across tasks, ` +
+          `so it has no key to hold them under. Declare it in the pool's groups instead`
+        );
+      }
       const limit = group.getMetrics?.().limit;
       if (typeof limit === 'number' && cost > limit) {
         throw new Error(

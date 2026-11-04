@@ -28,13 +28,18 @@ export default class TestInlineWorker extends BaseWorker {
     // a run of thousands of tasks is not paced by timer resolution.
     if (payload.countConcurrency) {
       const counter = ((globalThis as any).__fyflowConcurrency ??= { now: 0, peak: 0 });
+      // Per key too, when the task names one: `byKey[key]` is { now, peak }
+      const byKey = payload.countKey === undefined ? undefined
+        : ((counter.byKey ??= {})[payload.countKey] ??= { now: 0, peak: 0 });
       counter.now++;
       counter.peak = Math.max(counter.peak, counter.now);
+      if (byKey) { byKey.now++; byKey.peak = Math.max(byKey.peak, byKey.now); }
       try {
         for (let i = 0; i < 3; i++) await Promise.resolve();
         return { taskId: payload.taskId };
       } finally {
         counter.now--;
+        if (byKey) byKey.now--;
       }
     }
 
