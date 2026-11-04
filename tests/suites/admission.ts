@@ -47,7 +47,55 @@ const NEVER_MS = 400;
 
 const NEVER_STARTED = 'never started';
 
-const R3 = 'doc/design/admission-rework.md R3';
+/**
+ * Capacity granted from outside the scheduler, one unit at a time, and
+ * announced with `slot-released` - as a group fronting an external quota
+ * would. Keyed or not.
+ */
+class ExternalCapacityGroup extends EventTarget {
+  readonly id: string;
+  readonly type = 'test-external';
+  readonly keyed: boolean;
+  /** Units granted, for an unkeyed group. */
+  free = 0;
+  private freeByKey = new Map<string, number>();
+  private held = new Map<string, number>();
+  nextCapacityAt?: (key?: string) => number | undefined;
+
+  constructor(id: string, keyed: boolean) {
+    super();
+    this.id = id;
+    this.keyed = keyed;
+  }
+
+  keyFor(task: unknown): string | undefined {
+    return (task as { limitKey?: string }).limitKey;
+  }
+
+  canRun(key?: string): boolean {
+    if (this.keyed && key === undefined) return true;
+    const limit = this.keyed ? this.freeByKey.get(key!) ?? 0 : this.free;
+    return (this.held.get(key ?? '') ?? 0) < limit;
+  }
+
+  onStart(key?: string): void {
+    this.held.set(key ?? '', (this.held.get(key ?? '') ?? 0) + 1);
+  }
+
+  onFinish(key?: string): void {
+    this.held.set(key ?? '', (this.held.get(key ?? '') ?? 1) - 1);
+  }
+
+  getMetrics() {
+    return { limit: this.free, running: 0, available: 0, utilization: 0 };
+  }
+
+  grant(key?: string): void {
+    if (key === undefined) this.free++;
+    else this.freeByKey.set(key, (this.freeByKey.get(key) ?? 0) + 1);
+    this.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: this.id, key } }));
+  }
+}
 
 class AdmissionTestSuite {
   private results: TestResult[] = [];
@@ -150,18 +198,32 @@ class AdmissionTestSuite {
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (threaded)', () => this.testWakeOnWorkerReady(true));
     await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (inline)', () => this.testWakeOnWorkerReady(false));
     await this.run('A Burst Onto An Empty Threaded Pool Dispatches Each Task Once', () => this.testBurstNoBounce());
-    await this.run('Wake: A Rate Window Rolling Over Admits Without Polling', () => this.testWakeOnRateWindow(HEARTBEAT_OFF), {
-      knownGap: {
-        reason: `rate windows are heartbeat-only (AGENTS.md §6) - ${R3} wakes at resetAt`,
-        failsWith: NEVER_STARTED
-      }
-    });
+    await this.run('Wake: A Rate Window Rolling Over Admits Without Polling', () => this.testWakeOnRateWindow(HEARTBEAT_OFF));
+    await this.run('Wake: A Waiter Arriving After Its Window\'s Holder Finished Starts When The Window Rolls Over', () => this.testWakeAfterHolderFinished());
+    await this.run('Wake: Each Key\'s Rate Window Rolling Over Admits That Key\'s Waiter', () => this.testWakeOnKeyedRateWindow());
+    await this.run('Wake: Raising A Limit Admits Waiters', () => this.testRaisedLimitWakes());
+    await this.run('Wake: A Custom Group\'s slot-released Admits Its Waiters', () => this.testCustomSlotReleased(false));
+    await this.run('Wake: A Keyed Custom Group\'s slot-released Admits That Key\'s Waiters', () => this.testCustomSlotReleased(true));
 
     // What the heartbeat promises today
     await this.run('Heartbeat: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(50));
     await this.run('Heartbeat: A Rate Window Rolling Over Admits', () => this.testWakeOnRateWindow(50));
     await this.run('Heartbeat: Raising A Limit Admits Waiters', () => this.testRaisedLimit());
     await this.run('Heartbeat: A Keyed Rate Window Rolling Over Admits Every Key', () => this.testKeyedRateHeartbeat());
+
+    // What time-based wakes may cost the main loop
+    await this.run('Time Wakes: One Timer And One Ask Per Wait, Across 200 Keys', () => this.testTimeWakeCost());
+    await this.run('Time Wakes: Asked Once Per Wait, Not On Every Release', () => this.testAskOncePerWait());
+    await this.run('Time Wakes: One Timer Serves Groups With Different Windows, Earliest First', () => this.testTimerEarliestFirst());
+    await this.run('Time Wakes: A slot-released From The Scheduler\'s Own Release Wakes Nothing Twice', () => this.testOwnReleaseWakesOnce());
+    await this.run('Time Wakes: A Time Already Due Wakes The Queue, Heartbeat Off', () => this.testTimeAlreadyDue());
+    await this.run('Time Wakes: A Clock That Steps Back At The Fire Still Wakes The Waiter', () => this.testClockStepsBack());
+    await this.run('Time Wakes: A Group Always Answering Now Backs Off To The Heartbeat Interval', () => this.testBadTimes('past'));
+    await this.run('Time Wakes: A Time That Is Not A Number Is Left To The Heartbeat', () => this.testBadTimes('nan'));
+    await this.run('Time Wakes: A Throwing nextCapacityAt Is Left To The Heartbeat, Warned Once', () => this.testBadTimes('throws'));
+    await this.run('Time Wakes: Cancelling The Last Waiter Leaves No Timer', () => this.testTimeWakeCleared('cancel'));
+    await this.run('Time Wakes: Shutdown Leaves No Timer', () => this.testTimeWakeCleared('shutdown'));
+    await this.run('nextCapacityAt: When canRun Next Says Yes', () => this.testNextCapacityAt());
 
     // R1: blocked queues exist only while they hold a waiter
     await this.run('Empty Blocked Queues Are Deleted', () => this.testQueuesDeleted());
@@ -665,17 +727,421 @@ class AdmissionTestSuite {
     const s = this.track(new FyflowScheduler(
       { W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: heartbeatMs }
     ));
-    const firstStart = this.started(s, 'first');
+    // A finished task counts from when it finished, so the window frees
+    // WINDOW after the first one's completion
+    const firstDone = this.when(s, 'task.completed', d => d?.id === 'first');
     const start = this.started(s, 'second');
     const done = Promise.all([
       s.addTask(this.task('first', {}, 5), { createPromise: true }),
       s.addTask(this.task('second', {}, 5), { createPromise: true })
     ]);
     const startedAt = await this.startsWithin(start, 'second');
-    // The window can free no earlier than WINDOW after the first started
-    const freedBy = (await firstStart) + WINDOW + 5;
+    const freedBy = (await firstDone) + WINDOW;
     this.assertPrompt('second', freedBy, startedAt, heartbeatMs === HEARTBEAT_OFF ? WAKE_BOUND_MS : heartbeatMs + WAKE_BOUND_MS);
     await done;
+  }
+
+  /** Each key's waiter starts when that key's window rolls over - with keys starting at different times. */
+  private async testWakeOnKeyedRateWindow() {
+    const WINDOW = 40;
+    const api = new KeyedRateLimitGroup([{ limit: 1, windowMs: WINDOW }], { id: 'api' });
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['api'] }) }, { api }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const runs: Promise<any>[] = [];
+    for (const [i, k] of ['a', 'b', 'c'].entries()) {
+      // Staggered, so the three windows roll over at three different times
+      if (i > 0) await new Promise(r => setTimeout(r, 12));
+      // A finished task counts from when it finished, so that is when the
+      // window frees
+      const firstDone = this.when(s, 'task.completed', d => d?.id === `${k}1`);
+      const secondStart = this.started(s, `${k}2`);
+      runs.push(
+        s.addTask(this.task(`${k}1`, { limitKey: k }, 2), { createPromise: true }) as Promise<any>,
+        s.addTask(this.task(`${k}2`, { limitKey: k }, 2), { createPromise: true }) as Promise<any>
+      );
+      runs.push((async () => {
+        const at = await this.startsWithin(secondStart, `${k}2`);
+        this.assertPrompt(`${k}2`, (await firstDone) + WINDOW, at);
+      })());
+    }
+    await Promise.all(runs);
+  }
+
+  /**
+   * No release is coming: the holder finished before the waiter arrived, so
+   * only the time its queue was created with can wake it.
+   */
+  private async testWakeAfterHolderFinished() {
+    const WINDOW = 60;
+    const rate = new RateLimitGroup([{ limit: 1, windowMs: WINDOW }], 'rate');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    await s.addTask(this.task('first', {}, 1), { createPromise: true });
+    // A finished task counts from when it finished, so the window frees
+    // WINDOW after now, at the latest
+    const finishedAt = performance.now();
+    const start = this.started(s, 'second');
+    const done = s.addTask(this.task('second', {}, 1), { createPromise: true });
+    await new Promise(r => setTimeout(r, 5));
+    if (s.stats.running !== 0) throw new Error('the second started inside the window');
+    this.assertPrompt('second', finishedAt + WINDOW, await this.startsWithin(start, 'second'));
+    await done;
+  }
+
+  /**
+   * One ask per wait: a release inside the window does not ask again while
+   * a time is pending, since a rate window's time only moves later.
+   */
+  private async testAskOncePerWait() {
+    const rate = new RateLimitGroup([{ limit: 4, windowMs: 300 }], 'rate');
+    let asks = 0;
+    const ask = rate.nextCapacityAt.bind(rate);
+    rate.nextCapacityAt = () => { asks++; return ask(); };
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    let released = 0;
+    s.addEventListener('resource.released', () => released++);
+    const runs = Array.from({ length: 8 }, (_, i) => s.addTask(this.task(`t${i}`, {}, 5 + 5 * i), { createPromise: true }));
+    // Every holder released, well inside the window
+    await new Promise(r => setTimeout(r, 100));
+    if (released < 4) throw new Error(`only ${released} released - the test proves nothing`);
+    if (asks !== 1) throw new Error(`asked ${asks} times for one wait over ${released} releases`);
+    await Promise.all(runs);
+  }
+
+  /**
+   * One timer for every group: a short window queued after a long one is
+   * still woken at its own time, not the long one's. Ordered by a min-heap;
+   * one that did not keep its order would wake the short window's waiter at
+   * 300ms.
+   */
+  private async testTimerEarliestFirst() {
+    const long = new RateLimitGroup([{ limit: 1, windowMs: 300 }], 'long');
+    const short = new RateLimitGroup([{ limit: 1, windowMs: 40 }], 'short');
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { long, short }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    await s.addTask(this.task('long1', { workerGroups: ['long'] }, 1), { createPromise: true });
+    await s.addTask(this.task('short1', { workerGroups: ['short'] }, 1), { createPromise: true });
+    const shortDone = performance.now();
+    // The long window's time first, then the short one's
+    const runs = [
+      s.addTask(this.task('long2', { workerGroups: ['long'] }, 1), { createPromise: true }),
+      s.addTask(this.task('short2', { workerGroups: ['short'] }, 1), { createPromise: true })
+    ];
+    const start = this.started(s, 'short2');
+    this.assertPrompt('short2', shortDone + 40, await this.startsWithin(start, 'short2'));
+    await Promise.all(runs);
+  }
+
+  /** Raising a limit announces itself with slot-released, which the scheduler honours. */
+  private async testRaisedLimitWakes() {
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['g'] }) }, { g }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const start = this.started(s, 'waiter');
+    const done = Promise.all([
+      s.addTask(this.task('holder', {}, 300), { createPromise: true }),
+      s.addTask(this.task('waiter', {}, 5), { createPromise: true })
+    ]);
+    await new Promise(r => setTimeout(r, 20));
+    const raisedAt = performance.now();
+    g.limit = 2;
+    this.assertPrompt('waiter', raisedAt, await this.startsWithin(start, 'waiter'));
+    await done;
+  }
+
+  /** A custom group whose capacity is outside the scheduler says so with slot-released. */
+  private async testCustomSlotReleased(keyed: boolean) {
+    const group = new ExternalCapacityGroup('ext', keyed);
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['ext'] }) }, { ext: group }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const config = keyed ? { limitKey: 'k1' } : {};
+    const start = this.started(s, 'waiter');
+    const done = s.addTask(this.task('waiter', config, 2), { createPromise: true });
+    // A waiter on another key, which a grant to k1 must not wake
+    const other = keyed ? s.addTask(this.task('other', { limitKey: 'k2' }, 2), { createPromise: true }) : undefined;
+    await new Promise(r => setTimeout(r, 20));
+    if (s.stats.running !== 0) throw new Error('the waiter started with no capacity');
+    const asked: Array<string | undefined> = [];
+    const canRun = group.canRun.bind(group);
+    group.canRun = (key?: string) => { asked.push(key); return canRun(key); };
+    const grantedAt = performance.now();
+    group.grant(keyed ? 'k1' : undefined);
+    this.assertPrompt('waiter', grantedAt, await this.startsWithin(start, 'waiter'));
+    await done;
+    if (keyed) {
+      if (asked.includes('k2')) throw new Error(`a grant to k1 woke k2: asked ${JSON.stringify(asked)}`);
+      group.grant('k2');
+      await other;
+    }
+  }
+
+  /**
+   * The cost guard for time-based wakes, heartbeat off so every admission
+   * after the first window is a time wake. 200 keys: as many distinct times
+   * as keys, on one timer. The group is asked about once per waiter
+   * admitted - per wait, not per event or per poll - and when the last
+   * waiter leaves nothing is pending.
+   */
+  private async testTimeWakeCost() {
+    const [KEYS, PER_KEY, WINDOW] = [200, 5, 20];
+    const api = new KeyedRateLimitGroup([{ limit: 1, windowMs: WINDOW }], { id: 'api' });
+    let asks = 0;
+    const ask = api.nextCapacityAt.bind(api);
+    api.nextCapacityAt = (key?: string) => { asks++; return ask(key); };
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool({ maxConcurrentTasks: 100 }) }, { api }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const internals = s as any;
+    let fires = 0;
+    const onTimeWake = internals._onTimeWake.bind(s);
+    internals._onTimeWake = () => { fires++; onTimeWake(); };
+    let worstPending = 0;
+    let worstQueues = 0;
+    const sampler = setInterval(() => {
+      worstPending = Math.max(worstPending, internals.timeWakes.size - internals.blockedQueues.size);
+      worstQueues = Math.max(worstQueues, internals.blockedQueues.size);
+    }, 2);
+
+    const N = KEYS * PER_KEY;
+    const t0 = performance.now();
+    await Promise.all(Array.from({ length: N }, (_, i) =>
+      s.addTask(this.task(`t${i}`, { workerGroups: ['api'], limitKey: `key${i % KEYS}` }, 1), { createPromise: true })
+    ));
+    const ms = performance.now() - t0;
+    clearInterval(sampler);
+
+    const waited = N - KEYS;
+    console.log(`  ${N} tasks over ${KEYS} keys in ${ms.toFixed(0)}ms (ideal ${PER_KEY * WINDOW}ms): ` +
+      `${asks} asks, ${fires} timer fires for ${waited} waiters, up to ${worstQueues} queues`);
+    if (worstQueues < KEYS / 2) throw new Error(`only ${worstQueues} queues waited at once - the test proves nothing`);
+    if (asks > 2 * waited) throw new Error(`nextCapacityAt asked ${asks} times for ${waited} waiters`);
+    if (fires > waited) throw new Error(`${fires} timer fires for ${waited} waiters`);
+    if (worstPending > 0) throw new Error(`a time pending for a queue that no longer exists, ${worstPending} over`);
+    if (ms > PER_KEY * WINDOW * 4 + 200) throw new Error(`took ${ms.toFixed(0)}ms against an ideal of ${PER_KEY * WINDOW}ms`);
+    if (internals.timeWakes.size !== 0 || internals.timeWakeTimer !== null) {
+      throw new Error(`left ${internals.timeWakes.size} times pending, timer ${internals.timeWakeTimer !== null ? 'set' : 'clear'}`);
+    }
+  }
+
+  /**
+   * The scheduler's own releases wake directly. The slot-released a group
+   * emits from inside one - KeyedRateLimitGroup does on every release - must
+   * not queue a second wake.
+   */
+  private async testOwnReleaseWakesOnce() {
+    const groups = {
+      g: new ConcurrentLimitGroup(2, 'g'),
+      k: new KeyedRateLimitGroup([{ limit: 1000, windowMs: 1000 }], { id: 'k' }),
+      kc: new KeyedConcurrentLimitGroup(1, { id: 'kc' })
+    };
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, groups));
+    const internals = s as any;
+    let queued = 0;
+    const queueGroupWake = internals._queueGroupWake.bind(s);
+    internals._queueGroupWake = (...args: any[]) => { queued++; return queueGroupWake(...args); };
+    let released = 0;
+    for (const g of Object.values(groups)) g.addEventListener('slot-released', () => released++);
+    await Promise.all(Array.from({ length: 200 }, (_, i) =>
+      s.addTask(this.task(`t${i}`, { workerGroups: ['g', 'k', 'kc'], limitKey: `key${i % 4}` }, 1), { createPromise: true })
+    ));
+    if (released < 100) throw new Error(`only ${released} slot-released - the test proves nothing`);
+    if (queued !== 0) throw new Error(`${queued} extra wakes queued from ${released} slot-released inside the scheduler's releases`);
+  }
+
+  /**
+   * No hot loop. A time that is not a number, or thrown, is left to the
+   * heartbeat: no timer at all, and a throw is warned about once. A group
+   * answering "now" forever with no room is woken at 1, 2, 4... ms, then
+   * once per heartbeat interval - no more often than the heartbeat itself.
+   * Either way the waiter still starts.
+   */
+  private async testBadTimes(kind: 'past' | 'nan' | 'throws') {
+    const group = new ExternalCapacityGroup('ext', false);
+    let asks = 0;
+    group.nextCapacityAt = () => {
+      asks++;
+      if (kind === 'throws') throw new Error('no idea');
+      return kind === 'past' ? Date.now() - 5 : NaN;
+    };
+    // Long enough, for "now", to tell a backoff from none on Windows, whose
+    // timers fire no more often than every ~15ms
+    const [HEARTBEAT, WATCH] = kind === 'past' ? [200, 600] : [30, 150];
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['ext'] }) }, { ext: group }, { periodicRetryIntervalMs: HEARTBEAT }));
+    const warnings: unknown[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args[0]); };
+    try {
+      const start = this.started(s, 'waiter');
+      // Two, so that the first one's admission leaves a waiter and asks again
+      const done = Promise.all([
+        s.addTask(this.task('waiter', {}, 2), { createPromise: true }),
+        s.addTask(this.task('waiter2', {}, 2), { createPromise: true })
+      ]);
+      await new Promise(r => setTimeout(r, WATCH));
+      const internals = s as any;
+      if (kind === 'past') {
+        // 1+2+4+...+128 ms, then every 200: about 11 in 600ms. With no
+        // backoff it is one per timer tick - 40 on Windows, hundreds elsewhere
+        const bound = Math.ceil(Math.log2(HEARTBEAT)) + WATCH / HEARTBEAT + 3;
+        if (asks > bound) throw new Error(`past: asked ${asks} times in ${WATCH}ms, bound ${bound}`);
+      } else {
+        if (internals.timeWakeTimer !== null || internals.timeWakes.size !== 0) {
+          throw new Error(`${kind}: ${internals.timeWakes.size} times pending, timer ${internals.timeWakeTimer !== null ? 'set' : 'clear'}`);
+        }
+        // One ask per wait and per heartbeat wake at most: ~5 in 150ms
+        if (asks > WATCH / HEARTBEAT + 3) throw new Error(`${kind}: asked ${asks} times in ${WATCH}ms`);
+      }
+      group.free = 1; // No event: only the heartbeat can notice
+      await this.startsWithin(start, 'waiter');
+      await done;
+      if (asks < 2) throw new Error(`${kind}: asked ${asks} times - the test proves nothing`);
+    } finally {
+      console.warn = warn;
+    }
+    const thrown = warnings.filter(w => String(w).includes('nextCapacityAt')).length;
+    if (thrown !== (kind === 'throws' ? 1 : 0)) throw new Error(`${kind}: warned ${thrown} times`);
+  }
+
+  /**
+   * The millisecond boundary: a waiter refused at `t`, its group asked at
+   * `t + 1`, when the window frees at `t + 1`. The time it names is now - not
+   * a bogus one - and nothing else will wake the queue. It used to be
+   * ignored as past, and with the heartbeat off the waiter never started:
+   * the 200-key cost test hung on Node about one run in ten.
+   *
+   * Eight waiters, each finding room just as it asks, and arrivals taking
+   * some of it first: every one starts promptly, so the backoff for repeats
+   * is reset by each admission rather than growing across them.
+   */
+  private async testTimeAlreadyDue() {
+    const group = new ExternalCapacityGroup('ext', false);
+    // A unit of room arrives each time the scheduler asks, with no event
+    group.nextCapacityAt = () => { group.free++; return Date.now(); };
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['ext'] }) }, { ext: group }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const ids = Array.from({ length: 8 }, (_, i) => `waiter${i}`);
+    const starts = ids.map(id => this.started(s, id));
+    const askedAt = performance.now();
+    // Long-running, so no release can rescue a waiter: each needs a due time
+    // of its own
+    const done = Promise.all(ids.map(id => s.addTask(this.task(id, {}, 300), { createPromise: true })));
+    // They start one after another, each within two timer hops of the one
+    // before - one whose room an arrival took needs two. A release rescuing
+    // one would be 300ms, and a backoff that kept growing across admissions
+    // would double the gap each time
+    let previous = askedAt;
+    for (const [i, id] of ids.entries()) {
+      const at = await this.startsWithin(starts[i], id);
+      this.assertPrompt(id, previous, at, 3 * WAKE_BOUND_MS);
+      previous = Math.max(previous, at);
+    }
+    await done;
+  }
+
+  /**
+   * `Date.now()` is not monotonic. On Node on Windows a timer fired at 219,
+   * its time due, and the group's `canRun` a moment later read 218 and
+   * refused; asked again it read 219 and had room, so no time was set and
+   * the waiter never started - the 200-key cost test hung about one run in
+   * forty. Here the group's first `canRun` after each fire reads the clock
+   * as a millisecond before the time that fired - however late the timer
+   * itself ran.
+   */
+  private async testClockStepsBack() {
+    const WINDOW = 40;
+    const rate = new RateLimitGroup([{ limit: 1, windowMs: WINDOW }], 'rate');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const internals = s as any;
+    let behindOf: number | undefined;
+    let skewed = 0;
+    const realNow = Date.now;
+    const canRun = rate.canRun.bind(rate);
+    rate.canRun = () => {
+      if (behindOf === undefined) return canRun();
+      const at = behindOf;
+      behindOf = undefined;
+      skewed++;
+      Date.now = () => at - 1;
+      try { return canRun(); } finally { Date.now = realNow; }
+    };
+    const onTimeWake = internals._onTimeWake.bind(s);
+    internals._onTimeWake = () => { behindOf = internals.timeWakeHeap[0]?.[0]; onTimeWake(); };
+    try {
+      await s.addTask(this.task('first', {}, 1), { createPromise: true });
+      const finishedAt = performance.now();
+      const start = this.started(s, 'second');
+      const done = s.addTask(this.task('second', {}, 1), { createPromise: true });
+      // Two timer hops: the fire the clock contradicts, and the retry
+      this.assertPrompt('second', finishedAt + WINDOW, await this.startsWithin(start, 'second'), 2 * WAKE_BOUND_MS);
+      await done;
+      if (skewed === 0) throw new Error('no fire met a stepped-back clock - the test proves nothing');
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
+  /** Cancelling the last waiter, or shutting down, leaves no timer behind. */
+  private async testTimeWakeCleared(how: 'cancel' | 'shutdown') {
+    const rate = new RateLimitGroup([{ limit: 1, windowMs: 10_000 }], 'rate');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const internals = s as any;
+    await s.addTask(this.task('first', {}, 1), { createPromise: true });
+    const waiter = (s.addTask(this.task('waiter', {}, 1), { createPromise: true }) as Promise<any>).catch(() => 'rejected');
+    await new Promise(r => setTimeout(r, 5));
+    if (internals.timeWakeTimer === null) throw new Error('no timer for the waiter - the test proves nothing');
+    if (how === 'cancel') {
+      await s.cancel('waiter');
+      await waiter;
+    } else {
+      await s.shutdown();
+    }
+    if (internals.timeWakeTimer !== null || internals.timeWakes.size !== 0) {
+      throw new Error(`${how}: ${internals.timeWakes.size} times pending, timer ${internals.timeWakeTimer !== null ? 'set' : 'clear'}`);
+    }
+  }
+
+  /**
+   * `nextCapacityAt` is the time `canRun` next says yes, to the
+   * millisecond: no room a millisecond before it, room at it. The latest of
+   * the full windows, and past a count over the limit - a running task
+   * counted again when it finishes. On a fake clock, so it is exact.
+   */
+  private async testNextCapacityAt() {
+    const realNow = Date.now;
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    try {
+      const exact = (label: string, group: RateLimitGroup | KeyedRateLimitGroup, want: number, key?: string) => {
+        const at = group.nextCapacityAt(key);
+        if (at !== want) throw new Error(`${label}: ${at === undefined ? 'no time' : at - 1_000_000} - want ${want - 1_000_000}`);
+        const saved = clock;
+        clock = at - 1;
+        if (group.canRun(key)) throw new Error(`${label}: room a millisecond early`);
+        clock = at;
+        if (!group.canRun(key)) throw new Error(`${label}: no room at the time given`);
+        clock = saved;
+      };
+
+      const two = new RateLimitGroup([{ limit: 2, windowMs: 100 }, { limit: 3, windowMs: 300 }], 'two');
+      if (two.nextCapacityAt() !== undefined) throw new Error('an empty group has a time');
+      two.onStart(); two.onStart();
+      exact('first window full', two, 1_000_000 + 101);
+      two.onStart();
+      exact('both full: the later', two, 1_000_000 + 301);
+
+      const one = new RateLimitGroup([{ limit: 1, windowMs: 30 }], 'one');
+      clock = 2_000_000;
+      one.onStart();
+      clock += 31; // the start has left the window, though it still runs
+      if (one.nextCapacityAt() !== undefined || !one.canRun()) throw new Error('the window rolled over, yet no room');
+      one.onStart();
+      exact('the second start', one, clock + 31);
+      clock += 10;
+      one.onFinish(); // the first, counted again as it finishes: two in a window of one
+      exact('over the limit', one, clock + 31);
+
+      const keyed = new KeyedRateLimitGroup([{ limit: 1, windowMs: 50 }], { id: 'keyed' });
+      if (keyed.nextCapacityAt('a') !== undefined) throw new Error('an untouched key has a time');
+      keyed.onStart('a');
+      exact('key a', keyed, clock + 51, 'a');
+      if (keyed.nextCapacityAt('b') !== undefined) throw new Error('key b has a time');
+    } finally {
+      Date.now = realNow;
+    }
   }
 
   /** An out-of-band capacity change has no release to wake on. The heartbeat covers it. */

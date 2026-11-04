@@ -148,6 +148,24 @@ export class RateLimitGroup extends EventTarget implements ResourceGroup {
   }
 
   /**
+   * When a window next has room again, as a `Date.now()` time, if one is full
+   * now: the latest of the full windows, since every window must have room.
+   * Undefined while there is room. The scheduler sets a timer for it, so a
+   * waiter starts when the window rolls over rather than on the next
+   * heartbeat.
+   */
+  nextCapacityAt(): number | undefined {
+    const now = Date.now();
+    let at: number | undefined;
+    for (let i = 0; i < this.windows.length; i++) {
+      const { limit, windowMs } = this.windows[i];
+      const freesAt = windowFreesAt(this.requestCounts.get(i.toString())!, this.runningStartTimes, limit, windowMs, now);
+      if (freesAt !== undefined && (at === undefined || freesAt > at)) at = freesAt;
+    }
+    return at;
+  }
+
+  /**
    * One `window` gauge per configured window, because this group enforces all
    * of them together and a single bar would be a lie.
    */
@@ -258,6 +276,47 @@ export class RateLimitGroup extends EventTarget implements ResourceGroup {
       windowMs: config.seconds * 1000
     }));
   }
+}
+
+/**
+ * When a window that counts `completed` and `running` - each oldest first,
+ * each counted while `timestamp >= now - windowMs`, as `canRun` counts them -
+ * next has room for one more. Undefined if it has room now.
+ *
+ * Full means `count >= limit`, so `count - limit + 1` timestamps must fall
+ * out. The last of them to do so is the `(count - limit + 1)`th oldest, which
+ * stops counting 1 ms after `timestamp + windowMs`. A count above the limit
+ * is possible: a running task that started outside the window is counted
+ * again when it finishes.
+ *
+ * O(timestamps in the window) and no allocation: it runs once per wait, and
+ * again when that time comes.
+ * @internal
+ */
+export function windowFreesAt(
+  completed: ReadonlyArray<number | readonly [number, number]>,
+  running: readonly number[],
+  limit: number,
+  windowMs: number,
+  now: number
+): number | undefined {
+  const stamp = (entry: number | readonly [number, number]) => typeof entry === 'number' ? entry : entry[0];
+  const windowStart = now - windowMs;
+  // Both lists are oldest first, so what has fallen out is a prefix of each
+  let c = 0;
+  while (c < completed.length && stamp(completed[c]) < windowStart) c++;
+  let r = 0;
+  while (r < running.length && running[r] < windowStart) r++;
+  const count = (completed.length - c) + (running.length - r);
+  if (count < limit) return undefined;
+
+  // Merge-walk to the (count - limit + 1)th oldest
+  let last = 0;
+  for (let expiring = count - limit + 1; expiring > 0; expiring--) {
+    if (r >= running.length || (c < completed.length && stamp(completed[c]) <= running[r])) last = stamp(completed[c++]);
+    else last = running[r++];
+  }
+  return last + windowMs + 1;
 }
 
 /** `1000` -> `'1s'`, `60000` -> `'60s'`, `500` -> `'500ms'`. Labels only. */

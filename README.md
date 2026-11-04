@@ -352,9 +352,10 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   `scheduler.tasks` (default: unlimited). Set it for long-lived schedulers -
   completed tasks otherwise pin their payloads and results forever
 - `options.periodicRetryIntervalMs`: heartbeat for waking blocked tasks
-  (default 50ms). Groups that free a slot retry their own queue directly; this
-  covers what raises no signal - rate-limit windows rolling over, and resident
-  admission
+  (default 50ms). A fallback: releases wake their own queue directly, rate
+  windows wake theirs when they roll over, and a group emitting
+  `slot-released` is heard. This covers a custom group that changes without
+  saying so
 - `addTask(task, options?)`: Add a task. Fire-and-forget by default; pass
   `{ createPromise: true }` to get a promise back
 - `addTasks(tasks, options?)`: Batch version, optimised for bulk additions.

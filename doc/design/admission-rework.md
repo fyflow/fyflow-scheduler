@@ -181,9 +181,10 @@ they go in the release notes:
   - Mutation checks:
     - wake the whole list again: the flat-cost test must fail;
     - skip migration: the two-group latency test must fail.
-- **R3 — optional: time-based wakes.** Rate groups woken at `resetAt`, and
-  `slot-released` honoured. Expected to bring the keyed rate run near its
-  1.6 s ideal. It is separable, so it can be decided after R2.
+- **R3 — time-based wakes. Done**, on branch `r3-time-wakes`, kept out of
+  R2's release (see "R3 results" below). Rate groups name the time a window
+  frees (`nextCapacityAt`, not `resetAt`, which is the oldest timestamp and
+  wrong once a window is over its limit), and `slot-released` is honoured.
 
 Order against the other plans:
 - phase 0 (hard caps) and phase A (single-key `KeyedConcurrentLimitGroup`) do
@@ -238,7 +239,7 @@ reverted.
 
 ### The known gaps R2 and R3 must close
 
-R2 closed all four of its gaps; the R3 one remains.
+R2 closed all four of its gaps, and R3 the last.
 
 | Test | Closed by |
 |---|---|
@@ -396,6 +397,95 @@ heartbeat timing was classified as either a contract (promised in
 so arrivals during its creation wait for the next settle or the heartbeat. R1
 does the same. Fixed after R2: the scheduler dispatches on
 `worker.initialization.completed`.
+
+## R3 results
+
+### What changed
+
+- **`nextCapacityAt(key?)`**, optional on `ResourceGroup`: the `Date.now()`
+  time `canRun(key)` next says yes with no release. `RateLimitGroup` and
+  `KeyedRateLimitGroup` implement it exactly - the `(count - limit + 1)`th
+  oldest timestamp plus `windowMs + 1`, the latest over full windows - by a
+  merge walk over the two sorted lists, with no allocation.
+- **One timer per scheduler.** A min-heap of `[at, queueId]` with lazy
+  deletion, and one `setTimeout` for the earliest. A queue is asked when it
+  is created and when a wake leaves waiters with no time pending; never while
+  one is pending, since a rate window's time only moves later.
+- **Guards against a hot loop.** A time that is not a finite number is not
+  armed, and that queue is left to the heartbeat; a throw is warned once per
+  group. A time already due is woken at once, with a backoff for repeats
+  that admit nobody - 1, 2, 4 ms up to the heartbeat interval - reset by an
+  admission. With no group that has a `nextCapacityAt`, the whole path is
+  one boolean test.
+- **Found on the way: a due time is not a bogus one.** The first version
+  ignored any time not in the future. At a millisecond boundary - refused
+  at t, asked at t + 1, free at t + 1 - that dropped a real wake, and with
+  the heartbeat off the waiter never started: the 200-key cost test hung on
+  Node about one run in ten. A one-shot allowance was not enough either:
+  an arrival taking the room before the prompt wake ran made the second,
+  equally real "now" look like a repeat.
+- **Found on the way: `Date.now()` steps back.** With that fixed the test
+  still hung on Node about one run in forty. Traced: a timer fired at 219
+  with its time due, the group's `canRun` inside the wake read 218 and
+  refused, and the re-ask a moment later read 219 and found room - so no
+  time was set, and nothing woke the queue again. A wake that admits nobody
+  followed by "room now" is now treated as a time already due. It does not
+  fire for a wake that parked a waiter for want of a slot, which is an exit,
+  so the queue is not drained into the ready queue.
+- **And: arm on every push**, not only when a queue is created. A queue
+  whose last wake left it with no time pending can be joined later by a
+  waiter refused on its way out of the ready queue.
+- **`slot-released` honoured**, a microtask later, deduplicated per queue,
+  and ignored when emitted from inside the scheduler's own `onFinish` call.
+  The resident-release wake goes through the same microtask, so a teardown
+  and its group's event are one wake. `ConcurrentLimitGroup.limit` is now an
+  accessor that emits `slot-released` when raised.
+- The known gap "a rate window rolling over admits without polling" closed.
+
+### Mutation checks
+
+Nineteen, each caught by an assertion in the test named for it: no arm on
+a push (a waiter arriving after its holder finished never starts), trusting
+"room" after a wake refused (a clock stepping back strands the waiter),
+no re-arm after a wake, asking while a time is pending (asked 5 times over 4
+releases instead of once), no own-release guard (599 extra wakes for 599
+releases), no backoff for due times (40 asks in 600ms against 14), ignoring
+due times, a backoff never reset, accepting NaN, warning on every throw, no
+clear on queue drop, no clear on shutdown, a heap that does not sift (the
+short window's waiter woken at the long one's time), no `slot-released`
+listener, ignoring the event's key, the oldest timestamp instead of the kth,
+the earliest window instead of the latest, an off-by-one millisecond, and a
+silent limit raise.
+
+### Measured, Deno 2.9.6, Windows
+
+| shape | N | over ideal before | after |
+|---|---|---|---|
+| keyed-rate (10 keys) | 1,000 | 2.88 | 1.67 |
+| keyed-rate (10 keys) | 2,000 | 2.96 | 1.56 |
+| keyed-rate-wide (200 keys, new) | 10,000 | 2.01 | 1.43 |
+
+What is left of "over ideal" is the group's own rule: a finished task counts
+from when it finished, so a round is a window plus the task's run time. The
+ideal assumes it counts from the start.
+
+**Main-loop cost**, profiled on keyed-rate-wide at 10K with time wakes on and
+off, three runs each:
+- worst stall the same, 38-53 ms either way;
+- time spent waking 236-264 ms with the heartbeat alone, 336-390 ms with
+  timer fires plus heartbeat: about 100 ms more over a 5 s run, 2% of wall
+  time;
+- the worst single timer callback 8-29 ms, against 6-21 ms for a heartbeat;
+- at most 200 heap entries, one per key.
+
+The extra is wasted fires: a task finishing after its key was asked moves
+the time later, so the wake at the earlier time finds no room and asks
+again. Re-asking on every release would avoid it at the price of an ask per
+release, which for a 1,000-per-minute window is 1,000 asks against one
+wasted fire, so it stays. Bounded either way: about two asks and two fires
+per key per window, independent of the limit and of how many tasks wait.
+The admission suite's cost test holds it there: 800 waiters over 200 keys
+take 8-11 timer fires and 1.5-1.7 asks per waiter.
 
 ## Risks
 

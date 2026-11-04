@@ -205,7 +205,28 @@ export interface ResourceGroup extends EventTarget {
    */
   read?(key?: string): GaugeReading[];
 
+  /**
+   * For capacity that comes back with time rather than with a release - a
+   * rate window rolling over: when `canRun(key)` may next be true, as a
+   * `Date.now()` time. Undefined when there is room now, or when only a
+   * release or an outside change can make room.
+   *
+   * Optional. The scheduler asks when a queue starts waiting on this group
+   * (per key, for a keyed group), and again when that time comes and waiters
+   * are left - not per waiter, and not while a time is pending. It keeps one
+   * timer for every group and key together, at the earliest time asked for.
+   * A time that is not a finite number is ignored, and the heartbeat covers
+   * that queue. A time already due wakes it at once; repeated with nobody
+   * admitted, it backs off, doubling up to `periodicRetryIntervalMs`. A
+   * group whose capacity can come back sooner than it said should emit
+   * `slot-released`. Looked up when the scheduler is constructed.
+   */
+  nextCapacityAt?(key?: string): number | undefined;
+
   // Events emitted by all groups:
-  // - 'slot-released': When resource becomes available
+  // - 'slot-released': When resource becomes available. The scheduler wakes
+  //   that group's waiters - those of `detail.key`, if it names one - a
+  //   microtask later. Emitted from inside the scheduler's own release it
+  //   changes nothing, since that release wakes them already.
   // - 'capacity-exhausted': When limit reached
 }

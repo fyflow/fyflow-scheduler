@@ -55,7 +55,8 @@ Two things look like an overshoot and are not:
   freed unit can be refilled first. Read `group.getMetrics().running` instead.
 - **Lowering a limit at runtime.** `group.limit = n` takes effect at the next
   admission. Tasks already running keep their units, and nothing new is admitted
-  until the count is below `n`.
+  until the count is below `n`. Raising it starts the waiters that now fit
+  straight away (§6).
 
 Re-entering the scheduler from inside a group's own methods (`canRun`,
 `onStart`, `onFinish`) or from the group's own `EventTarget` events is not
@@ -337,7 +338,7 @@ worker wrappers the pool manages for you - you should not construct them.
 | `workerPools` | `Record<string, WorkerManager>` | Keys are the `workerType` values tasks refer to |
 | `resourceGroups` | `Record<string, ResourceGroup>` | Keys are the group ids used in `groups` / `workerGroups` |
 | `options.maxCompletedTasks` | `number` | Cap on retained terminal tasks. Default: unlimited |
-| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks that no release can wake (rate windows, raised limits). Default `50` |
+| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks that nothing else wakes: a custom group whose capacity changes without a `slot-released` or a `nextCapacityAt` (§6). The fallback, not the usual path. Default `50` |
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -1193,13 +1194,71 @@ Two mechanisms, and knowing which applies explains the latency you see:
   the queue of the one it is short of, so whichever release it needs is the one
   that wakes it. A task waiting for a new worker is also admitted when one of
   its pool's existing workers settles a task and has a slot free.
+- **When a rate window rolls over.** Capacity that comes back with time
+  rather than with a release has a time the group can name, and
+  `RateLimitGroup` and `KeyedRateLimitGroup` name it (`nextCapacityAt`,
+  below). The scheduler wakes that queue - that key's, for a keyed group - at
+  that time, so a rate-limited waiter starts when its window frees, as
+  closely as the runtime's timers allow, not on the next heartbeat. Timers
+  on Windows can run 10-15ms late.
+- **When a group says so.** A group emitting `slot-released` has its waiters
+  woken a microtask later - those of `detail.key`, if it names one.
+  `ConcurrentLimitGroup` emits it when you **raise** its `limit`.
 - **On the heartbeat**, every `periodicRetryIntervalMs` (default 50ms), for
-  everything with no such signal: a **rate-limit window** rolling over, and a
-  group whose limit you **raised** by hand. Neither raises an event when it
-  becomes satisfiable. Also one deliberate case: a pool at the head of a
+  anything none of these covers: a custom group whose capacity changes
+  without saying so. Also one deliberate case: a pool at the head of a
   resident queue whose task-held group is full when its units free up. It
   keeps its place, so the pools behind it cannot take those units, and is
   retried by the heartbeat.
+
+A rate window counts a finished task from when it **finished**: with 1 per
+50ms, the next task starts 50ms after the previous one finished, not after
+it started. That is the group's rule, not wake latency. A task finishing
+after the scheduler asked moves the time later, and the wake at the earlier
+time finds no room and asks again - one more timer, not a missed wake.
+
+**What time wakes cost.** One timer for the whole scheduler, set for the
+earliest time, however many keys wait - 200 keys rolling over at 200
+different times are one pending timer, not 200. The group is asked when a
+queue starts waiting, and again when its time comes with waiters left - not
+per waiter, not on every release, not on the heartbeat. A group cannot put
+the scheduler into a hot loop: a time that is not a finite number is
+ignored, and that queue falls back to the heartbeat. A time already due is
+woken at once - it is real at a millisecond boundary, or when an arrival
+took the room first - but again and again with no waiter admitted, each
+repeat waits twice as long, up to `periodicRetryIntervalMs`. The same goes
+for a group that refuses a wake and then says it has room: `Date.now()` can
+step back a millisecond, and the two answers can come from either side of
+it. With no group
+that names a time, none of this runs.
+
+A custom group whose capacity comes back by itself can take part:
+
+```typescript
+class QuotaGroup extends EventTarget {
+  // ...canRun, onStart, onFinish, getMetrics...
+
+  // When canRun(key) may next be true with no release, as a Date.now() time;
+  // undefined while there is room, or when only a release can make room
+  nextCapacityAt(key?: string): number | undefined { /* ... */ }
+
+  // Capacity came back from outside - a quota topped up, a limit raised
+  topUp(key?: string) {
+    this.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: this.id, key } }));
+  }
+}
+```
+
+- `nextCapacityAt` is looked up when the scheduler is constructed. A group
+  given one later is not asked
+- The scheduler does not ask again while a time is pending, because a rate
+  window's time only moves later. A group whose time can move **earlier**
+  should emit `slot-released` when it does
+- If it throws, the scheduler warns once per group and leaves that group to
+  the heartbeat. It is a hint, so no task fails over it
+- A `slot-released` emitted from inside the scheduler's own release - the
+  library's groups emit one from `onFinish` - wakes nothing twice: that
+  release has woken those waiters already
 
 A release admits only what it freed. One finished task admits one waiter, and a
 weighted release admits as many as now fit. The cost of a release does not

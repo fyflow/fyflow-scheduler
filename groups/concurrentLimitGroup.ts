@@ -12,7 +12,8 @@ import type {
  * A hard cap: the scheduler checks and acquires a task's groups in one
  * synchronous turn, so no more tasks hold this group than its limit, counted
  * from `onStart` to `onFinish`. Lowering `limit` under running tasks keeps
- * their units; nothing new is admitted until the count is below it.
+ * their units; nothing new is admitted until the count is below it. Raising
+ * it emits `slot-released`, which starts the waiters that now fit.
  *
  * Example:
  * ```typescript
@@ -22,7 +23,7 @@ import type {
 export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
     readonly id: string;
     readonly type = 'concurrent' as const;
-    limit: number;
+    private _limit: number;
     running = 0;
     private stats = {
       totalAcquired: 0,
@@ -31,8 +32,34 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
 
     constructor(limit: number, id?: string) {
       super();
-      this.limit = limit;
+      this._limit = limit;
       this.id = id || `concurrent-${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    get limit(): number {
+      return this._limit;
+    }
+
+    /**
+     * Raised, it announces the room it made with `slot-released`, so a
+     * scheduler starts the waiters that now fit straight away. A field used
+     * to hold it, which nothing could observe: they waited for the
+     * scheduler's heartbeat.
+     */
+    set limit(value: number) {
+      const raised = value > this._limit;
+      this._limit = value;
+      if (raised && this.running < value) {
+        this.dispatchEvent(new CustomEvent('slot-released', {
+          detail: {
+            groupType: 'concurrent-limit',
+            groupId: this.id,
+            running: this.running,
+            limit: value,
+            available: value - this.running
+          }
+        }));
+      }
     }
 
     /**
@@ -43,7 +70,7 @@ export class ConcurrentLimitGroup extends EventTarget implements ResourceGroup {
      * is refused while four 2-unit workers hold 8.
      */
     canRun(_key?: string, cost: number = 1): boolean {
-      return this.running + cost <= this.limit;
+      return this.running + cost <= this._limit;
     }
 
     getMetrics(): ResourceGroupMetrics {

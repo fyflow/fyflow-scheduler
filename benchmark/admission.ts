@@ -73,7 +73,7 @@ interface LatencyRow {
   missed: number;
 }
 
-const COST_SHAPES = ['none', 'global', 'keyed', 'keyed-wide', 'two-group', 'keyed-rate', 'keyed-multi', 'units'] as const;
+const COST_SHAPES = ['none', 'global', 'keyed', 'keyed-wide', 'two-group', 'keyed-rate', 'keyed-rate-wide', 'keyed-multi', 'units'] as const;
 const LATENCY_SHAPES = ['two-group-wake', 'resident-handoff'] as const;
 type CostShape = typeof COST_SHAPES[number];
 
@@ -129,6 +129,16 @@ async function measureCost(shape: CostShape, N: number): Promise<CostRow> {
       break;
     case 'keyed-rate': {
       const [limit, windowMs, keys] = [10, 20, 10];
+      groups.r = new KeyedRateLimitGroup([{ limit, windowMs }], { id: 'r' });
+      configFor = i => ({ workerGroups: ['r'], limitKey: `key${i % keys}` });
+      idealMs = Math.ceil(N / keys / limit) * windowMs;
+      break;
+    }
+    case 'keyed-rate-wide': {
+      // Many keys, each with its own window: as many distinct times a window
+      // frees as there are keys, which is what time-based wakes must handle
+      // without a timer each
+      const [limit, windowMs, keys] = [1, 50, 200];
       groups.r = new KeyedRateLimitGroup([{ limit, windowMs }], { id: 'r' });
       configFor = i => ({ workerGroups: ['r'], limitKey: `key${i % keys}` });
       idealMs = Math.ceil(N / keys / limit) * windowMs;
@@ -330,6 +340,7 @@ function compare(base: { cost: CostRow[]; latency: LatencyRow[] }, head: typeof 
       'tasks/s': `${b.tasksPerSec} -> ${h.tasksPerSec} (${pct(b.tasksPerSec, h.tasksPerSec)})`,
       'stall ms': `${b.maxStallMs} -> ${h.maxStallMs}`,
       'heap MB': `${b.peakHeapMB} -> ${h.peakHeapMB}`,
+      ...(h.overIdeal !== undefined ? { 'over ideal': `${b.overIdeal} -> ${h.overIdeal}` } : {}),
     }];
   });
   const latency = head.latency.flatMap(h => {
@@ -353,7 +364,9 @@ async function main() {
   for (const shape of options.shapes) {
     if ((LATENCY_SHAPES as readonly string[]).includes(shape)) continue;
     // Rate-paced: the wall time is set by the limits, so keep it short
-    const sizes = shape === 'keyed-rate' ? options.sizes.filter(n => n <= 2_000) : options.sizes;
+    const sizes = shape === 'keyed-rate' ? options.sizes.filter(n => n <= 2_000)
+      : shape === 'keyed-rate-wide' ? options.sizes.filter(n => n <= 10_000)
+      : options.sizes;
     let tooSlow: string | undefined;
     for (const [index, N] of sizes.entries()) {
       if (tooSlow) {

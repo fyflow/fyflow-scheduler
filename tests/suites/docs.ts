@@ -150,6 +150,10 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Resident Admission Is Head-Of-Line For Arrivals', () => this.docResidentArrivalsQueue()));
     this.results.push(await this.runTest('Doc: A Task Waiting For A New Worker Takes A Free Slot', () => this.docResidentWaiterTakesSlot()));
     this.results.push(await this.runTest('Doc: A Two-Group Waiter Migrates, And Every Waiter Is Listed', () => this.docTwoGroupMigrates()));
+    this.results.push(await this.runTest('Doc: A Rate Window Rolling Over Starts Its Waiter, Not The Heartbeat', () => this.docRateWindowWakes()));
+    this.results.push(await this.runTest('Doc: A Finished Task Counts From When It Finished', () => this.docRateCountsFromFinish()));
+    this.results.push(await this.runTest('Doc: Raising A Limit Starts The Waiters That Now Fit', () => this.docRaisedLimitWakes()));
+    this.results.push(await this.runTest('Doc: A Custom Group Names Its Time And Announces A Top-Up (QuotaGroup)', () => this.docQuotaGroup()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -2108,6 +2112,133 @@ class DocsTestSuite {
 
   private poolThreads(scheduler: FyflowScheduler, type: string): number {
     return (scheduler as any).workerPools[type].threads.length;
+  }
+
+  /** Resolves with `performance.now()` at a task's `task.running`. */
+  private startedAt(scheduler: FyflowScheduler, id: string): Promise<number> {
+    return new Promise(resolve => {
+      const listener = (e: any) => {
+        if (e.detail?.id !== id) return;
+        scheduler.removeEventListener('task.running', listener);
+        resolve(performance.now());
+      };
+      scheduler.addEventListener('task.running', listener);
+    });
+  }
+
+  /** Rejects if `promise` has not settled within `ms`. */
+  private async within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} within ${ms}ms`)), ms);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // AGENTS.md section 6, "How a blocked task wakes up": a waiter on a rate
+  // window starts when the window rolls over. The heartbeat is off, so
+  // nothing else could start it.
+  private async docRateWindowWakes(): Promise<void> {
+    const api = new RateLimitGroup([{ limit: 1, windowMs: 50 }], 'api');
+    const scheduler = this.makeScheduler({ groups: ['api'] }, { api }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1 } });
+    await scheduler.addTask(task('first'), { createPromise: true });
+    const freedBy = performance.now() + 50;
+    const second = this.startedAt(scheduler, 'second');
+    const done = scheduler.addTask(task('second'), { createPromise: true });
+    const at = await this.within(second, 1000, 'second never started');
+    if (at - freedBy > 25) throw new Error(`second started ${(at - freedBy).toFixed(0)}ms after its window freed`);
+    await done;
+  }
+
+  // AGENTS.md section 6: "with 1 per 50ms, the next task starts 50ms after
+  // the previous one finished, not after it started", and a task finishing
+  // after the scheduler asked costs one more timer, not a missed wake
+  private async docRateCountsFromFinish(): Promise<void> {
+    const api = new RateLimitGroup([{ limit: 1, windowMs: 50 }], 'api');
+    const scheduler = this.makeScheduler({ groups: ['api'] }, { api }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1, awaitMs: 20 } });
+    let firstFinished = 0;
+    const onFinish = api.onFinish.bind(api);
+    api.onFinish = () => { if (!firstFinished) firstFinished = performance.now(); onFinish(); };
+    const first = this.startedAt(scheduler, 'first');
+    const second = this.startedAt(scheduler, 'second');
+    const done = Promise.all([
+      scheduler.addTask(task('first'), { createPromise: true }),
+      scheduler.addTask(task('second'), { createPromise: true })
+    ]);
+    const at = await this.within(second, 1000, 'second never started');
+    await done;
+    if (at - (await first) < 50 + 15) throw new Error(`second started ${(at - (await first)).toFixed(0)}ms after the first started - counted from its start`);
+    if (at - firstFinished < 49) throw new Error(`second started ${(at - firstFinished).toFixed(0)}ms after the first finished`);
+    // Two timers' worth of slack: the one asked before the first finished, and the one after
+    if (at - firstFinished > 50 + 2 * 25) throw new Error(`second started ${(at - firstFinished).toFixed(0)}ms after the first finished`);
+  }
+
+  // AGENTS.md section 1 and section 6: raising a ConcurrentLimitGroup's limit
+  // starts the waiters that now fit, heartbeat off
+  private async docRaisedLimitWakes(): Promise<void> {
+    const gpu = new ConcurrentLimitGroup(1, 'gpu');
+    const scheduler = this.makeScheduler({ groups: ['gpu'] }, { gpu }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string, awaitMs: number) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1, awaitMs } });
+    const waiter = this.startedAt(scheduler, 'waiter');
+    const done = Promise.all([
+      scheduler.addTask(task('holder', 300), { createPromise: true }),
+      scheduler.addTask(task('waiter', 1), { createPromise: true })
+    ]);
+    await new Promise(r => setTimeout(r, 20));
+    const raised = performance.now();
+    gpu.limit = 2;
+    const at = await this.within(waiter, 250, 'waiter did not start before the holder finished');
+    if (at - raised > 25) throw new Error(`waiter started ${(at - raised).toFixed(0)}ms after the raise`);
+    await done;
+  }
+
+  // AGENTS.md section 6, the QuotaGroup snippet: a custom group names when
+  // its capacity comes back, and announces a top-up with slot-released.
+  // Heartbeat off: those are the only two things that can start a waiter.
+  private async docQuotaGroup(): Promise<void> {
+    class QuotaGroup extends EventTarget {
+      readonly id = 'quota';
+      readonly type = 'quota';
+      left = 1;
+      refillAt = Date.now() + 60;
+      canRun() {
+        if (Date.now() >= this.refillAt) { this.left = 1; this.refillAt = Infinity; }
+        return this.left > 0;
+      }
+      onStart() { this.left--; }
+      onFinish() {}
+      getMetrics() { return { limit: 1, running: 0, available: this.left, utilization: 0 }; }
+      nextCapacityAt(): number | undefined {
+        return this.left > 0 || !Number.isFinite(this.refillAt) ? undefined : this.refillAt;
+      }
+      topUp() {
+        this.left++;
+        this.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: this.id } }));
+      }
+    }
+    const quota = new QuotaGroup();
+    const scheduler = this.makeScheduler({ groups: ['quota'] }, { quota }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1 } });
+    const refill = quota.refillAt;
+    const second = this.startedAt(scheduler, 'second');
+    const third = this.startedAt(scheduler, 'third');
+    const runs = ['first', 'second', 'third'].map(id => scheduler.addTask(task(id), { createPromise: true }));
+    // The second at the time the group named
+    await this.within(second, 1000, 'second never started');
+    if (Date.now() < refill) throw new Error('second started before the refill');
+    // The third only once topped up
+    await new Promise(r => setTimeout(r, 30));
+    if (scheduler.stats.running + scheduler.stats.done !== 2) throw new Error('third started with no quota');
+    const toppedUp = performance.now();
+    quota.topUp();
+    const at = await this.within(third, 250, 'third never started after the top-up');
+    if (at - toppedUp > 25) throw new Error(`third started ${(at - toppedUp).toFixed(0)}ms after the top-up`);
+    await Promise.all(runs);
   }
 
   // AGENTS.md section 6: a task waiting on two groups is listed once, under the

@@ -357,6 +357,45 @@ export class FyflowTask {
      */
     private shutDown = false;
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /**
+     * Time-based wakes: queue id -> the `Date.now()` its group said capacity
+     * comes back (`nextCapacityAt`). At most one per queue, for queues that
+     * wait on a group with such a time.
+     */
+    private timeWakes = new Map<string, number>();
+    /**
+     * The same times as a min-heap of `[at, queueId]`, so the earliest is
+     * found in O(log n) however many keys wait. An entry whose `at` no longer
+     * matches `timeWakes` is stale, and skipped when it surfaces.
+     */
+    private timeWakeHeap: Array<[number, string]> = [];
+    /** One timer for every time-based wake, set for the earliest. */
+    private timeWakeTimer: ReturnType<typeof setTimeout> | null = null;
+    private timeWakeTimerAt = Infinity;
+    /**
+     * The delay for a queue's next wake on a time already due, doubled each
+     * time it is used without the queue making progress and capped at the
+     * heartbeat interval: a group answering "now" with no room would
+     * otherwise wake its queue every millisecond. Reset by progress.
+     */
+    private timeWakeDue = new Map<string, number>();
+    /** Groups whose `nextCapacityAt` threw, warned about once. */
+    private timeWakeWarned = new WeakSet<object>();
+    /**
+     * Whether any group has a `nextCapacityAt`. With none - concurrency
+     * limits, units - time wakes cost a wake one boolean test.
+     */
+    private timeWakeGroups = false;
+
+    /**
+     * Inside the scheduler's own release of a task's groups. A
+     * `slot-released` the group emits from there is ignored: the release
+     * wakes those waiters itself, in the same turn.
+     */
+    private releasing = 0;
+    /** Group wakes due in a microtask, by `groupId` or queue id. */
+    private groupWakes = new Map<string, { groupId: string; key?: string }>();
     /**
      * Tasks sitting out a retry backoff, by id. Held outside every queue, so no
      * dispatch can start them early - they used to wait in the ready queue,
@@ -402,6 +441,7 @@ export class FyflowTask {
       super();
       this.workerPools = workerPools;
       this.groups = groups;
+      this.timeWakeGroups = Object.values(groups).some(g => typeof (g as any)?.nextCapacityAt === 'function');
       this.options = {
         periodicRetryIntervalMs: 50, // Default to 50ms - optimal balance of speed and efficiency
         ...options
@@ -828,6 +868,12 @@ export class FyflowTask {
           keys.add(suffix);
         }
       }
+      // Called for a waiter its group just refused: if the group knows when
+      // it has room again and no time is pending, wake the queue then. On
+      // every push, not only when the queue is created - a queue whose last
+      // wake left it with no time pending can be joined later, by a waiter
+      // refused on its way out of the ready queue, and nothing would wake it
+      if (this.timeWakeGroups) this._armTimeWake(queueId);
       return queue;
     }
 
@@ -848,6 +894,12 @@ export class FyflowTask {
         const keys = this.blockedKeys.get(groupId);
         keys?.delete(suffix);
         if (keys?.size === 0) this.blockedKeys.delete(groupId);
+      }
+      // Its heap entry goes stale. With none left, nothing should keep a
+      // timer pending - nor the process alive
+      if (this.timeWakeGroups) {
+        this.timeWakeDue.delete(queueId);
+        if (this.timeWakes.delete(queueId) && this.timeWakes.size === 0) this._clearTimeWakes();
       }
     }
 
@@ -1389,7 +1441,15 @@ export class FyflowTask {
       for (const { id, group, key } of holds) {
         // The original, as onStart returned it: a group may rely on identity
         const grant = grants?.get(FyflowScheduler._holdId(id, key));
-        group.onFinish(key, 1, grant?.raw);
+        // Counted as ours, so a slot-released the group emits from here wakes
+        // nothing twice. Only the group's own call: a resource.released
+        // listener changing some other group is outside this release
+        this.releasing++;
+        try {
+          group.onFinish(key, 1, grant?.raw);
+        } finally {
+          this.releasing--;
+        }
         if (this._resourceObserved) {
           this._emitResource('resource.released', group, {
             groupId: id,
@@ -1869,14 +1929,20 @@ export class FyflowTask {
       // Held for the whole wake - see blockedInUse - and deleted after, if the
       // wake, or anything it reached, emptied it
       this.blockedInUse.set(queueId, (this.blockedInUse.get(queueId) ?? 0) + 1);
+      let exits = 0;
       try {
         const { groupId, key } = this._splitQueueId(queueId);
-        return this._admitFromQueue(queueId, groupId, blockedTasks, key, maxExits, sweep);
+        exits = this._admitFromQueue(queueId, groupId, blockedTasks, key, maxExits, sweep);
+        return exits;
       } finally {
         const depth = this.blockedInUse.get(queueId)! - 1;
         if (depth > 0) this.blockedInUse.set(queueId, depth);
         else this.blockedInUse.delete(queueId);
+        // Progress: a time already due is woken promptly again
+        if (exits > 0 && this.timeWakeGroups) this.timeWakeDue.delete(queueId);
         this._dropBlockedQueueIfEmpty(queueId);
+        // Waiters left, and no time pending for them: ask again
+        if (this.timeWakeGroups && this.blockedQueues.has(queueId)) this._armTimeWake(queueId, exits === 0);
       }
     }
 
@@ -2228,7 +2294,10 @@ export class FyflowTask {
      * That is a stall, not a slow path. A task-held group is retried directly
      * by `_releaseResourcesForTask` when its own slot frees, so the damage was
      * confined to the waiters with no other wakeup: rate-limit windows rolling
-     * over, and resident admission, neither of which raises an event.
+     * over, and resident admission, neither of which raised an event then.
+     * Both have their own wakes now - a timer at `nextCapacityAt`, and the
+     * resident release - so this is the fallback for a custom group that
+     * changes without saying so.
      *
      * Leaving a pending timer alone is what makes it a heartbeat. It costs one
      * `_retryBlockedTasks()` per interval while work exists, and that
@@ -2457,12 +2526,7 @@ export class FyflowTask {
       // A worker gave its units back: wake the group's waiters. In a microtask,
       // because the pool notifies from inside its own teardown, and a wake
       // dispatches - possibly into that same pool - before it has finished.
-      if (notice.type === 'released') {
-        const groupId = notice.groupId;
-        queueMicrotask(() => {
-          if (!this.shutDown) this._retryBlockedTasksForGroup(groupId);
-        });
-      }
+      if (notice.type === 'released') this._queueGroupWake(notice.groupId);
 
       if (!this._resourceObserved) return;
 
@@ -2514,9 +2578,185 @@ export class FyflowTask {
       return holding;
     }
 
+    /**
+     * Honour `slot-released`: capacity a group gives back outside a release
+     * of ours - a raised `limit`, or a custom group whose capacity is
+     * external - wakes its waiters a microtask later. Those of the key it
+     * names, for a keyed group.
+     *
+     * The scheduler's own releases wake directly, and a `slot-released` from
+     * inside one is ignored, so the hot path pays one listener call and a
+     * comparison. Wakes requested in one turn are deduplicated, so a burst
+     * of events is one wake per queue.
+     */
     _setupGroupEventListeners() {
-      // Note: We no longer need event listeners on slot-released because we explicitly call
-      // _retryBlockedTasksForGroup() after releasing resources in _releaseResourcesForTask()
+      for (const [groupId, group] of Object.entries(this.groups)) {
+        if (typeof (group as any)?.addEventListener !== 'function') continue;
+        this._addInternalListener(group, 'slot-released', (e: Event) => {
+          if (this.releasing > 0 || this.shutDown) return;
+          const key = (e as CustomEvent).detail?.key;
+          this._queueGroupWake(groupId, typeof key === 'string' && key !== '' ? key : undefined);
+        });
+      }
+    }
+
+    /**
+     * Wake a group's waiters in a microtask: those of `key`, or with no key,
+     * every queue of the group.
+     *
+     * A microtask, because both callers are inside someone else's code - a
+     * pool tearing a worker down, a group's setter - and a wake dispatches.
+     */
+    private _queueGroupWake(groupId: string, key?: string): void {
+      const id = key === undefined ? groupId : this._blockedQueueId(groupId, key);
+      if (this.groupWakes.has(id)) return;
+      const first = this.groupWakes.size === 0;
+      this.groupWakes.set(id, { groupId, key });
+      if (!first) return;
+      queueMicrotask(() => {
+        const due = [...this.groupWakes.values()];
+        this.groupWakes.clear();
+        if (this.shutDown) return;
+        for (const { groupId, key } of due) {
+          const group = this.groups[groupId];
+          if (key !== undefined || !group?.keyed) this._retryBlockedTasksForGroup(groupId, key);
+          else {
+            // No key from a keyed group: any of its keys may have room
+            this._retryBlockedTasksForGroup(groupId);
+            for (const k of this._blockedKeysFor(groupId)) this._retryBlockedTasksForGroup(groupId, k);
+          }
+        }
+      });
+    }
+
+    /**
+     * Ask `queueId`'s group when it has room again, and wake the queue then.
+     *
+     * Asked once per wait: when the queue is created, and when a wake leaves
+     * waiters in it with no time pending. Not again while one is pending - a
+     * rate window's time only moves later as tasks start and finish, and a
+     * release wakes the queue anyway. So it costs one `nextCapacityAt` per
+     * queue per window, not per waiter or per event.
+     */
+    /**
+     * @param refused the wake that just ran admitted nobody. If the group
+     *   then says it has room, the two answers disagree - `Date.now()` is not
+     *   monotonic, and on Windows a timer firing at 219 met a `canRun` that
+     *   read 218 - and with no time pending nothing would wake the queue
+     *   again. That is treated as a time already due.
+     */
+    private _armTimeWake(queueId: string, refused = false): void {
+      if (!this.timeWakeGroups || this.shutDown || this.timeWakes.has(queueId)) return;
+      const { groupId, key, set } = this._splitQueueId(queueId);
+      const group: any = this.groups[groupId];
+      // A wait-set group's queues are woken as a whole; none has a time
+      if (typeof group?.nextCapacityAt !== 'function' || set !== undefined) return;
+      let at: unknown;
+      try {
+        at = group.nextCapacityAt(key);
+      } catch (error) {
+        // Advisory: the heartbeat still covers the queue, so warn and go on
+        // rather than fail a task over a hint
+        if (!this.timeWakeWarned.has(group)) {
+          this.timeWakeWarned.add(group);
+          console.warn(`⚠️ Group "${groupId}" threw from nextCapacityAt - its waiters wait for the heartbeat:`, error);
+        }
+        return;
+      }
+      // Room now, yet the wake just before refused: try again shortly
+      if (at === undefined && refused) at = Date.now();
+      if (typeof at !== 'number' || !Number.isFinite(at)) return;
+      let wakeAt: number = at;
+      // A time already due is real at a millisecond boundary - refused at t,
+      // asked at t + 1, free at t + 1 - and when an arrival takes the room
+      // first. Nothing else wakes the queue then, so it is woken promptly.
+      // Again and again without progress is a group answering "now" with no
+      // room, so each repeat waits twice as long, up to the heartbeat
+      // interval: never a lost wake, never a hot loop.
+      if (at <= Date.now()) {
+        const delay = this.timeWakeDue.get(queueId) ?? 1;
+        this.timeWakeDue.set(queueId, Math.min(delay * 2, Math.max(1, this.options.periodicRetryIntervalMs!)));
+        wakeAt = Date.now() + delay;
+      } else {
+        this.timeWakeDue.delete(queueId);
+      }
+      this.timeWakes.set(queueId, wakeAt);
+      FyflowScheduler._heapPush(this.timeWakeHeap, [wakeAt, queueId]);
+      this._setTimeWakeTimer(wakeAt);
+    }
+
+    /** Set the one timer for `at`, unless it is already set for no later. */
+    private _setTimeWakeTimer(at: number): void {
+      if (this.timeWakeTimer !== null && this.timeWakeTimerAt <= at) return;
+      if (this.timeWakeTimer !== null) clearTimeout(this.timeWakeTimer);
+      this.timeWakeTimerAt = at;
+      this.timeWakeTimer = setTimeout(() => this._onTimeWake(), Math.max(1, at - Date.now()));
+    }
+
+    /**
+     * Wake every queue whose time has come, then set the timer for the next.
+     *
+     * Each wake admits what has room and re-asks for the waiters left, so a
+     * fire costs O(queues due) wakes plus O(log n) per heap entry. Timers can
+     * fire a millisecond early against `Date.now()`; such a time is not due
+     * yet, and the timer is set again for it.
+     */
+    private _onTimeWake(): void {
+      this.timeWakeTimer = null;
+      this.timeWakeTimerAt = Infinity;
+      if (this.shutDown) return;
+      const heap = this.timeWakeHeap;
+      const now = Date.now();
+      const due: string[] = [];
+      while (heap.length > 0 && heap[0][0] <= now) {
+        const [at, queueId] = FyflowScheduler._heapPop(heap);
+        if (this.timeWakes.get(queueId) !== at) continue; // stale
+        this.timeWakes.delete(queueId);
+        due.push(queueId);
+      }
+      for (const queueId of due) {
+        if (!this.blockedQueues.has(queueId)) continue;
+        const { groupId, key } = this._splitQueueId(queueId);
+        this._retryBlockedTasksForGroup(groupId, key);
+      }
+      while (heap.length > 0 && this.timeWakes.get(heap[0][1]) !== heap[0][0]) FyflowScheduler._heapPop(heap);
+      if (heap.length > 0) this._setTimeWakeTimer(heap[0][0]);
+    }
+
+    private _clearTimeWakes(): void {
+      if (this.timeWakeTimer !== null) clearTimeout(this.timeWakeTimer);
+      this.timeWakeTimer = null;
+      this.timeWakeTimerAt = Infinity;
+      this.timeWakes.clear();
+      this.timeWakeHeap = [];
+    }
+
+    private static _heapPush(heap: Array<[number, string]>, entry: [number, string]): void {
+      let i = heap.push(entry) - 1;
+      while (i > 0) {
+        const parent = (i - 1) >> 1;
+        if (heap[parent][0] <= entry[0]) break;
+        heap[i] = heap[parent];
+        i = parent;
+      }
+      heap[i] = entry;
+    }
+
+    private static _heapPop(heap: Array<[number, string]>): [number, string] {
+      const top = heap[0];
+      const last = heap.pop()!;
+      if (heap.length === 0) return top;
+      let i = 0;
+      for (;;) {
+        const left = 2 * i + 1;
+        if (left >= heap.length) break;
+        const child = left + 1 < heap.length && heap[left + 1][0] < heap[left][0] ? left + 1 : left;
+        if (heap[child][0] >= last[0]) break;
+        heap[i] = heap[child];
+        i = child;
+      }
+      heap[i] = last;
+      return top;
     }
 
     _setupWorkerPoolListeners() {
@@ -2956,6 +3196,8 @@ export class FyflowTask {
       // running is discarded with the queues, so it cannot fire into a pool
       // that no longer exists.
       this._clearPeriodicRetry();
+      this._clearTimeWakes();
+      this.timeWakeDue.clear();
       for (const { timer } of this.retryWaiting.values()) clearTimeout(timer);
       this.retryWaiting.clear();
       this._removeAllListeners();

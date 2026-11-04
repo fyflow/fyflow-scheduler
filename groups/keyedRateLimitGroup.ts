@@ -5,7 +5,7 @@ import type {
   ResourceGroupMetrics,
   ResourceGroupStats
 } from './resourceGroup.ts';
-import type { RateWindow } from './rateLimitGroup.ts';
+import { type RateWindow, windowFreesAt } from './rateLimitGroup.ts';
 
 /** Shape the group needs from a task in order to derive its key. */
 export interface KeyedTaskLike {
@@ -169,6 +169,25 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
     this.dispatchEvent(new CustomEvent('slot-released', {
       detail: { groupId: this.id, key: resolved }
     }));
+  }
+
+  /**
+   * When `key`'s bucket next has room again, as a `Date.now()` time, if a
+   * window of it is full now; undefined while it has room. As
+   * {@link RateLimitGroup.nextCapacityAt}, per key: each key's waiters are
+   * woken when that key's window rolls over.
+   */
+  nextCapacityAt(key?: string): number | undefined {
+    const state = this.keys.get(key ?? '');
+    if (!state) return undefined; // An untouched key has a full bucket
+    const now = Date.now();
+    let at: number | undefined;
+    for (let i = 0; i < this.windows.length; i++) {
+      const { limit, windowMs } = this.windows[i];
+      const freesAt = windowFreesAt(state.completed[i], state.runningStartTimes, limit, windowMs, now);
+      if (freesAt !== undefined && (at === undefined || freesAt > at)) at = freesAt;
+    }
+    return at;
   }
 
   /**
