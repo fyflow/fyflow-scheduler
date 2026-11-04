@@ -162,6 +162,25 @@ instead, with a docs test; change the docs tests that count from events.
 
 **Status**: 🔵 Not Started
 
+#### 🔵 A burst onto a threaded pool bounces one task per new worker
+A new thread takes its first task a microtask after `enqueueNoQueue` creates it
+(the threaded branch awaits before `runTask`), so for that microtask the
+thread still shows a free slot. The next task in the same dispatch loop takes
+it, and the first task finds the thread full, is put back with its groups
+released, and is retried after the 10 ms capacity-race backoff. Measured with
+300 ms tasks and the heartbeat off: 4 threads x 1 slot gave 3 extra
+acquire/release pairs, 8 x 1 gave 7, and start times spread 30-60 ms. Each
+bounce is a `resource.acquired`/`resource.released` pair a consumer sees.
+
+The suspected cause - a new worker counted twice, in `threads` and
+`initializingThreads`, serialising start-ups - is not one: the overlap lasts the
+same microtask, and a task added during a start-up creates its own worker
+straight away. Likely fix: hand a fresh thread its task synchronously, as the
+inline branch does (a prototype closes the known gap). Known gap: "A Burst Onto
+An Empty Threaded Pool Dispatches Each Task Once" in the admission suite.
+
+**Status**: 🔵 Not Started
+
 #### 🔵 Admission follow-ups from R2
 - The wake pump's re-entrancy guard (`waking`) is not caught by any test:
   removing it fails nothing, because no path found nests a wake (settles arrive
