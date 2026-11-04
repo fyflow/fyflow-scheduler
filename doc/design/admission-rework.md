@@ -170,8 +170,8 @@ they go in the release notes:
     - `benchmark:quick` shows nothing beyond single-run noise.
   - Three tests guard it (deletion after every shape, deletion on cancel, keyed
     heartbeat through the index), each mutation-checked.
-- **R2 — the core.** Single membership with migration, admit on wake, and
-  every waiter in a list.
+- **R2 — the core. Done** (see "R2 results" below). Single membership with
+  migration, admit on wake, and every waiter in a list.
   - Acceptance:
     - `canRun` per task and events per task stay roughly flat from 1K to 50K
       on every shape;
@@ -237,6 +237,8 @@ reverted.
 | a waiter cancelled in transit re-queued | not by this suite. Caught by cancellation "Cancel From An Admitted Unblock" |
 
 ### The known gaps R2 and R3 must close
+
+R2 closed all four of its gaps; the R3 one remains.
 
 | Test | Closed by |
 |---|---|
@@ -323,6 +325,76 @@ heartbeat timing was classified as either a contract (promised in
   - `position`, "the head gates the rest", which is not true today for
     task-held groups;
   - the `periodicRetryIntervalMs` description.
+
+## R2 results
+
+### What changed
+
+- **Admit on wake** (`_admitFromQueue`). The head is examined in place, and each
+  waiter is admitted and dispatched - `onStart` included - before the next is
+  examined, so `canRun()` ends the loop (risk 15). A waiter whose pool has no
+  free slot waits in the ready queue and counts against what the wake hands
+  out (`parked`), or a full pool would drain the whole list into its ready queue.
+- **A wake pump.** A wake requested during a wake is queued and run after it,
+  never nested (risk 2).
+- **Migration** (`_migrate`), with `unblocked.reason: 'migrated'` (risk 4).
+  - Out of a task-held queue, to the other task-held group that refuses, or -
+    if the pool's worker cost does not fit - to the resident group it is short
+    of. That replaced a `break` that stopped the whole task-held queue at it.
+  - **Never out of a resident queue** (risk 6, as planned). A resident head whose
+    task-held group is full keeps its place and waits for the heartbeat. Moving
+    it let the pools behind it take its units: tested.
+  - **The entry is announced before the exit**: `blocked` for the new queue, then
+    `unblocked: migrated` for the old one. Built the other way round, a cancel
+    from the `migrated` listener emitted an exit from the new queue with no
+    entry (risk 5); the test for it failed before the swap.
+- **Resident releases wake their group** in a microtask, because the pool
+  notifies from inside its own teardown (risk 1).
+- **Arrivals are head-of-line** behind resident waiters (risk 14, decided).
+- **The dispatch loop moves every refused arrival into its list**, up to
+  `maxTasksPerLoop` per pass, instead of stopping at the first.
+- **The capacity race** (risk 3) marks the pool, so neither `_poolHasRoom` nor
+  `_canDispatchTask` offers it work until the 10 ms retry.
+- **`superseded` is no longer emitted**: it needed a task in two queues. It stays
+  in the union, so code naming it still compiles.
+
+### Mutation checks
+
+| Mutation | Caught by |
+|---|---|
+| arrivals skip head-of-line | resource-events criterion 4; docs "Resident Admission Is Head-Of-Line For Arrivals" |
+| no migration (re-blocked through dispatch instead) | admission two-group wake: the moves read `admitted` then `blocked` |
+| no wake on resident release | admission "A Resident Release Admits A Waiting Pool" |
+| `parked` not counted | admission "A Full Pool Takes Only What A Release Freed" |
+| a task-held queue stops at a waiter short of a worker | admission "A Task-Held Waiter Short Of A Worker Moves To The Resident Queue" |
+| a resident head migrates | admission "A Resident Head Whose Own Group Is Full Keeps Its Place" |
+| exit announced before entry | admission "Cancel During A Migration Leaves No Waiter Behind" (found the bug) |
+| the pump's re-entrancy guard removed | **nothing**. No path found nests a wake; it is defensive |
+
+### Measured, back to back against `8836eab` (R1), Deno 2.9.6, Windows
+
+| | R1 | R2 |
+|---|---|---|
+| keyed (10 keys), 50K | 445.8 s (R0 baseline) | 1.18 s |
+| keyed `canRun` / `blocked` per task, 50K | 4,892 / 1,630 | 5 / 1 |
+| keyed-rate, 1K | 577-589 ms, `canRun` 15.5 | 560-566 ms, `canRun` 4.8 |
+| global / two-group / keyed-wide, 50K (2 runs each) | 1,255, 1,091 / 1,276, 1,254 / 1,972, 1,942 ms | 1,076, 1,305 / 1,041, 1,082 / 1,270, 1,531 ms |
+| admission queue seen / waiting, two-group 50K | 3 / 47,866 | 49,810 / 49,810 |
+| two-group wake, heartbeat on | 15.7 ms | 0 ms |
+| resident hand-over, heartbeat on | 31 ms | 0.8 ms |
+| worst stall, global / two-group, 50K | 7-9 / 6-9 ms | 25-34 / 26-36 ms |
+| peak heap, global 50K | 166-171 MB | 219-228 MB |
+
+`benchmark:quick` is within the bands in both run orders; the one move past 10%
+(-12.8% on the 50K stress scenario) was +1.2% with the order reversed.
+
+**Two costs, recorded as follow-ups in `TODO_CHECKLIST.md`:**
+- the worst stall, from moving up to 1,000 refused arrivals per dispatch pass;
+- the heap, a `Set` entry per waiter (risk 9).
+
+**Found on the way:** a pool's first worker becoming ready dispatches nothing,
+so arrivals during its creation wait for the next settle or the heartbeat. R1
+does the same. It is in `TODO_CHECKLIST.md`.
 
 ## Risks
 

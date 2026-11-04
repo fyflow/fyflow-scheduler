@@ -138,6 +138,8 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Cancelling A Run', () => this.docCancelRun()));
     this.results.push(await this.runTest('Doc: The Forced Stop', () => this.docForcedStop()));
     this.results.push(await this.runTest('Doc: Cancelled Tasks In Events And Descendants', () => this.docCancelEvents()));
+    this.results.push(await this.runTest('Doc: Resident Admission Is Head-Of-Line For Arrivals', () => this.docResidentArrivalsQueue()));
+    this.results.push(await this.runTest('Doc: A Two-Group Waiter Migrates, And Every Waiter Is Listed', () => this.docTwoGroupMigrates()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -1707,6 +1709,75 @@ class DocsTestSuite {
     await scheduler.cancel(holder.id);
     await this.waitFor(() => completed > 0, 2000, 'scheduler.completed');
     if (scheduler.stats.done !== 0 || scheduler.stats.cancelled !== 2) throw new Error(`Stats: ${JSON.stringify(scheduler.stats)}`);
+  }
+
+  // AGENTS.md section 4 (resident groups): a task that would need a new worker
+  // queues behind a waiting expensive pool even when its own cost fits
+  private async docResidentArrivalsQueue(): Promise<void> {
+    const vram = new ConcurrentLimitGroup(3, 'vram');
+    const pool = (cost: number) => new WorkerManager(this.workerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true,
+      idleTimeout: 30, idleCheckIntervalMs: 10, residentGroups: { vram: cost }
+    });
+    const scheduler = new FyflowScheduler({ Small: pool(1), Big: pool(3), Cheap: pool(1) }, { vram });
+    this.schedulers.push(scheduler);
+    const task = (id: string, workerType: string, awaitMs: number) =>
+      new FyflowTask({ id, workerType, payload: { id, value: 1, awaitMs } });
+
+    const small = scheduler.addTask(task('small', 'Small', 80), { createPromise: true });
+    await this.waitFor(() => vram.running === 1, 2000, 'the small worker');
+    const big = scheduler.addTask(task('big', 'Big', 5), { createPromise: true });   // needs 3, 2 free
+    const cheap = scheduler.addTask(task('cheap', 'Cheap', 5), { createPromise: true }); // needs 1, and 1 would fit
+
+    const waiting = (scheduler.getAdmissionQueue('vram').vram ?? []).map(w => w.holderId);
+    if (waiting.join() !== 'big,cheap') throw new Error(`vram queue is [${waiting}], expected [big,cheap]`);
+    if (scheduler.tasks.get('cheap')?.state !== 'pending') throw new Error('cheap overtook the waiting big pool');
+
+    // The order workers are created in is the order the pools were admitted
+    const order: string[] = [];
+    scheduler.addEventListener('resource.acquired', (e: any) => {
+      if (e.detail.lifetime === 'resident') order.push(e.detail.workerType);
+    });
+    await Promise.all([small, big, cheap]);
+    if (order.join() !== 'Big,Cheap') throw new Error(`Workers created in order [${order}], expected [Big,Cheap]`);
+  }
+
+  // AGENTS.md section 6: a task waiting on two groups is listed once, under the
+  // group it is short of, and moves to the other group's queue with 'migrated'
+  // when the first frees - woken by the release, not the heartbeat
+  private async docTwoGroupMigrates(): Promise<void> {
+    const scheduler = this.makeScheduler({ maxThreads: 1, maxConcurrentTasks: 8 },
+      { A: new ConcurrentLimitGroup(1), B: new ConcurrentLimitGroup(1) },
+      { periodicRetryIntervalMs: 1_000_000_000 });
+    const moves: string[] = [];
+    scheduler.addEventListener('resource.unblocked', (e: any) => {
+      if (e.detail.holderId === 'both') moves.push(`${e.detail.groupId}:${e.detail.reason}`);
+    });
+    const task = (id: string, groups: string[], awaitMs: number) => new FyflowTask({
+      id, workerType: 'DocsWorker', workerGroups: groups, payload: { id, value: 1, awaitMs }
+    });
+    // Warm the worker first: arrivals while the first worker is still being
+    // created wait for it in the ready queue, not in a blocked queue
+    await scheduler.addTask(task('warm', [], 1), { createPromise: true });
+
+    const all = [
+      scheduler.addTask(task('holdA', ['A'], 40), { createPromise: true }),
+      scheduler.addTask(task('holdB', ['B'], 120), { createPromise: true }),
+      scheduler.addTask(task('both', ['A', 'B'], 5), { createPromise: true }),
+      scheduler.addTask(task('onlyA', ['A'], 5), { createPromise: true })
+    ];
+    const listed = () => {
+      const queue = scheduler.getAdmissionQueue();
+      return `A=[${(queue.A ?? []).map(w => w.holderId)}] B=[${(queue.B ?? []).map(w => w.holderId)}]`;
+    };
+    await this.waitFor(() => listed() === 'A=[both,onlyA] B=[]', 1000, `both waiters listed under A (${listed()})`);
+
+    // holdA finishes: 'both' still needs B, so it moves there; 'onlyA' runs
+    await this.waitFor(() => scheduler.tasks.get('onlyA')?.state !== 'pending', 1000, 'onlyA to be admitted');
+    if (listed() !== 'A=[] B=[both]') throw new Error(`After A freed: ${listed()}`);
+
+    await Promise.all(all);
+    if (moves.join() !== 'A:migrated,B:admitted') throw new Error(`Moves of 'both': ${moves}`);
   }
 
   /** An HTTP server that takes requests and never answers them. */

@@ -643,8 +643,6 @@ class CrossPlatformTestSuite {
     await scheduler.shutdown();
   }
 
-  // Blocked tasks are released by the periodic retry, so a custom interval must
-  // still drain them - this is the only thing the option controls
   // TaskQueue replaces the arrays behind the ready and blocked queues. Checked
   // against a plain array as the model, with a long, seeded mix of operations
   // that crosses its compaction threshold many times.
@@ -737,10 +735,9 @@ class CrossPlatformTestSuite {
         payload: { taskId: i, countConcurrency: true }
       }));
       // One addTask() each, as an application streaming work in would: each
-      // runs the dispatch loop, which moves one more task into the blocked
-      // queue. A single addTasks() batch never builds it up. Sampled straight
-      // after, before anything settles: the first release moves the whole
-      // blocked queue back to the ready queue.
+      // runs the dispatch loop, which moves the new task into the blocked
+      // queue. Sampled straight after, before anything settles, so the queue
+      // is at its deepest.
       const promises = tasks.map(t => scheduler.addTask(t, { createPromise: true }) as Promise<any>);
       const peakBlocked = scheduler.getAdmissionQueue('g').g?.length ?? 0;
 
@@ -776,6 +773,10 @@ class CrossPlatformTestSuite {
     await runAtScale('group', 3, new ConcurrentLimitGroup(3));
   }
 
+  // A custom heartbeat interval must not stop blocked tasks draining. Releases
+  // wake their waiters directly, so this no longer depends on the heartbeat;
+  // what only the heartbeat serves - rate windows, raised limits - is covered
+  // in the admission suite, with the heartbeat on and off.
   private async testPeriodicRetryInterval(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
     const workerManager = new WorkerManager(this.testInlineWorkerUrl, {

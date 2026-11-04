@@ -982,11 +982,16 @@ class ResourceEventsTestSuite {
   /**
    * A 20-unit pool waiting on a 24-unit group held by 2-unit workers.
    *
-   * The cheap pools keep cycling - short idle timeout, work arriving - so units
-   * are released and retaken throughout, and every release runs
-   * `_retryBlockedTasksForGroup`. That is the loop where a task is shifted out
-   * of a blocked queue and unshifted back within one synchronous pass, which is
-   * exactly what criterion 4b exists to catch.
+   * Three phases, each a different way a release reaches the queue:
+   *
+   * 1. Churn on warm Small workers. They are already held, so these tasks cost
+   *    nothing extra and run past the head without being admission at all.
+   * 2. An idle gap. The Smalls are reaped, every release wakes the queue, and
+   *    each wake must stop at the head: 18 units free, the head needs 20, and
+   *    the cheap waiter behind it - which fits - must not overtake.
+   * 3. Arrivals that need a new Small worker. They fit too, and must queue
+   *    behind the head rather than past it. Not awaited: they cannot run until
+   *    a Hold worker idles out, long after this returns.
    *
    * `observe` is called between dispatch passes; it receives the scheduler,
    * because a sampler that closed over a variable assigned after this returns
@@ -994,7 +999,7 @@ class ResourceEventsTestSuite {
    */
   private async runHeadOfLineScenario(
     observe: (scheduler: FyflowScheduler, seen: Recorded[]) => void
-  ): Promise<{ scheduler: FyflowScheduler; seen: Recorded[] }> {
+  ): Promise<{ scheduler: FyflowScheduler; seen: Recorded[]; arrivals: string[] }> {
     const vram = new ConcurrentLimitGroup(24, 'vram');
 
     const pools: Record<string, any> = {
@@ -1043,23 +1048,19 @@ class ResourceEventsTestSuite {
       freeWhileQueued = Math.max(freeWhileQueued, vram.limit - vram.running);
       observe(scheduler, seen);
     }, 10);
+    const arrivals = Array.from({ length: 9 }, (_, i) => `arrival-${i}`);
     try {
-      // Rounds of churn separated by idle gaps. The gaps matter: every settle
-      // calls _schedulePeriodicRetry, which CLEARS the pending timer and starts
-      // a new one, so a continuously busy scheduler resets the 50ms retry
-      // forever and `_retryBlockedTasksForGroup` is never reached at all. An
-      // earlier version of this scenario churned without pausing and passed
-      // while testing nothing.
-      for (let round = 1; round <= 3; round++) {
-        await Promise.all(
-          Array.from({ length: 9 }, (_, i) =>
-            scheduler.addTask(this.task(`churn-${round}-${i}`, `Small${i}`), { createPromise: true })
-          )
-        );
-        // Longer than idleTimeout + idleCheckIntervalMs and than the retry
-        // interval, so workers are reaped AND the retry actually fires
-        await new Promise(resolve => setTimeout(resolve, 150));
-      }
+      // 1. Warm churn
+      await Promise.all(
+        Array.from({ length: 9 }, (_, i) =>
+          scheduler.addTask(this.task(`churn-${i}`, `Small${i}`), { createPromise: true })
+        )
+      );
+      // 2. Longer than idleTimeout + idleCheckIntervalMs, so the Smalls are reaped
+      await new Promise(resolve => setTimeout(resolve, 150));
+      // 3. Arrivals needing a worker, which must queue behind the head
+      arrivals.forEach((id, i) => scheduler.addTask(this.task(id, `Small${i}`)));
+      await new Promise(resolve => setTimeout(resolve, 100));
     } finally {
       clearInterval(timer);
     }
@@ -1072,7 +1073,7 @@ class ResourceEventsTestSuite {
       );
     }
 
-    return { scheduler, seen };
+    return { scheduler, seen, arrivals };
   }
 
   /**
@@ -1084,7 +1085,7 @@ class ResourceEventsTestSuite {
     let sawSomeoneBehind = false;
     const problems: string[] = [];
 
-    const { scheduler } = await this.runHeadOfLineScenario(sched => {
+    const { scheduler, arrivals } = await this.runHeadOfLineScenario(sched => {
       const queue = sched.getAdmissionQueue('vram').vram;
       if (!queue || queue.length === 0) return;
 
@@ -1124,6 +1125,17 @@ class ResourceEventsTestSuite {
         `The cheap waiter reached "${cheap?.state}" - it overtook the 20-unit head, ` +
         `which is how an expensive pool starves forever`
       );
+    }
+    // Arrivals too: each fits, and each would have overtaken before arrival
+    // admission was head-of-line
+    const overtook = arrivals.filter(id => scheduler.tasks.get(id)?.state !== 'pending');
+    if (overtook.length > 0) {
+      throw new Error(`Arrivals overtook the head: ${overtook.join(', ')}`);
+    }
+    const order = scheduler.getAdmissionQueue('vram').vram.map(w => w.holderId);
+    const expected = ['big-1', 'cheap-behind', ...arrivals];
+    if (order.join(',') !== expected.join(',')) {
+      throw new Error(`Queue is [${order}], expected [${expected}] - arrivals belong behind, in arrival order`);
     }
   }
 

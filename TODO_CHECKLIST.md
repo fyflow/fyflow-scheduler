@@ -30,8 +30,8 @@ reword the docs, and add a mutation-checked docs test.
 Phase A of `doc/design/keyed-concurrent-limit.md`: a concurrency limit counted
 per key, with an optional `limitFor(key)`, immediate key eviction and per-key
 `level` gauges. One key per task. Multi-key is phase B, accepted but deferred.
-It is blocked on R1 and R2 of the admission rework below, and is gated on its
-`admission` benchmark.
+It builds on R1 and R2 of the admission rework below (done on the
+`admission-rework` branch), and is gated on its `admission` benchmark.
 
 **Status**: 🔵 Not Started
 
@@ -57,15 +57,25 @@ The baseline at `0adeefb`:
 **R1 is done**: empty blocked queues are deleted, keyed waiters are found through
 an index, and the heartbeat is O(groups with waiters).
 
+**R2 is done** (branch `admission-rework`, not merged): every waiter is in
+exactly one queue, admitted from the head on wake one at a time, and migrated
+(`unblocked.reason: 'migrated'`) to the group it is short of. Resident releases
+wake their queue, and arrivals are head-of-line behind resident waiters (risk 14).
+- Keyed, 50K tasks over 10 keys: 445.8 s → 1.2 s; `canRun` per task 4,892 → 5,
+  `resource.blocked` per task 1,630 → 1.
+- Two-group wake 15.7 ms → 0 ms, resident hand-over 31 ms → 0.8 ms (heartbeat on).
+- The admission queue lists every waiter (49,810 of 49,810 in the two-group run).
+- `benchmark:quick` within the bands in both run orders.
+- Costs: the worst event-loop stall at 50K is 25-36 ms against 6-9 ms (the
+  dispatch loop now moves up to 1,000 refused arrivals into lists per pass), and
+  global peak heap is up ~30% (a `Set` entry per waiter, risk 9).
+
 Next:
-- R2: one wait list per task, admit on wake, migration. Decide risk 14
-  (resident head-of-line on arrival) first;
+- a release, with notes, before R3 (risk 12): `migrated`, arrivals queueing,
+  complete admission queues, `superseded` no longer emitted;
 - R3: optional, time-based wakes.
 
-It closes the herd known issue below, and supersedes "Empty blocked queues are
-never deleted".
-
-**Status**: 🟡 In Progress (R0 done)
+**Status**: 🟡 In Progress (R0, R1, R2 done)
 
 #### 🔵 Units with identities (scheduler pass 2 #2, P3)
 `doc/design/unit-grants.md`. Design only, to be built after the keyed group. It
@@ -152,29 +162,28 @@ instead, with a docs test; change the docs tests that count from events.
 
 **Status**: 🔵 Not Started
 
-#### 🔵 One release moves a whole blocked queue back to the ready queue
-`_retryBlockedTasksForGroup` loops `while (blockedTasks.length > 0 &&
-group.canRun(key))`, but nothing is acquired until dispatch, so `canRun()` stays
-true and the first release moves every waiter back - 2,997 tasks for one free
-slot. The dispatch loop then blocks one of them again and stops. No task is
-lost or reordered, but the blocked queue stops describing who is waiting
-(`getAdmissionQueue()` and `resource.blocked`/`unblocked` with it), and it may be
-why a group-limited run is so much slower: 50K tasks at ~1,900 tasks/s under a
-limit-7 group, against ~114,000 pool-only. Not yet investigated; the throughput
-link is unconfirmed.
+#### 🔵 A pool's first worker becoming ready dispatches nothing
+Found during admission R2. Tasks that arrive while a pool's first worker is
+still being created wait in the ready queue, and the worker becoming ready does
+not run the dispatch loop: they start on the next settle, or the heartbeat. With
+`maxThreads: 1, maxConcurrentTasks: 8`, the second task waited out the whole
+first task (40 ms) with the heartbeat off; R1 behaves the same. A wake on
+worker-ready would close it. It needs a heartbeat-off test, like the admission
+suite's wake tests.
 
-Measured 2026-11-03 (`doc/design/admission-rework.md`): for a global group the
-moved queue is only 1-2 tasks, because the dispatch loop breaks on a non-keyed
-block, so the cost is linear (178K tasks/s at limit 7). For keyed groups it is
-quadratic: whole per-key queues are moved and re-blocked on every wake.
-Planned in R2 of that document.
+**Status**: 🔵 Not Started
 
-Still there after #1 (2026-10-14): 300 tasks of 30 ms on a 50-slot pool behind a
-`ConcurrentLimitGroup(1)` - mid-run, `getAdmissionQueue('g')` listed 1-2
-waiters while `stats.queued` was 258. A consumer building an admission view
-from `resource.blocked`/`unblocked` - the 0.3.0 resource events, which a
-downstream library folds - sees one or two tasks waiting on a group that 258
-are waiting for.
+#### 🔵 Admission follow-ups from R2
+- The wake pump's re-entrancy guard (`waking`) is not caught by any test:
+  removing it fails nothing, because no path found nests a wake (settles arrive
+  asynchronously, and cancelling a waiter releases nothing). Defensive - keep it,
+  and test it if a synchronous release path appears.
+- A resident waiter whose task-held group is full keeps its place at the head and
+  is retried by the heartbeat, deliberately (risk 6). Only that combination waits
+  for the tick.
+- The 50K stall and heap costs above. A smaller per-pass cap on moving refused
+  arrivals would bound the stall, and membership on the task (`_blockedQueueId`)
+  could replace the per-queue `Set`.
 
 **Status**: 🔵 Not Started
 

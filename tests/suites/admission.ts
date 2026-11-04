@@ -46,7 +46,6 @@ const NEVER_MS = 400;
 
 const NEVER_STARTED = 'never started';
 
-const R2 = 'doc/design/admission-rework.md R2';
 const R3 = 'doc/design/admission-rework.md R3';
 
 class AdmissionTestSuite {
@@ -140,18 +139,8 @@ class AdmissionTestSuite {
     await this.run('Wake: A Task Release Admits The Next Waiter (threaded)', () => this.testWakeOnRelease(true));
     await this.run('Wake: A Keyed Release Admits That Key\'s Waiter', () => this.testWakeOnKeyedRelease());
     await this.run('Wake: Cancelling A Holder Admits The Next Waiter', () => this.testWakeOnCancel());
-    await this.run('Wake: The Second Group\'s Release Admits A Two-Group Waiter', () => this.testWakeTwoGroups(), {
-      knownGap: {
-        reason: `a two-group waiter sits in its first group's queue, which the second group's release does not retry - ${R2} (migration)`,
-        failsWith: NEVER_STARTED
-      }
-    });
-    await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF), {
-      knownGap: {
-        reason: `resident admission is heartbeat-only (AGENTS.md §6) - ${R2} wakes it on release`,
-        failsWith: NEVER_STARTED
-      }
-    });
+    await this.run('Wake: The Second Group\'s Release Admits A Two-Group Waiter', () => this.testWakeTwoGroups());
+    await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF));
     await this.run('Wake: A Rate Window Rolling Over Admits Without Polling', () => this.testWakeOnRateWindow(HEARTBEAT_OFF), {
       knownGap: {
         reason: `rate windows are heartbeat-only (AGENTS.md §6) - ${R3} wakes at resetAt`,
@@ -170,20 +159,14 @@ class AdmissionTestSuite {
     await this.run('Cancelling The Last Waiter Deletes Its Queue', () => this.testCancelDeletesQueue());
 
     // Targets and guards on what admission costs
-    await this.run('Admission Queue Lists Every Waiter', () => this.testAdmissionQueueComplete(), {
-      knownGap: {
-        reason: `only the head of the ready queue enters the blocked queue; the rest stay in the ready queue - ${R2}`,
-        failsWith: 'admission queue lists'
-      }
-    });
+    await this.run('Admission Queue Lists Every Waiter', () => this.testAdmissionQueueComplete());
     await this.run('Global Group Admission Cost Is Flat', () => this.testCostFlat('global'));
-    await this.run('Keyed Admission Cost Is Flat In Queue Depth', () => this.testCostFlat('keyed'), {
-      knownGap: {
-        reason: `a release moves a key's whole queue back to the ready queue, and it is re-blocked - ${R2}`,
-        failsWith: 'grows with queue depth'
-      }
-    });
+    await this.run('Keyed Admission Cost Is Flat In Queue Depth', () => this.testCostFlat('keyed'));
     await this.run('Two-Group Admission Cost Is Flat', () => this.testCostFlat('two-group'));
+    await this.run('A Full Pool Takes Only What A Release Freed', () => this.testFullPoolTakesOne());
+    await this.run('Wake: A Task-Held Waiter Short Of A Worker Moves To The Resident Queue', () => this.testShortOfWorkerMoves());
+    await this.run('A Resident Head Whose Own Group Is Full Keeps Its Place', () => this.testResidentHeadKeepsPlace());
+    await this.run('Cancel During A Migration Leaves No Waiter Behind', () => this.testCancelDuringMigration());
 
     // Guards
     await this.run('Limits And Fold Invariants Hold Under Mixed Contention', () => this.testMixedContention());
@@ -281,6 +264,13 @@ class AdmissionTestSuite {
     ));
     const freed = this.when(s, 'task.completed', d => d?.id === 'holdB');
     const start = this.started(s, 'both');
+    const moves: string[] = [];
+    for (const type of ['resource.blocked', 'resource.unblocked']) {
+      s.addEventListener(type, (e: Event) => {
+        const d = (e as CustomEvent).detail;
+        if (d?.holderId === 'both') moves.push(`${type.slice(9)}:${d.groupId}${d.reason ? ':' + d.reason : ''}`);
+      });
+    }
     const done = Promise.all([
       s.addTask(this.task('holdA', { workerGroups: ['A'] }, 40), { createPromise: true }),
       s.addTask(this.task('holdB', { workerGroups: ['B'] }, 80), { createPromise: true }),
@@ -289,6 +279,156 @@ class AdmissionTestSuite {
     const startedAt = await this.startsWithin(start, 'both');
     this.assertPrompt('both', await freed, startedAt);
     await done;
+    // A's release cannot admit it, so it must move to B's queue as one move -
+    // not be announced admitted and then blocked again. The entry is announced
+    // before the exit (see _migrate).
+    const expected = ['blocked:A', 'blocked:B', 'unblocked:A:migrated', 'unblocked:B:admitted'];
+    if (moves.join(' ') !== expected.join(' ')) {
+      throw new Error(`Moves were [${moves.join(', ')}], expected [${expected.join(', ')}]`);
+    }
+  }
+
+  /**
+   * Cancelled by the listener of its own `migrated` exit. It has already been
+   * pushed onto the target queue, so the cancel must find it there - through
+   * `_blockedQueueId`, which must be set before the event - and no `blocked`
+   * may follow for the queue it has left.
+   */
+  private async testCancelDuringMigration() {
+    const A = new ConcurrentLimitGroup(1, 'A');
+    const B = new ConcurrentLimitGroup(1, 'B');
+    const s = this.track(new FyflowScheduler(
+      { W: this.pool() }, { A, B }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const net = new Map<string, number>();
+    for (const type of ['resource.blocked', 'resource.unblocked']) {
+      s.addEventListener(type, (e: Event) => {
+        const d = (e as CustomEvent).detail;
+        const k = `${d.groupId}/${d.holderId}`;
+        net.set(k, (net.get(k) ?? 0) + (type === 'resource.blocked' ? 1 : -1));
+        if (d.reason === 'migrated' && d.holderId === 'both') s.cancel('both');
+      });
+    }
+    const holders = [
+      s.addTask(this.task('holdA', { workerGroups: ['A'] }, 30), { createPromise: true }),
+      s.addTask(this.task('holdB', { workerGroups: ['B'] }, 80), { createPromise: true })
+    ];
+    const both = s.addTask(this.task('both', { workerGroups: ['A', 'B'] }, 5), { createPromise: true }) as Promise<any>;
+    const settled = both.then(() => 'resolved', () => 'rejected');
+    await Promise.all(holders);
+    if (await settled !== 'rejected') throw new Error('The cancelled task did not reject');
+    if (s.tasks.get('both')?.state !== 'cancelled') throw new Error(`both is ${s.tasks.get('both')?.state}`);
+    const left = Object.values(s.getAdmissionQueue()).flat().map(w => w.holderId);
+    if (left.length > 0) throw new Error(`Still queued after the cancel: ${left}`);
+    if (s.blockedQueues.size !== 0) throw new Error(`${s.blockedQueues.size} blocked queue(s) left`);
+    const unbalanced = [...net].filter(([, n]) => n !== 0);
+    if (unbalanced.length > 0) throw new Error(`Membership unbalanced: ${unbalanced.map(([k, n]) => `${k}=${n}`)}`);
+    if (!net.has('B/both')) throw new Error("both never reached B's queue - the migration did not happen");
+  }
+
+  /**
+   * A waiter in a task-held queue whose pool would need a worker that does not
+   * fit. It moves to the resident group's queue, so the task-held release
+   * still admits the waiter behind it, and the worker's release admits it.
+   * Stopping the task-held queue at it instead left both for the heartbeat.
+   */
+  private async testShortOfWorkerMoves() {
+    const gpu = new ConcurrentLimitGroup(1, 'gpu');
+    const G = new ConcurrentLimitGroup(1, 'G');
+    const resident = () => this.pool({
+      maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 60, idleCheckIntervalMs: 10
+    });
+    const s = this.track(new FyflowScheduler(
+      { P: resident(), Q: resident(), R: this.pool() }, { gpu, G }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    // P's worker holds the gpu until it idles out; h holds G for 30ms
+    await s.addTask(this.task('p', { workerType: 'P' }, 1), { createPromise: true });
+    const freedG = this.when(s, 'task.completed', d => d?.id === 'h');
+    const freedGpu = this.when(s, 'resource.released', d => d?.lifetime === 'resident' && d?.workerType === 'P');
+    const startQ = this.started(s, 'q');
+    const startR = this.started(s, 'r');
+    const done = Promise.all([
+      s.addTask(this.task('h', { workerType: 'R', workerGroups: ['G'] }, 30), { createPromise: true }),
+      s.addTask(this.task('q', { workerType: 'Q', workerGroups: ['G'] }, 1), { createPromise: true }),
+      s.addTask(this.task('r', { workerType: 'R', workerGroups: ['G'] }, 1), { createPromise: true })
+    ]);
+    // r needs no worker: G's release must reach it past q
+    this.assertPrompt('r', await freedG, await this.startsWithin(startR, 'r'));
+    const queued = s.getAdmissionQueue('gpu').gpu?.map(w => `${w.holderId}:${w.lifetime}`) ?? [];
+    if (queued.join() !== 'q:resident') throw new Error(`gpu queue is [${queued}], expected [q:resident]`);
+    this.assertPrompt('q', await freedGpu, await this.startsWithin(startQ, 'q', NEVER_MS + 100));
+    await done;
+  }
+
+  /**
+   * A resident head whose task-held group is full when its units free up. It
+   * keeps its place rather than moving to that group's queue, or the cheap pool
+   * behind it takes the units, and it no longer fits once its group frees - the
+   * starvation head-of-line exists to prevent.
+   */
+  private async testResidentHeadKeepsPlace() {
+    const gpu = new ConcurrentLimitGroup(2, 'gpu');
+    const G = new ConcurrentLimitGroup(1, 'G');
+    const s = this.track(new FyflowScheduler({
+      Hold: this.pool({ maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 30, idleCheckIntervalMs: 10 }),
+      Big: this.pool({ maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 2 }, idleTimeout: 30, idleCheckIntervalMs: 10 }),
+      Cheap: this.pool({ maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 30, idleCheckIntervalMs: 10 }),
+      R: this.pool()
+    }, { gpu, G }, { periodicRetryIntervalMs: 50 }));
+
+    await s.addTask(this.task('hold', { workerType: 'Hold' }, 1), { createPromise: true });
+    const order: string[] = [];
+    s.addEventListener('task.running', (e: any) => order.push(e.detail.id));
+    // big first, while G is free, so it waits on gpu (2 needed, 1 free). Then h
+    // takes G, past the Hold worker idling out. Then cheap, which fits on gpu
+    // and queues behind big.
+    const done = Promise.all([
+      s.addTask(this.task('big', { workerType: 'Big', workerGroups: ['G'] }, 1), { createPromise: true }),
+      s.addTask(this.task('h', { workerType: 'R', workerGroups: ['G'] }, 150), { createPromise: true }),
+      s.addTask(this.task('cheap', { workerType: 'Cheap' }, 1), { createPromise: true })
+    ]);
+    const before = s.getAdmissionQueue('gpu').gpu?.map(w => w.holderId) ?? [];
+    if (before.join() !== 'big,cheap') throw new Error(`Precondition: gpu queue is [${before}], expected [big,cheap]`);
+    // After Hold's release, with G still held: big fits on gpu, but not on G
+    await this.when(s, 'resource.released', d => d?.lifetime === 'resident' && d?.workerType === 'Hold');
+    await new Promise(r => setTimeout(r, 60));
+    const queued = s.getAdmissionQueue('gpu').gpu?.map(w => w.holderId) ?? [];
+    if (queued.join() !== 'big,cheap') {
+      throw new Error(`gpu queue is [${queued}] with G still held, expected [big,cheap] - big gave up its place`);
+    }
+    await done;
+    const ran = order.filter(id => id === 'big' || id === 'cheap');
+    if (ran.join() !== 'big,cheap') throw new Error(`Ran in order [${ran}], expected [big,cheap]`);
+  }
+
+  /**
+   * A release on one pool waking waiters of another pool that is full. The
+   * group has room for one; the pool for none. Exactly one waiter may leave the
+   * queue for that pool's ready queue - not all of them, which would empty the
+   * admission queue into a ready queue that re-blocks them one by one.
+   */
+  private async testFullPoolTakesOne() {
+    const g = new ConcurrentLimitGroup(1, 'g');
+    const s = this.track(new FyflowScheduler(
+      { P1: this.pool({ maxThreads: 1, maxConcurrentTasks: 1 }), P2: this.pool({ maxThreads: 1, maxConcurrentTasks: 1 }) },
+      { g }, { periodicRetryIntervalMs: HEARTBEAT_OFF }
+    ));
+    const held = s.addTask(this.task('holder', { workerType: 'P1', workerGroups: ['g'] }, 40), { createPromise: true });
+    const waiters = Array.from({ length: 5 }, (_, i) =>
+      s.addTask(this.task(`w${i}`, { workerType: 'P2', workerGroups: ['g'] }, 1), { createPromise: true })
+    );
+    // P2 had room, so the waiters blocked on g. Now fill P2 without g.
+    const filler = s.addTask(this.task('filler', { workerType: 'P2' }, 150), { createPromise: true });
+    await new Promise(r => setTimeout(r, 10));
+    const before = s.getAdmissionQueue('g').g?.length ?? 0;
+    if (before !== 5) throw new Error(`Precondition: ${before} waiters on g, expected 5`);
+    await held;
+    await new Promise(r => setTimeout(r, 0));
+    const after = s.getAdmissionQueue('g').g?.map(w => w.holderId) ?? [];
+    if (after.join(',') !== 'w1,w2,w3,w4') {
+      throw new Error(`After one release the queue is [${after}] - expected [w1,w2,w3,w4]: one slot was freed, one waiter may go`);
+    }
+    await Promise.all([filler, ...waiters]);
   }
 
   /** Two pools sharing a limit-1 resident group: Q's worker can exist only once P's is torn down. */
@@ -411,7 +551,7 @@ class AdmissionTestSuite {
     await new Promise(r => setTimeout(r, 10));
     if (s.blockedQueues.size !== 1) throw new Error(`Precondition: ${s.blockedQueues.size} blocked queues`);
     await s.cancel('waiter');
-    if (s.blockedQueues.size !== 0) throw new Error('The emptied queue survived its last waiter being cancelled');
+    if ((s.blockedQueues.size as number) !== 0) throw new Error('The emptied queue survived its last waiter being cancelled');
     await held;
   }
 

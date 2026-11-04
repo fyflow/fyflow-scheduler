@@ -304,7 +304,7 @@ worker wrappers the pool manages for you - you should not construct them.
 | `workerPools` | `Record<string, WorkerManager>` | Keys are the `workerType` values tasks refer to |
 | `resourceGroups` | `Record<string, ResourceGroup>` | Keys are the group ids used in `groups` / `workerGroups` |
 | `options.maxCompletedTasks` | `number` | Cap on retained terminal tasks. Default: unlimited |
-| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks. Default `50` |
+| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks that no release can wake (rate windows, raised limits). Default `50` |
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -454,13 +454,20 @@ new WorkerManager(url, { residentGroups: ['vram'] })
 
 A worker is not created while its cost does not fit, and tasks needing one wait
 until a holder is torn down — which happens on the normal idle-timeout path, so
-a pool with work arriving keeps its worker and its loaded model. Admission is
-head-of-line: a waiting expensive pool is not overtaken by cheaper ones.
+a pool with work arriving keeps its worker and its loaded model.
+
+Admission is **head-of-line**: a waiting expensive pool is not overtaken by
+cheaper ones. That holds for new arrivals too - a task that would need a new
+worker queues behind anyone already waiting on one of that pool's resident
+groups, **even when its own cost fits**. Without that, a steady stream of cheap
+arrivals keeps an expensive waiter out forever. A task for a pool whose worker
+already exists costs nothing extra and is not affected.
 
 Costs must be positive integers and no larger than the group's limit; both are
 rejected at construction, as is an unknown group id. Because the release is
 driven by the idle sweep, hand-over takes up to `idleTimeout + idleCheckIntervalMs`
-— lower `idleCheckIntervalMs` if that matters.
+— lower `idleCheckIntervalMs` if that matters. The release itself wakes the
+waiting pool straight away; it does not wait for the heartbeat.
 
 ##### `idleTimeout: 0` deadlocks a *contended* resident group
 
@@ -842,18 +849,21 @@ resident acquire twice and see conservation drift by exactly the resident share.
 > the task spread flat, so `workerType` *looks* like the task's own field and is
 > not.
 
-**A blocked task leaves its queue five ways**, and `unblocked.reason` says which:
+A blocked task is in **exactly one** queue at a time: the queue of the group
+it is short of. **It leaves that queue six ways**, and `unblocked.reason` says
+which:
 
 | `reason` | What happened |
 |---|---|
-| `admitted` | Moved to the ready queue — the ordinary exit |
-| `superseded` | Admitted via a *different* group and spliced out of this one |
+| `admitted` | Every group it needs has room for it. It is dispatched straight away, or, if its pool has no free slot, waits in the ready queue for one. The ordinary exit |
+| `migrated` | This group freed up, but another group it needs is still full. It moves to the **tail** of that group's queue. The `resource.blocked` for the new queue comes **before** this event, so a fold never sees the task in no queue |
+| `superseded` | No longer emitted: it came from a task listed in two queues at once, which cannot happen any more. Kept in the type so code that names it still compiles |
 | `orphaned` | Its worker pool no longer exists. The task is **failed terminally** — `task.failed`, then `user_action` unless it is optional, and its promise rejects. Retries are skipped: the pool is gone |
 | `shutdown` | The scheduler tore down and discarded every remaining waiter |
 | `cancelled` | It was cancelled while it waited (§5) |
 
-**Do not switch exhaustively on `reason`.** `cancelled` was added after the
-first four, and the union may grow again - the same rule as for `groupType`.
+**Do not switch exhaustively on `reason`.** `cancelled` and `migrated` were
+added later, and the union may grow again - the same rule as for `groupType`.
 Treat a reason you do not recognise as an exit.
 
 Two invariants worth folding against, because a fold can stay internally
@@ -876,7 +886,7 @@ interface AdmissionWaiter {
   workerType: string;                    // its pool
   lifetime:   'task-held' | 'resident';  // what it is waiting to acquire
   cost:       number;                    // the pool's per-worker cost, or 1 for task-held
-  position:   number;                    // 0-based; 0 is the head, and the head gates the rest
+  position:   number;                    // 0-based; 0 is the head, and it is admitted first
   key?:       string;                    // the bucket, for keyed groups
 }
 ```
@@ -884,6 +894,10 @@ interface AdmissionWaiter {
 Keyed by **group id**, with the bucket on the waiter. A keyed group has one
 sub-queue per key; they are concatenated in key order, each numbered from 0. A
 group with an empty queue is absent rather than present-and-empty.
+
+It lists **every** waiter. A task is admitted from the head when the group frees
+up, one at a time, until the group has no more room. A task waiting on two groups
+is listed once, under the group it is short of right now.
 
 `cost` is what makes a stall legible: a 20-unit waiter at position 0 is the
 entire reason four 2-unit pools are not starting, because head-of-line admission
@@ -899,13 +913,23 @@ a fold.
 
 Two mechanisms, and knowing which applies explains the latency you see:
 
-- **Directly**, when a slot frees. Releasing a task-held group retries that
-  group's queue in the same turn, so a task waiting on a concurrency limit
-  starts as soon as one finishes.
+- **Directly**, when capacity frees. Releasing a task-held group admits from
+  that group's queue in the same turn, so a task waiting on a concurrency limit
+  starts as soon as one finishes. A worker torn down wakes its resident groups'
+  queues the same way, a microtask later. A task waiting on two groups waits in
+  the queue of the one it is short of, so whichever release it needs is the one
+  that wakes it.
 - **On the heartbeat**, every `periodicRetryIntervalMs` (default 50ms), for
-  everything with no such signal — a **rate-limit window** rolling over, and
-  **resident admission**, neither of which raises an event when it becomes
-  satisfiable.
+  everything with no such signal: a **rate-limit window** rolling over, and a
+  group whose limit you **raised** by hand. Neither raises an event when it
+  becomes satisfiable. Also one deliberate case: a pool at the head of a
+  resident queue whose task-held group is full when its units free up. It
+  keeps its place, so the pools behind it cannot take those units, and is
+  retried by the heartbeat.
+
+A release admits only what it freed. One finished task admits one waiter, and a
+weighted release admits as many as now fit. The cost of a release does not
+depend on how many tasks are waiting.
 
 The heartbeat runs on a fixed interval while work exists. It used to be
 restarted on every settle, which made it a debounce: a scheduler completing

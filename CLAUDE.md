@@ -116,7 +116,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Ten suites, 234 tests, all in the default `deno task test` run:
+Ten suites, 240 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -128,8 +128,8 @@ Ten suites, 234 tests, all in the default `deno task test` run:
 | resource-events | 25 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
 | cancellation | 33 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
-| docs | 41 | **executes every snippet in README.md and AGENTS.md** |
-| admission | 19 | wake paths with the heartbeat off, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention; 5 known gaps |
+| docs | 43 | **executes every snippet in README.md and AGENTS.md** |
+| admission | 23 | wake paths with the heartbeat off, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention; 1 known gap (R3) |
 
 `deno task test:scripts` is separate and not included in `deno task test`. It
 unit-tests `scripts/` and the known-gap rules in `tests/harness.ts`.
