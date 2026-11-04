@@ -2071,6 +2071,16 @@ export class FyflowTask {
         };
         this._addInternalListener(pool, 'task.started', taskStartedListener);
 
+        // A worker becoming ready frees its slots without anything settling.
+        // Tasks that arrived during its start-up saw it as full, and no room
+        // for another worker, so they wait in the ready queue: without this
+        // they start at the next settle or the heartbeat. A microtask, because
+        // the worker clears `initializing` after it emits this.
+        const workerReadyListener = () => {
+          queueMicrotask(() => { if (!this.shutDown) this._dispatchLoop(); });
+        };
+        this._addInternalListener(pool, 'worker.initialization.completed', workerReadyListener);
+
         // Handle progress updates from workers
         const taskProgressListener = (e: any) => {
           const task = this.tasks.get(e.detail.taskId);

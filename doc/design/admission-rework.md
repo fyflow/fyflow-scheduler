@@ -394,7 +394,8 @@ heartbeat timing was classified as either a contract (promised in
 
 **Found on the way:** a pool's first worker becoming ready dispatches nothing,
 so arrivals during its creation wait for the next settle or the heartbeat. R1
-does the same. It is in `TODO_CHECKLIST.md`.
+does the same. Fixed after R2: the scheduler dispatches on
+`worker.initialization.completed`.
 
 ## Risks
 

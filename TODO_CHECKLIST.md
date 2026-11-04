@@ -162,17 +162,6 @@ instead, with a docs test; change the docs tests that count from events.
 
 **Status**: 🔵 Not Started
 
-#### 🔵 A pool's first worker becoming ready dispatches nothing
-Found during admission R2. Tasks that arrive while a pool's first worker is
-still being created wait in the ready queue, and the worker becoming ready does
-not run the dispatch loop: they start on the next settle, or the heartbeat. With
-`maxThreads: 1, maxConcurrentTasks: 8`, the second task waited out the whole
-first task (40 ms) with the heartbeat off; R1 behaves the same. A wake on
-worker-ready would close it. It needs a heartbeat-off test, like the admission
-suite's wake tests.
-
-**Status**: 🔵 Not Started
-
 #### 🔵 Admission follow-ups from R2
 - The wake pump's re-entrancy guard (`waking`) is not caught by any test:
   removing it fails nothing, because no path found nests a wake (settles arrive
@@ -410,6 +399,7 @@ another day does not.
 The following tasks have been completed and verified:
 
 ### ✅ Recently Completed (2026)
+- **A worker becoming ready now dispatches** - tasks that arrived while a pool's only worker was starting found no free slot and no room for another worker, and the worker becoming ready ran no dispatch, so they waited for the next settle or the heartbeat: with `maxThreads: 1, maxConcurrentTasks: 8` the second task waited out the whole first task. Inline pools did the same. The scheduler now runs its dispatch loop a microtask after `worker.initialization.completed`. Two heartbeat-off tests in the admission suite (threaded and inline), both failing without the fix. Found during admission R2; R1 and earlier behaved the same.
 - **A browser performance spec no longer asserts a timing order** - "should measure Web Worker vs inline performance" required the Web Worker run to be the slower one, a race that failed once on WebKit in a full run. The overhead is now reported as a test annotation, and the spec shuts its two schedulers down, which it never did.
 - **Cancel a task, queued or running (fyflow-app #1)** - `scheduler.cancel()` reaches all seven places a task can be: waiting tasks are removed at once, running ones see `context.signal`, and a threaded worker that ignores it is retired after `cancelGraceMs` (default 2000) - detached before teardown, co-tenants requeued, settled `forced` only once the thread is dead, not counted as a restart. Cancel wins over any late outcome; `task.cancelling` then `task.cancelled`, with resources released at the second. Built in four stages with 33 tests in a new `cancellation` suite, 4 docs tests and a three-engine browser spec; 49 mutations checked. Cancelling 50,000 tasks takes 30-40 ms. Found and fixed on the way: `scheduler.completed` never fired for a run with no successes; a threaded `run()` returning `null` or `undefined` crashed the host; "is any task blocked?" walked every blocked queue (1.8 s to cancel 50,000 tasks over 5,000 keys, now 29 ms via a live count kept by `TaskQueue`). Benchmark against `main`: 50K +0.5%, 100K -5.1% (inside the band), threaded within ±3%.
 - **A worker event channel (fyflow-app #2)** - asked for as `context.log()`; built as `emit(name, data)` on both worker contexts, delivered as `task.message` on the scheduler and `worker.message` on the pool, with logging as one convention on top. Nothing is sent while nobody listens; events are batched (20 ms, cap 100 per buffer), ordered per attempt, delivered before their attempt settles, and every drop is counted. `core/messageChannel.ts` holds the logic once for both worker scripts and `InlineWrapper`. New `messages` suite (19 tests) and a browser spec.

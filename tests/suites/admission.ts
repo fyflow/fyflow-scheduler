@@ -141,6 +141,8 @@ class AdmissionTestSuite {
     await this.run('Wake: Cancelling A Holder Admits The Next Waiter', () => this.testWakeOnCancel());
     await this.run('Wake: The Second Group\'s Release Admits A Two-Group Waiter', () => this.testWakeTwoGroups());
     await this.run('Wake: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(HEARTBEAT_OFF));
+    await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (threaded)', () => this.testWakeOnWorkerReady(true));
+    await this.run('Wake: A Worker Becoming Ready Admits Tasks That Arrived During Its Start-Up (inline)', () => this.testWakeOnWorkerReady(false));
     await this.run('Wake: A Rate Window Rolling Over Admits Without Polling', () => this.testWakeOnRateWindow(HEARTBEAT_OFF), {
       knownGap: {
         reason: `rate windows are heartbeat-only (AGENTS.md §6) - ${R3} wakes at resetAt`,
@@ -219,6 +221,33 @@ class AdmissionTestSuite {
     const startedAt = await this.startsWithin(start, 'waiter', threaded ? 5_000 : NEVER_MS);
     this.assertPrompt('waiter', await freed, startedAt);
     await done;
+  }
+
+  /**
+   * A task that arrives while the pool's only worker is starting finds no free
+   * slot and no room for another worker, so it waits in the ready queue. The
+   * worker becoming ready is what frees its slots: nothing settles, and with
+   * the heartbeat off nothing else would run the dispatch loop until the first
+   * task finished.
+   */
+  private async testWakeOnWorkerReady(threaded: boolean) {
+    const pool = this.pool({ maxThreads: 1, maxConcurrentTasks: 8, inline: !threaded });
+    const s = this.track(new FyflowScheduler({ W: pool }, {}, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const initStarted = this.when(pool, 'worker.initialization.started', () => true);
+    const firstStart = this.started(s, 'first');
+    const firstDone = this.when(s, 'task.completed', d => d?.id === 'first');
+    const first = s.addTask(this.task('first', {}, 200), { createPromise: true });
+    await initStarted;
+    const secondStart = this.started(s, 'second');
+    const second = s.addTask(this.task('second', {}, 5), { createPromise: true });
+    const startedAt = await this.startsWithin(secondStart, 'second', threaded ? 5_000 : NEVER_MS);
+    // A missed wake starts it when `first` settles, 200ms later
+    const done = await Promise.race([firstDone, Promise.resolve(Infinity)]);
+    if (done !== Infinity) {
+      throw new Error(`"second" waited for "first" to finish (started ${(startedAt - done).toFixed(1)}ms after it)`);
+    }
+    this.assertPrompt('second', await firstStart, startedAt);
+    await Promise.all([first, second]);
   }
 
   private async testWakeOnKeyedRelease() {
