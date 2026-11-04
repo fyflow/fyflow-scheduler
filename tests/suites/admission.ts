@@ -22,7 +22,7 @@
 // bundle split.
 
 import {
-  WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup
+  WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup
 } from '../../index.ts';
 import { runTest, type RunTestOptions, type TestResult } from '../harness.ts';
 import { KeyedCounterGroup, instrument } from '../fixtures/keyedCounterGroup.ts';
@@ -163,6 +163,11 @@ class AdmissionTestSuite {
     await this.run('Heartbeat: A Resident Release Admits A Waiting Pool', () => this.testWakeOnResidentRelease(50));
     await this.run('Heartbeat: A Rate Window Rolling Over Admits', () => this.testWakeOnRateWindow(50));
     await this.run('Heartbeat: Raising A Limit Admits Waiters', () => this.testRaisedLimit());
+    await this.run('Heartbeat: A Keyed Rate Window Rolling Over Admits Every Key', () => this.testKeyedRateHeartbeat());
+
+    // R1: blocked queues exist only while they hold a waiter
+    await this.run('Empty Blocked Queues Are Deleted', () => this.testQueuesDeleted());
+    await this.run('Cancelling The Last Waiter Deletes Its Queue', () => this.testCancelDeletesQueue());
 
     // Targets and guards on what admission costs
     await this.run('Admission Queue Lists Every Waiter', () => this.testAdmissionQueueComplete(), {
@@ -342,6 +347,72 @@ class AdmissionTestSuite {
     g.limit = 2;
     this.assertPrompt('waiter', raisedAt, await this.startsWithin(start, 'waiter'), 50 + WAKE_BOUND_MS);
     await done;
+  }
+
+  /**
+   * Keyed waiters are found through the per-group key index, not a scan of
+   * every queue. A heartbeat must still reach each key's queue.
+   */
+  private async testKeyedRateHeartbeat() {
+    const WINDOW = 40;
+    const api = new KeyedRateLimitGroup([{ limit: 1, windowMs: WINDOW }], { id: 'api' });
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['api'] }) }, { api }, { periodicRetryIntervalMs: 50 }));
+    const keys = ['a', 'b', 'c'];
+    const starts = keys.map(k => this.started(s, `${k}2`));
+    const t0 = performance.now();
+    const done = Promise.all(keys.flatMap(k => [
+      s.addTask(this.task(`${k}1`, { limitKey: k }, 2), { createPromise: true }),
+      s.addTask(this.task(`${k}2`, { limitKey: k }, 2), { createPromise: true })
+    ]));
+    for (const [i, k] of keys.entries()) {
+      const at = await this.startsWithin(starts[i], `${k}2`);
+      this.assertPrompt(`${k}2`, t0 + WINDOW, at, 50 + WAKE_BOUND_MS);
+    }
+    await done;
+  }
+
+  /** After every shape of wait has drained, no blocked queue is left. */
+  private async testQueuesDeleted() {
+    const groups = {
+      g: new ConcurrentLimitGroup(1, 'g'),
+      k: new KeyedCounterGroup(1, 'k'),
+      gpu: new ConcurrentLimitGroup(1, 'gpu')
+    };
+    const s = this.track(new FyflowScheduler({
+      W: this.pool(),
+      P: this.pool({ maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 10, idleCheckIntervalMs: 5 }),
+      Q: this.pool({ maxThreads: 1, maxConcurrentTasks: 1, residentGroups: { gpu: 1 }, idleTimeout: 10, idleCheckIntervalMs: 5 }),
+    }, groups));
+    const promises: Promise<any>[] = [];
+    for (let i = 0; i < 20; i++) promises.push(s.addTask(this.task(`g${i}`, { workerGroups: ['g'] }, 1), { createPromise: true }) as Promise<any>);
+    for (let i = 0; i < 200; i++) promises.push(s.addTask(this.task(`k${i}`, { workerGroups: ['k'], limitKey: `key${Math.floor(i / 4)}` }, 1), { createPromise: true }) as Promise<any>);
+    for (let i = 0; i < 4; i++) promises.push(s.addTask(this.task(`r${i}`, { workerType: i % 2 ? 'Q' : 'P' }, 1), { createPromise: true }) as Promise<any>);
+
+    // The test has to have built queues, or it proves nothing
+    let peak = 0;
+    const sampler = setInterval(() => { peak = Math.max(peak, s.blockedQueues.size); }, 1);
+    await Promise.all(promises);
+    clearInterval(sampler);
+    if (peak < 10) throw new Error(`Only ${peak} blocked queues ever existed - the test proves nothing`);
+    if (s.blockedQueues.size !== 0) {
+      throw new Error(`${s.blockedQueues.size} blocked queues left behind: ${[...s.blockedQueues.keys()].slice(0, 5).map(k => JSON.stringify(k))}`);
+    }
+    // The key index must not outlive the queues it indexes
+    const indexed = (s as any).blockedKeys?.size ?? 0;
+    if (indexed !== 0) throw new Error(`The blocked-key index still holds ${indexed} group(s)`);
+  }
+
+  private async testCancelDeletesQueue() {
+    const k = new KeyedCounterGroup(1, 'k');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['k'] }) }, { k }));
+    const held = s.addTask(this.task('holder', { limitKey: 'a' }, 200), { createPromise: true });
+    const waiting = s.addTask(this.task('waiter', { limitKey: 'a' }, 1), { createPromise: true }) as Promise<any>;
+    waiting.catch(() => { /* cancelled */ });
+    await new Promise(r => setTimeout(r, 10));
+    if (s.blockedQueues.size !== 1) throw new Error(`Precondition: ${s.blockedQueues.size} blocked queues`);
+    await s.cancel('waiter');
+    if (s.blockedQueues.size !== 0) throw new Error('The emptied queue survived its last waiter being cancelled');
+    await held;
   }
 
   // --- Admission cost and honesty --------------------------------------------

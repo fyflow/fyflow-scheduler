@@ -414,8 +414,7 @@ export class FyflowTask {
       // Queue against the first group without room. Its release wakes the task.
       const short = entries.find(({ group, cost }) => !group.canRun(undefined, cost)) ?? entries[0];
       const queueId = this._blockedQueueId(short.id);
-      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, this._newBlockedQueue());
-      const queue = this.blockedQueues.get(queueId)!;
+      const queue = this._blockedQueue(queueId);
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
       this.stats.queued = Math.max(0, this.stats.queued - 1);
@@ -512,6 +511,57 @@ export class FyflowTask {
 
     private _newBlockedQueue(): TaskQueue<FyflowTask> {
       return new TaskQueue<FyflowTask>({ trackMembership: true, counter: this.blockedLive });
+    }
+
+    /**
+     * Keys with a blocked queue, per keyed group. Kept in step with
+     * `blockedQueues` by the two methods below, so finding a keyed group's
+     * waiting keys is a lookup rather than a scan of every queue.
+     */
+    private blockedKeys = new Map<string, Set<string>>();
+
+    /**
+     * Queues being iterated right now, with their nesting depth. Such a queue
+     * must not be deleted: the loop holds the object, a listener it calls can
+     * empty the queue and a later push recreate it, and the loop would then
+     * put tasks back into the detached object, where nothing ever finds them.
+     */
+    private blockedInUse = new Map<string, number>();
+
+    /** The queue for `queueId`, created and indexed if it does not exist. */
+    private _blockedQueue(queueId: string): TaskQueue<FyflowTask> {
+      let queue = this.blockedQueues.get(queueId);
+      if (!queue) {
+        queue = this._newBlockedQueue();
+        this.blockedQueues.set(queueId, queue);
+        const { groupId, key } = this._splitQueueId(queueId);
+        if (key !== undefined) {
+          let keys = this.blockedKeys.get(groupId);
+          if (!keys) this.blockedKeys.set(groupId, keys = new Set());
+          keys.add(key);
+        }
+      }
+      return queue;
+    }
+
+    /**
+     * Delete `queueId`'s queue if it is empty and nothing is iterating it.
+     *
+     * Blocked queues exist only while they hold a waiter. They used to live
+     * forever, so a keyed group kept one per key that had ever blocked - 1,000
+     * empty queues after a 1,000-key run - and every heartbeat walked them all.
+     */
+    private _dropBlockedQueueIfEmpty(queueId: string | undefined): void {
+      if (queueId === undefined || this.blockedInUse.has(queueId)) return;
+      const queue = this.blockedQueues.get(queueId);
+      if (!queue || queue.length > 0) return;
+      this.blockedQueues.delete(queueId);
+      const { groupId, key } = this._splitQueueId(queueId);
+      if (key !== undefined) {
+        const keys = this.blockedKeys.get(groupId);
+        keys?.delete(key);
+        if (keys?.size === 0) this.blockedKeys.delete(groupId);
+      }
     }
 
     _checkCompletion() {
@@ -749,7 +799,7 @@ export class FyflowTask {
 
       // Clear periodic retry if no more tasks queued or blocked
       const hasReadyTasks = Array.from(this.readyQueuesByWorker.values()).some(q => q.length > 0);
-      const hasBlockedTasks = Array.from(this.blockedQueues.values()).some(q => q.length > 0);
+      const hasBlockedTasks = this._hasBlockedTasks();
       const hasQueuedInStats = this.stats.queued > 0;
       if (!hasReadyTasks && !hasBlockedTasks && !hasQueuedInStats) {
         this._clearPeriodicRetry();
@@ -778,10 +828,7 @@ export class FyflowTask {
           const blockedOnKey = Boolean(group.keyed);
           // Blocked on this group - and on this key, when the group is keyed
           const queueId = this._blockedQueueId(id, key);
-          if (!this.blockedQueues.has(queueId)) {
-            this.blockedQueues.set(queueId, this._newBlockedQueue());
-          }
-          const blockedQueue = this.blockedQueues.get(queueId)!;
+          const blockedQueue = this._blockedQueue(queueId);
           // It has left the ready queue: count it out of `queued` before
           // resource.blocked fires, so a listener sees consistent stats
           this.stats.queued = Math.max(0, this.stats.queued - 1);
@@ -1282,6 +1329,7 @@ export class FyflowTask {
         case 'blocked':
           // Blocked tasks are counted in no stats key
           this.blockedQueues.get(task._blockedQueueId!)?.tombstone(task);
+          this._dropBlockedQueueIfEmpty(task._blockedQueueId);
           break;
         // undefined: in transit between queues, counted nowhere; whoever is
         // moving it sees the terminal state and leaves it
@@ -1340,7 +1388,11 @@ export class FyflowTask {
       // groups hold one queue per key, so each is retried on its own bucket -
       // otherwise a saturated key would gate every other key behind it.
       for (const [groupId, group] of Object.entries(this.groups)) {
-        if (!group || !group.canRun()) continue;
+        // Nobody waiting on it: skip before asking the group anything, so a
+        // heartbeat costs O(groups with waiters) rather than O(groups)
+        if (!group) continue;
+        if (group.keyed ? !this.blockedKeys.has(groupId) : !this.blockedQueues.has(groupId)) continue;
+        if (!group.canRun()) continue;
 
         if (group.keyed) {
           for (const key of this._blockedKeysFor(groupId)) {
@@ -1353,22 +1405,33 @@ export class FyflowTask {
 
     }
 
-    /** Keys that currently have tasks blocked on this group. */
+    /**
+     * Keys that currently have tasks blocked on this group. A copy, because
+     * retrying a key can delete it from the index.
+     */
     private _blockedKeysFor(groupId: string): string[] {
-      const prefix = `${groupId}${BLOCKED_QUEUE_SEPARATOR}`;
-      const keys: string[] = [];
-      for (const [queueId, queue] of this.blockedQueues) {
-        if (queue.length > 0 && queueId.startsWith(prefix)) {
-          keys.push(queueId.slice(prefix.length));
-        }
-      }
-      return keys;
+      return [...(this.blockedKeys.get(groupId) ?? [])];
     }
 
     _retryBlockedTasksForGroup(groupId: string, key?: string) {
       const queueId = this._blockedQueueId(groupId, key);
       const blockedTasks = this.blockedQueues.get(queueId);
       if (!blockedTasks || blockedTasks.length === 0) return;
+
+      // Held for the whole retry - see blockedInUse - and deleted after, if
+      // the retry, or anything it reached, emptied it
+      this.blockedInUse.set(queueId, (this.blockedInUse.get(queueId) ?? 0) + 1);
+      try {
+        this._retryBlockedQueue(queueId, groupId, blockedTasks, key);
+      } finally {
+        const depth = this.blockedInUse.get(queueId)! - 1;
+        if (depth > 0) this.blockedInUse.set(queueId, depth);
+        else this.blockedInUse.delete(queueId);
+        this._dropBlockedQueueIfEmpty(queueId);
+      }
+    }
+
+    private _retryBlockedQueue(queueId: string, groupId: string, blockedTasks: TaskQueue<FyflowTask>, key?: string) {
 
       const group = this.groups[groupId];
       if (!group || !group.canRun(key)) return;
@@ -1428,6 +1491,7 @@ export class FyflowTask {
           const otherQueue = this.blockedQueues.get(otherQueueId);
           if (otherQueue) {
             if (otherQueue.remove(task)) {
+              this._dropBlockedQueueIfEmpty(otherQueueId);
               if (this._resourceObserved) {
                 this._emitResource('resource.unblocked', g, {
                   groupId: id,
@@ -1533,10 +1597,13 @@ export class FyflowTask {
       // Announce the exit it has already made, then leave no membership behind:
       // a queue still holding it would never drain in a consumer's fold
       this._emitOrphanedExit(task, leftQueueId);
+      const left: string[] = [];
       for (const [queueId, queue] of this.blockedQueues) {
-        if (!queue.remove(task)) continue;
-        this._emitOrphanedExit(task, queueId);
+        if (queue.remove(task)) left.push(queueId);
       }
+      // Deleted before any event, and outside the iteration
+      for (const queueId of left) this._dropBlockedQueueIfEmpty(queueId);
+      for (const queueId of left) this._emitOrphanedExit(task, queueId);
 
       task.error = error.message;
       task.endTime = Date.now();
@@ -1603,7 +1670,7 @@ export class FyflowTask {
 
       // Only schedule retry if there are queued tasks or blocked tasks (fallback for groups without events)
       const hasReadyTasks = Array.from(this.readyQueuesByWorker.values()).some(q => q.length > 0);
-      const hasBlockedTasks = Array.from(this.blockedQueues.values()).some(queue => queue.length > 0);
+      const hasBlockedTasks = this._hasBlockedTasks();
       if (hasReadyTasks || hasBlockedTasks) {
         this.retryTimer = setTimeout(() => {
           // Cleared before the work, so the re-arm below is not a no-op
@@ -2312,6 +2379,7 @@ export class FyflowTask {
         }
       }
       this.blockedQueues.clear();
+      this.blockedKeys.clear();
       this.blockedLive.live = 0;
       for (const task of this.tasks.values()) task._queuedIn = undefined;
 

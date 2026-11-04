@@ -153,9 +153,23 @@ they go in the release notes:
 
 - **R0 — measure, and pin down today's behaviour.** Built; see "R0 results"
   below.
-- **R1 — housekeeping, low risk.** Delete empty lists, add the per-group key
-  index, and make the periodic tick O(non-empty). This closes the leak and is
-  independent of R2.
+- **R1 — housekeeping, low risk. Done.**
+  - A blocked queue exists only while it holds a waiter. It is deleted when
+    it empties, but never while a retry loop is iterating it: `blockedInUse`
+    counts that, by depth, so a listener that empties the queue mid-loop cannot
+    detach it from the loop.
+  - Keyed waiters are found through a per-group key index, not a prefix scan.
+  - The heartbeat skips groups with nobody waiting before calling `canRun`,
+    and the "anything blocked?" checks use the O(1) live counter.
+  - Measured back to back against `2da4ef3`:
+    - lists left after every shape go from up to 1,000 to 0;
+    - keyed-wide at 50K runs at +28% throughput, with the worst stall down
+      from 79 ms to 36 ms;
+    - global at 50K averages 897 ms in both, over three alternating runs, so
+      the -7% of a single run was noise;
+    - `benchmark:quick` shows nothing beyond single-run noise.
+  - Three tests guard it (deletion after every shape, deletion on cancel, keyed
+    heartbeat through the index), each mutation-checked.
 - **R2 — the core.** Single membership with migration, admit on wake, and
   every waiter in a list.
   - Acceptance:
@@ -450,14 +464,14 @@ measurement that has to catch it.
     scenario *depends* on that overtaking: its churn rounds finish only
     because new Small-pool tasks get past `big-1`. If R2 makes arrivals queue
     behind existing waiters, which the contract implies, that scenario hangs.
-    Decide which it is before R2:
-    - the contract wins: fix arrivals, and rewrite the scenario so it does not
-      rely on overtaking;
-    - or narrow `AGENTS.md` to say what is true: "a waiter is not overtaken
-      by waiters behind it".
-
-    Either way it is a published-contract decision, so it goes in the release
-    notes.
+    **Decided (2026-11-04): the contract wins.** A newly arriving task that
+    would need a new worker queues behind existing resident waiters of that
+    group, rather than being admitted past them. The `resource-events.ts`
+    head-of-line scenario is rewritten so it does not rely on overtaking.
+    The release notes say that arrivals no longer jump the queue. The
+    alternative, narrowing `AGENTS.md` to "a waiter is not overtaken by
+    waiters behind it", was rejected: it leaves a stream of cheap arrivals
+    able to starve an expensive pool, the thing the rule exists to stop.
 15. **Collect-then-dispatch overshoots once queues are complete.** Today's
     retry loop collects waiters while `canRun()` is still true, because
     `onStart` only runs later, in `_dispatchTask`. That is harmless only

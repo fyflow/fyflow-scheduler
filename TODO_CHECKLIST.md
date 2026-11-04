@@ -54,8 +54,10 @@ The baseline at `0adeefb`:
 - **Empty blocked queues are never deleted**: 1,000 are left after a 1,000-key run.
 - **A two-group waiter, and a resident waiter, wake only on the heartbeat.**
 
+**R1 is done**: empty blocked queues are deleted, keyed waiters are found through
+an index, and the heartbeat is O(groups with waiters).
+
 Next:
-- R1: housekeeping, which closes the leak;
 - R2: one wait list per task, admit on wake, migration. Decide risk 14
   (resident head-of-line on arrival) first;
 - R3: optional, time-based wakes.
