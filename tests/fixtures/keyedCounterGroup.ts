@@ -5,9 +5,9 @@
 // is paced by the 50 ms heartbeat. This one frees capacity only on release, so
 // a run is CPU-bound and the cost of admission is all that is measured.
 //
-// Test and benchmark scaffolding, not a published group. Planned as
-// `KeyedConcurrentLimitGroup` in doc/design/keyed-concurrent-limit.md; once that
-// ships, use it instead and delete this.
+// Test and benchmark scaffolding, not a published group. Written before
+// `KeyedConcurrentLimitGroup` shipped (0.7.0); replacing it with that group is
+// a follow-up in TODO_CHECKLIST.md.
 
 import type { ResourceGroup, ResourceGroupMetrics } from '../../groups/resourceGroup.ts';
 

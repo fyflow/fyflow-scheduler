@@ -1,4 +1,4 @@
-// Admission and wake-up tests - R0 of doc/design/admission-rework.md.
+// Admission and wake-up tests - built as R0 of the admission rework (0.7.0).
 //
 // Three kinds of test, and the difference matters when one goes red:
 //

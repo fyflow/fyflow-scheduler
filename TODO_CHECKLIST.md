@@ -15,154 +15,96 @@ channel, in place of a log API) and #4 (attempts already spent) are built, and #
 below.
 
 fyflow-app's pass 2 (`../fyflow-app/.scratch/mu-upstream-adoption/requests/fyflow-scheduler.pass2.md`)
-is planned. The reply has not been sent yet.
+is built and ships in 0.7.0: #1 (`KeyedConcurrentLimitGroup`, several keys per
+task) and #2 (units with identities). The reply has not been sent yet, and the
+plan was to send it **before** the release (the event stream a sibling library
+folds changes). Summaries in the archive below.
 
-#### 🟡 Admission and wake-up rework (foundation)
-`doc/design/admission-rework.md`. This is the shared foundation for keyed phase
-B and for specific-unit requests.
+### 0.7.0: release notes
 
-**R0 is done** (branch `admission-r0`):
-- known gaps in `tests/harness.ts`;
-- `tests/suites/admission.ts`, 16 tests, 5 of them known gaps;
-- `benchmark:admission`;
-- the order-assertion audit.
-
-The baseline at `0adeefb`:
-- **Keyed groups are quadratic in each key's queue depth.** 50K tasks over 10
-  keys take 7.4 minutes, with 4,892 `canRun` calls and 1,630 `resource.blocked`
-  events per task, and an 881 ms stall.
-- **Global and two-group shapes are flat, but their admission queue shows 2-4
-  waiters** while ~49,000 wait.
-- **Empty blocked queues are never deleted**: 1,000 are left after a 1,000-key run.
-- **A two-group waiter, and a resident waiter, wake only on the heartbeat.**
-
-**R1 is done**: empty blocked queues are deleted, keyed waiters are found through
-an index, and the heartbeat is O(groups with waiters).
-
-**R2 is done** (branch `admission-rework`, not merged): every waiter is in
-exactly one queue, admitted from the head on wake one at a time, and migrated
-(`unblocked.reason: 'migrated'`) to the group it is short of. Resident releases
-wake their queue, and arrivals are head-of-line behind resident waiters (risk 14).
-- Keyed, 50K tasks over 10 keys: 445.8 s → 1.2 s; `canRun` per task 4,892 → 5,
-  `resource.blocked` per task 1,630 → 1.
-- Two-group wake 15.7 ms → 0 ms, resident hand-over 31 ms → 0.8 ms (heartbeat on).
-- The admission queue lists every waiter (49,810 of 49,810 in the two-group run).
-- `benchmark:quick` within the bands in both run orders.
-- Costs: the worst event-loop stall at 50K is 25-36 ms against 6-9 ms (the
-  dispatch loop now moves up to 1,000 refused arrivals into lists per pass), and
-  global peak heap is up ~30% (a `Set` entry per waiter, risk 9).
-
-**R3 is done** (merged into `admission-rework`, shipping with R2): rate windows wake their waiters when they roll over instead
-of on the heartbeat, through one timer per scheduler, and `slot-released`
-is honoured - a raised `ConcurrentLimitGroup.limit` emits it.
-- Keyed rate, 10 keys: 2.9x the ideal time → 1.6x; 200 keys at 10K: 2.0x → 1.4x.
-- Main loop: the same worst stall with it on and off; about 2% more wall
-  time spent waking; one timer and at most one heap entry per waiting key.
-
-Next: one release of R2 and R3 together, with notes (risk 12): `migrated`,
-arrivals queueing, complete admission queues, `superseded` no longer
-emitted, rate-window wakes, `slot-released` honoured. Decided 2026-11-05:
-R3 ships with R2 rather than in a release of its own.
-
-**Status**: 🟡 In Progress (R0-R3 done; R2 and R3 unreleased)
-
-#### 🟡 Units with identities (scheduler pass 2 #2, P3)
-`doc/design/unit-grants.md`, built in two phases on `admission-rework`.
-
-- **Phase 1, done.** Grants: an `onStart` that returns one, kept for
-  `onFinish`, copied once into `context.grants` and `workerContext.grants`,
-  with the protocol in both bootstraps. `UnitGroup` granting any free unit,
-  task-held and resident. The new `grants` suite is threaded on both runtimes,
-  plus a browser spec.
-- **Phase 2, done.** Requests for specific units: a candidate set `from` and a
-  soft `prefer`, one wait queue per candidate set, FIFO across sets on a
-  release, and resident head-of-line scoped to overlapping sets. Benchmark
-  against phase 1, 10K tasks, three alternating pairs: `canRun` per task down
-  by about 1 on every shape; throughput medians two-group -9.4% (spread
-  40.7-41.8K base, 36.9-40.6K head), keyed-wide -5%, the rest within noise -
-  inside the ±10% band, two-group near its edge. The units shape: 12 `canRun`
-  per task, flat to 200K.
-- **Fixed:** a task waiting for a new worker waited for a resident release
-  even when an existing worker of its pool had a free slot - with
-  `idleTimeout: 0`, forever. Pre-existing, found building phase 2. It now
-  takes the slot from wherever it is in the resident queue.
-- **Fixed, from the PR #1 review** (2026-11-04), each with a test that fails
-  without it:
-  - a worker created from a `task.running` listener swapped resident units
-    with the worker being created - bound by identity now;
-  - one release of a group with wait sets parked every waiter of a full
-    pool - the sweep's parked count now spans its rounds;
-  - a waiter woken from a task-held queue skipped resident head-of-line;
-  - a group callback throwing at dispatch (`limitFor`, `keyFrom`,
-    `requestFrom`) left the task in no queue, never settling - it fails,
-    terminally, `unblocked.reason` `failed`;
-  - the free-slot admission drained a pool's resident queue into its ready
-    queue during a capacity-race backoff;
-  - any `onStart` return value was a grant, so an `async onStart` failed
-    every task - grants are now opt-in, `grants: true`;
-  - admission positions were per wait set with nothing naming the set -
-    `waitSet` on the waiter and on blocked/unblocked, and the sets listed in
-    turn order;
-  - a `{ cost }`-only object in `residentGroups` was read as a request.
-- **Left as is:** `UnitGroup` caches a resolved request per object, so one
-  mutated after `addTask` is not re-read - the caller's to avoid. `onStart`
-  throwing part-way through a task's acquires is not handled (pre-existing).
-
-**Status**: 🟡 In Progress (phases 1 and 2 done)
-
-### 0.6.0: release notes
-
-Everything on `main` since `v0.5.2`. The manifests are at 0.6.0; it ships when
-`v0.6.0` is tagged and pushed. A minor release by the 0.3.0 precedent: the
-source-breaking items below are narrow, and the release commit gives the
-reasoning for each.
+Everything on `main` since `v0.6.0`: the admission rework (R0-R3) and
+fyflow-app's pass 2 (#1 keyed concurrency, #2 units with identities). The
+manifests are at 0.7.0; it ships when `v0.7.0` is tagged and pushed. A minor
+release by the 0.3.0 precedent: the source-breaking items below are narrow,
+and under `^0.6.0` neither registry upgrades a consumer to it unasked - which
+matters here, because the resource event stream a sibling library folds
+changes shape.
 
 **New**
-- `scheduler.cancel(taskId, options?)`, `CancelOptions`, `CancelledError`,
-  `task.cancelling` / `task.cancelled`, the `'cancelled'` state,
-  `task.cancellation`, `stats.cancelled`, `context.signal`, and the pool option
-  `cancelGraceMs` (`AGENTS.md` §4, §5, §6, §8).
-- `emit()` on both worker contexts, `task.message` on the scheduler,
-  `worker.message` on the pool, and the pool option `messages` (§4, §6).
-- `attemptsSpent`, `task.attemptNumber` and `task.retrying` (§5, §6).
+- `KeyedConcurrentLimitGroup(limit, { id?, keyFrom?, limitFor? })`: a hard
+  concurrency cap per key, `limitFor(key)` read once per key lifetime, one
+  `level` gauge per key (`AGENTS.md` §1).
+- Several keys per task: `keyFrom` (or a custom group's `keyFor`) may return a
+  list. Admission is all or nothing, events are per (group, key). Works for
+  `KeyedRateLimitGroup` too.
+- Grants: a group with `grants: true` may return a grant from `onStart`;
+  `onFinish` gets the original back, the work a frozen copy in
+  `context.grants`, and a worker its resident grants in `workerContext.grants`
+  from the constructor on (§4, §5).
+- `UnitGroup`: named units, telling the work which it got. Requests for
+  particular units - `from` and `prefer` - on a task (`units`) or a pool (the
+  object form of `residentGroups`, `ResidentGroupRequest`). `waitSet` on
+  admission-queue entries and on `resource.blocked` / `resource.unblocked`.
+- `ResourceGroup.nextCapacityAt(key?)`, optional: when capacity comes back by
+  itself. `RateLimitGroup` and `KeyedRateLimitGroup` implement it, so their
+  waiters start when the window rolls over instead of on the heartbeat (§6).
+- `slot-released` from a group now wakes its waiters, and raising a
+  `ConcurrentLimitGroup`'s `limit` emits it.
+- `deno task benchmark:admission`.
 
 **Source-breaking**
-- `emit` is a new required member of `BaseWorkerContext` and
-  `TaskWorkerContext`, and `signal` of `TaskWorkerContext`: code that builds a
-  context object literal, typically to unit-test a worker, must add them.
-- `ResourceUnblockReason` gains `'cancelled'`, which breaks an exhaustive
-  `switch` - the same call as `ResourceGroup.type` in 0.3.0. `AGENTS.md` now says
-  not to switch exhaustively on it.
-- `readyQueuesByWorker` and `blockedQueues` hold a `TaskQueue`, not an array.
-  Public fields, never documented.
+- `ResourceUnblockReason` gains `'migrated'` and `'failed'`, which breaks an
+  exhaustive `switch` - the same call as in 0.3.0 and 0.6.0. `'superseded'`
+  stays in the union but is no longer emitted.
+- `ResourceGroup.onStart` returns `unknown` rather than `void`, and `keyFor`
+  may return `string[]`. Code implementing a group is unaffected; code
+  *calling* `keyFor` and expecting a string must handle a list.
+- `ConcurrentLimitGroup.limit` is an accessor, not a field. Assigning it works
+  as before; a subclass redeclaring `limit` as a field no longer compiles.
+- (`ResourceGroup.type` gains `'unit'` and `'keyed-concurrent'`, which breaks
+  nothing: it has been `string` since 0.3.0.)
 
 **Behaviour changes**
-- `terminateWithError()` is a request and never throws, on both pool types;
-  code after it runs. Called on a task's context on a threaded pool, that task
-  now fails instead of being requeued. Called from `setup()`, it fires
-  `worker.setup.completed`, not `.failed`.
-- A retry waits out its `backoffMs` however busy the scheduler is, so retries
-  start later under load than before.
-- `scheduler.completed` fires for a run with no successes - all failed, or all
-  cancelled.
-- `onCompletePromise()` settles for a task that has already settled.
-- `shutdown()` keeps listening to its pools during its drain, so a spawn or
-  requeue reported then is no longer lost.
-- A threaded worker's progress and spawns for a task it is not running are
-  dropped.
+- A woken waiter is admitted from the head of its queue, in the same turn,
+  one at a time; it no longer goes back to the ready queue. Dispatch order -
+  across pools sharing a group, too - can differ from 0.6.
+- A waiter refused by another group moves to that group's queue
+  (`unblocked.reason: 'migrated'`, then `blocked` there) instead of waiting
+  where it was.
+- Per task, `resource.blocked` fires once per wait rather than on every retry;
+  `getAdmissionQueue()` lists every waiter, and `queuePosition` means its
+  place in line.
+- A new task that needs a new worker queues behind resident waiters already
+  in line, rather than overtaking them.
+- Waiters start sooner: up to ~50 ms for two-group and resident waiters, and
+  rate-limited waiters at the window's roll-over. Code that relied on that
+  slack - observing a task as blocked before it starts - may see it go.
+- `slot-released` is acted on. A custom group that emitted it freely now
+  triggers a wake per emission (deduplicated per turn).
+- Concurrency limits are hard caps, re-entry from `resource.*` listeners
+  included. Strengthening the contract breaks no consumer; defensive code
+  against an overshoot can go. A lowered limit keeps running tasks' units.
+- A group callback throwing at dispatch (`limitFor`, `keyFrom`,
+  `requestFrom`) fails the task terminally, `unblocked.reason: 'failed'`;
+  before, the task was left in no queue and never settled.
 
 **Fixed**
-- A requeued task could be settled by the run it abandoned.
-- A threaded self-terminating task was requeued forever instead of failing, and
-  in the browser a termination was not recognised at all.
-- One worker failure spent two restarts.
-- A retried task blocked when its pool disappeared vanished without settling.
-- A listener re-entering the dispatch loop could lose a task.
-- A threaded `run()` returning `null` or `undefined` crashed the host process.
+- A worker becoming ready did not dispatch; a new thread took its first task a
+  microtask late, so a burst bounced off new workers.
+- A task waiting for a new worker ignored a free slot on an existing worker of
+  its pool - with `idleTimeout: 0`, forever.
+- Re-entry from `resource.acquired` could overshoot a second group, or a pool's
+  `maxThreads`; a task whose slot was taken there failed instead of requeueing.
+- Two-group and resident waiters, and rate-limited ones, waited for the
+  heartbeat - with it off, forever.
 
 **Performance**
-- Head-indexed queues: 50K inline tasks 5.9x faster, 100K 10.9x; throughput is
-  flat from 10K to 100K. Cancelling is O(1) wherever a task waits.
+- Keyed, 50K tasks over 10 keys: 445.8 s -> 1.2 s (`canRun` per task 4,892 ->
+  5, `resource.blocked` 1,630 -> 1). Two-group wake 15.7 ms -> 0; resident
+  hand-over 31 ms -> 0.8 ms. Keyed rate, 10 keys: 2.9x the ideal time -> 1.5x.
+- Costs: at 50K the worst event-loop stall is 25-36 ms against 6-9 ms, and
+  global peak heap is up ~30%. Time wakes add one timer per scheduler and
+  about 2% wall time on a 200-key rate run, with the same worst stall.
 
 ## Known Issues / Follow-ups
 
@@ -203,11 +145,34 @@ guessing.
   asynchronously, and cancelling a waiter releases nothing). Defensive - keep it,
   and test it if a synchronous release path appears.
 - A resident waiter whose task-held group is full keeps its place at the head and
-  is retried by the heartbeat, deliberately (risk 6). Only that combination waits
+  is retried by the heartbeat, deliberately: moving it let the pools behind it take its units. Only that combination waits
   for the tick.
-- The 50K stall and heap costs above. A smaller per-pass cap on moving refused
-  arrivals would bound the stall, and membership on the task (`_blockedQueueId`)
-  could replace the per-queue `Set`.
+- Two costs of R2, measured at 50K: the worst event-loop stall is 25-36 ms
+  against 6-9 ms before (the dispatch loop moves up to 1,000 refused arrivals
+  into lists per pass), and global peak heap is up ~30% (a `Set` entry per
+  waiter). A smaller per-pass cap on moving refused arrivals would bound the
+  stall, and membership on the task (`_blockedQueueId`) could replace the
+  per-queue `Set`.
+- **Cross-pool fairness on wake is undocumented.** If a woken task's pool is
+  full, a task of another pool can take the freed capacity first. Accepted in
+  the plan (reservation is the starvation machinery the rework avoided) but
+  never written into `AGENTS.md` or tested as a claim.
+
+**Status**: 🔵 Not Started
+
+#### 🔵 Unit grants follow-ups
+- **The grant choice for "any".** Lowest free index. Should `UnitGroup` avoid
+  granting a unit a pinned waiter is queued for, when another is free? It would
+  help pinned work, but needs the scheduler to tell the group what waits. Defer
+  until measured.
+- **Left as is:** `UnitGroup` caches a resolved request per object, so one
+  mutated after `addTask` is not re-read - the caller's to avoid. `onStart`
+  throwing part-way through a task's acquires is not handled (pre-existing).
+- Out of scope so far: per-task cost above 1, units per key, adding or removing
+  units at runtime, sticky units beyond `prefer`, requesting a unit from inside
+  a running worker.
+- `tests/fixtures/keyedCounterGroup.ts` predates `KeyedConcurrentLimitGroup`;
+  replace it with the real group and delete it.
 
 **Status**: 🔵 Not Started
 
@@ -434,9 +399,11 @@ another day does not.
 The following tasks have been completed and verified:
 
 ### ✅ Recently Completed (2026)
+- **Admission and wake-up rework (R0-R3, 0.7.0)** - every waiter is in exactly one queue, admitted from the head on wake one at a time, and migrated (`unblocked.reason: 'migrated'`) to the group it is short of; `superseded` is no longer emitted. Empty blocked queues are deleted and keyed waiters indexed (R1). Resident releases wake their queue; arrivals queue head-of-line behind resident waiters. Rate windows wake their waiters when they roll over (`nextCapacityAt`, one timer per scheduler) and `slot-released` is honoured, so a raised `ConcurrentLimitGroup.limit` admits (R3). Keyed 50K over 10 keys 445.8 s -> 1.2 s (`canRun` per task 4,892 -> 5); two-group wake 15.7 -> 0 ms; resident hand-over 31 -> 0.8 ms; keyed rate 2.9x -> 1.5x ideal. The admission suite (66 tests, heartbeat off) and `benchmark:admission` came with it; every phase mutation-checked (R3: 26). Found on the way: a due time and a stepped-back `Date.now()` each stranded a rate waiter on Node; seven ultrareview findings on R3 fixed with tests.
+- **Units with identities (fyflow-app pass 2 #2, 0.7.0)** - grants: a group with `grants: true` may return one from `onStart`, kept for `onFinish` and copied once (`structuredClone`, frozen) into `context.grants` / `workerContext.grants`, resident grants from the constructor on; the protocol in both bootstraps. `UnitGroup` grants named units, task-held and resident; requests with `from` and `prefer` on a task (`units`) or a pool (object form of `residentGroups`), one wait queue per candidate set, FIFO across sets on a release, resident head-of-line scoped to overlapping sets, `waitSet` on waiters and events. 12 `canRun` per task with 30% pinned, flat to 200K. Fixed with it: a task waiting for a new worker ignored a free slot on an existing worker (forever with `idleTimeout: 0`), and eight PR #1 review findings, each with a test.
 - **Several keys per task (keyed phase B, fyflow-app pass 2 #1)** - `keyFrom` (and a custom group's `keyFor`) may return a list: a C: -> D: copy is admitted only when both disks have room, and holds one unit of each. All or nothing, checked and acquired in one turn, nothing held while waiting; duplicates collapse, an empty list throws at `addTask`; events per (group, key), `key` still one string. A waiter refused by another key of the same group moves there (`migrated`), the R2 model applied per key. Works for `KeyedRateLimitGroup` too. `task.limitKey` stays a string - widening it would break consumers reading it - so multi-key goes through `keyFrom`. Greedy admission can starve a two-key task behind a stream of one-key ones: documented, not solved. Admission benchmark `keyed-multi` (20% two-key): 5.6 canRun and 1 blocked per task at 10K, 50K and 200K. Found while measuring: the wake loop built a task's group list twice per waiter and copied every entry, which raised two-group 50K peak heap 58 -> 121 MB; built once and not copied, it is at or under the base. Six admission tests, a two-key scale case in core counted inside `run()` per key, a docs test; mutations caught: no dedupe, only the first key held, wake check skipping the task's own group, groups flattening a list into one key.
-- **`KeyedConcurrentLimitGroup` (fyflow-app pass 2 #1, phase A of `doc/design/keyed-concurrent-limit.md`)** - a concurrency limit per key, one key per task: `new KeyedConcurrentLimitGroup(limit, { id?, keyFrom?, limitFor? })`. Keyed like `KeyedRateLimitGroup` (missing key throws at `addTask`, blocked queues per key); a hard cap per key; `limitFor(key)` read once per key lifetime and validated at `addTask`, so a bad answer cannot strand a task mid-dispatch; a key is dropped the moment nothing holds it; one `level` gauge per key against its own limit; `getMetrics().limit` is the default per-key limit, as on the keyed rate group. Rejected in `residentGroups` - only this group: other keyed groups were always accepted there, under an empty key, and still are. No scheduler change beyond that check: R1/R2 already handle keyed waiters. Tests: four in core (isolation, `limitFor`, the up-front errors, 3,000 tasks over 50 keys counted inside `run()` per key), one in resource-events (gauges), one in cancellation (a blocked key), one docs test for the AGENTS.md snippet; mutations caught: one counter shared by every key, `limitFor` ignored, no eviction, the resident rejection removed, `limitFor` unchecked at `addTask`. `jsr:smoke` stages 19 files. Phase B (several keys per task) is accepted but deferred.
-- **Concurrency limits are hard caps (phase 0 of `doc/design/keyed-concurrent-limit.md`)** - `AGENTS.md` §1, the §9 row, `README.md` and the group doc comments called groups "optimistic", able to overshoot by `maxThreads x maxConcurrentTasks`; they now state the contract: no more tasks hold a `ConcurrentLimitGroup` than its limit, a rate group caps starts per window (not concurrency), counting events can overshoot, and a lowered limit keeps running tasks' units. The audit of every `onStart` path found the claim was not quite true, through re-entry: `resource.acquired` fired between one group's acquire and the next, so a task added from that listener took a group the first had checked but not yet taken (B at limit 1 held 2); and a worker's resident acquire was announced before it joined `threads`, so a task added there made the pool outgrow `maxThreads` (1 -> 2). Both fixed by finishing every transition before its events. Found on the way, older than all of this: a task whose pool slot was taken by a task added from its own `resource.acquired` failed for good in `user_action` ("No worker thread available") - now requeued as the capacity race it is. Re-entry from a group's own methods or `EventTarget` events is declared unsupported rather than guarded. Three docs tests (hard cap under re-entry, rate caps starts, lowered limit), two existing docs tests moved from counting events to the group's reading, four admission tests; mutations caught: no `canRun` at dispatch, interleaved acquire events, resident announced early.
+- **`KeyedConcurrentLimitGroup` (fyflow-app pass 2 #1, phase A)** - a concurrency limit per key, one key per task: `new KeyedConcurrentLimitGroup(limit, { id?, keyFrom?, limitFor? })`. Keyed like `KeyedRateLimitGroup` (missing key throws at `addTask`, blocked queues per key); a hard cap per key; `limitFor(key)` read once per key lifetime and validated at `addTask`, so a bad answer cannot strand a task mid-dispatch; a key is dropped the moment nothing holds it; one `level` gauge per key against its own limit; `getMetrics().limit` is the default per-key limit, as on the keyed rate group. Rejected in `residentGroups` - only this group: other keyed groups were always accepted there, under an empty key, and still are. No scheduler change beyond that check: R1/R2 already handle keyed waiters. Tests: four in core (isolation, `limitFor`, the up-front errors, 3,000 tasks over 50 keys counted inside `run()` per key), one in resource-events (gauges), one in cancellation (a blocked key), one docs test for the AGENTS.md snippet; mutations caught: one counter shared by every key, `limitFor` ignored, no eviction, the resident rejection removed, `limitFor` unchecked at `addTask`. `jsr:smoke` stages 19 files. Phase B (several keys per task) is accepted but deferred.
+- **Concurrency limits are hard caps (phase 0 of keyed concurrency)** - `AGENTS.md` §1, the §9 row, `README.md` and the group doc comments called groups "optimistic", able to overshoot by `maxThreads x maxConcurrentTasks`; they now state the contract: no more tasks hold a `ConcurrentLimitGroup` than its limit, a rate group caps starts per window (not concurrency), counting events can overshoot, and a lowered limit keeps running tasks' units. The audit of every `onStart` path found the claim was not quite true, through re-entry: `resource.acquired` fired between one group's acquire and the next, so a task added from that listener took a group the first had checked but not yet taken (B at limit 1 held 2); and a worker's resident acquire was announced before it joined `threads`, so a task added there made the pool outgrow `maxThreads` (1 -> 2). Both fixed by finishing every transition before its events. Found on the way, older than all of this: a task whose pool slot was taken by a task added from its own `resource.acquired` failed for good in `user_action` ("No worker thread available") - now requeued as the capacity race it is. Re-entry from a group's own methods or `EventTarget` events is declared unsupported rather than guarded. Three docs tests (hard cap under re-entry, rate caps starts, lowered limit), two existing docs tests moved from counting events to the group's reading, four admission tests; mutations caught: no `canRun` at dispatch, interleaved acquire events, resident announced early.
 - **A burst onto a threaded pool no longer bounces off new workers** - a new thread took its first task a microtask after `enqueueNoQueue` created it, so for that microtask its slot showed free; the next task in the same dispatch loop took it, and the first was put back, its groups released, and retried after the 10 ms capacity-race backoff. One bounce per new worker: 3 extra `resource.acquired`/`released` pairs for 4 threads, 7 for 8, start times spread 30-60 ms. A fresh thread now takes its task in the same turn, as an inline one always did, which leaves nothing that awaits between dispatch and the thread: the polling wait, the pool's `enqueuing` map and `initializingThreads` are gone, and the cancellation suite's "on its way to a new thread" place with them (six places now, not seven). Measured on the same bursts: no extra acquires, the last task starts as early or earlier (8 x 1: 88-119 ms against 110-131 ms), start times 3-6 ms apart rather than 10-80, the first can start later since every worker now starts at once; `benchmark:quick` threaded scenarios unchanged run alone (2.37 s against 2.38 s). Investigated as a suspected double count of initialising workers (`threads` + `initializingThreads`) serialising start-ups, which it is not - start-ups overlap. Test: "A Burst Onto An Empty Threaded Pool Dispatches Each Task Once" (admission).
 - **A worker becoming ready now dispatches** - tasks that arrived while a pool's only worker was starting found no free slot and no room for another worker, and the worker becoming ready ran no dispatch, so they waited for the next settle or the heartbeat: with `maxThreads: 1, maxConcurrentTasks: 8` the second task waited out the whole first task. Inline pools did the same. The scheduler now runs its dispatch loop a microtask after `worker.initialization.completed`. Two heartbeat-off tests in the admission suite (threaded and inline), both failing without the fix. Found during admission R2; R1 and earlier behaved the same.
 - **A browser performance spec no longer asserts a timing order** - "should measure Web Worker vs inline performance" required the Web Worker run to be the slower one, a race that failed once on WebKit in a full run. The overhead is now reported as a test annotation, and the spec shuts its two schedulers down, which it never did.

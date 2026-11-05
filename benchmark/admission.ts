@@ -1,4 +1,4 @@
-// Admission benchmark - R0 of doc/design/admission-rework.md.
+// Admission benchmark - built as R0 of the admission rework (0.7.0).
 //
 // The main suite measures throughput. That misses the admission rework's
 // problems, which are about *work per task* growing with how many tasks wait,

@@ -261,8 +261,8 @@ class CancellationTestSuite {
   // the clamp at 0.
   //
   // The queued tasks come from a full pool, not from waiters stranded behind a
-  // blocked head: today only b1 enters the blocked queue and b2-b4 wait in
-  // the ready queue, but after doc/design/admission-rework.md R2 all four are
+  // blocked head: before 0.7.0 only b1 entered the blocked queue and b2-b4
+  // waited in the ready queue; since the admission rework all four are
   // blocked. q1 and q2 are queued under either model.
   private async testBlocked(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
