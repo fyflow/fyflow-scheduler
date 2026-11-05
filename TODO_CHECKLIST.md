@@ -52,18 +52,17 @@ wake their queue, and arrivals are head-of-line behind resident waiters (risk 14
   dispatch loop now moves up to 1,000 refused arrivals into lists per pass), and
   global peak heap is up ~30% (a `Set` entry per waiter, risk 9).
 
-**R3 is done** (branch `r3-time-wakes`, off `admission-rework`, kept out of
-R2's release): rate windows wake their waiters when they roll over instead
+**R3 is done** (merged into `admission-rework`, shipping with R2): rate windows wake their waiters when they roll over instead
 of on the heartbeat, through one timer per scheduler, and `slot-released`
 is honoured - a raised `ConcurrentLimitGroup.limit` emits it.
 - Keyed rate, 10 keys: 2.9x the ideal time → 1.6x; 200 keys at 10K: 2.0x → 1.4x.
 - Main loop: the same worst stall with it on and off; about 2% more wall
   time spent waking; one timer and at most one heap entry per waiting key.
 
-Next:
-- a release, with notes, of R2 (risk 12): `migrated`, arrivals queueing,
-  complete admission queues, `superseded` no longer emitted;
-- then R3 in a release of its own.
+Next: one release of R2 and R3 together, with notes (risk 12): `migrated`,
+arrivals queueing, complete admission queues, `superseded` no longer
+emitted, rate-window wakes, `slot-released` honoured. Decided 2026-11-05:
+R3 ships with R2 rather than in a release of its own.
 
 **Status**: 🟡 In Progress (R0-R3 done; R2 and R3 unreleased)
 

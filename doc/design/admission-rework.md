@@ -181,8 +181,8 @@ they go in the release notes:
   - Mutation checks:
     - wake the whole list again: the flat-cost test must fail;
     - skip migration: the two-group latency test must fail.
-- **R3 — time-based wakes. Done**, on branch `r3-time-wakes`, kept out of
-  R2's release (see "R3 results" below). Rate groups name the time a window
+- **R3 — time-based wakes. Done**, and shipping in the same release as R2
+  (decided 2026-11-05; see "R3 results" below). Rate groups name the time a window
   frees (`nextCapacityAt`, not `resetAt`, which is the oldest timestamp and
   wrong once a window is over its limit), and `slot-released` is honoured.
 
@@ -677,7 +677,8 @@ measurement that has to catch it.
 
 - **Blast radius.** R2 rewrites the code that the settlement, cancellation and
   resource-events suites (92 tests) were written to protect. Keep R1 and R2
-  separate commits, keep R3 out of the same release as R2, and land R0's
+  separate commits, keep R3 out of the same release as R2 (superseded
+  2026-11-05: they ship together), and land R0's
   benchmark and the order-classification first, so that R2 is measured against
   a fixed baseline.
 - **Rollback.** A flag that keeps the old wake path until R2 has a release
