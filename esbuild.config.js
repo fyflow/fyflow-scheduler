@@ -133,8 +133,11 @@ if (buildType === 'development') {
       "tests/suites/resource-events.ts",
       "tests/suites/messages.ts",
       "tests/suites/cancellation.ts",
+      "tests/suites/admission.ts",
+      "tests/suites/grants.ts",
       "tests/performance/contention-scaling.ts",
-      "benchmark/runBenchmarks.ts"
+      "benchmark/runBenchmarks.ts",
+      "benchmark/admission.ts"
     ],
     bundle: true,
     target: ["es2022"],
@@ -160,6 +163,7 @@ if (buildType === 'development') {
       "tests/workers/selfTerminatingWorker.ts",
       "tests/workers/messageWorker.ts",
       "tests/workers/cancelWorker.ts",
+      "tests/workers/grantWorker.ts",
       "groups/concurrentLimitGroup.ts",
       "groups/rateLimitGroup.ts"
     ],

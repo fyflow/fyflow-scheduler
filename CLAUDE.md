@@ -80,9 +80,17 @@ capacity.
 
 **`core/resourceEvents.ts`** — the `resource.*` event payload types.
 
-**`groups/`** — `ConcurrentLimitGroup` (optimistic concurrency), `RateLimitGroup`
-(overlapping time windows), `KeyedRateLimitGroup` (per-key quotas), all behind
-the `ResourceGroup` interface with optional gauge `describe()`/`read()`.
+**`groups/`** — `ConcurrentLimitGroup` (a hard concurrency cap), `RateLimitGroup`
+(overlapping time windows), `KeyedRateLimitGroup` (per-key quotas),
+`KeyedConcurrentLimitGroup` (a concurrency cap per key), `UnitGroup` (named
+units, telling the work which it got), all behind the `ResourceGroup` interface
+with optional gauge `describe()`/`read()`.
+
+A group that sets `grants: true` may return a **grant** from `onStart`. The scheduler keeps the original
+for `onFinish`, and copies it once with `structuredClone`, on inline pools too.
+The copy reaches the work as `context.grants`. Task grants travel with the
+`run` message. Resident grants travel in `init`, which is why they are known
+before the worker's constructor runs.
 
 Groups come in two lifetimes. **Task-scoped** groups are acquired at dispatch and
 released at settle. **Resident** groups (`residentGroups`, with a per-worker
@@ -97,11 +105,12 @@ cheaper pools overtake it.
 # Deno
 deno task check          # type check (includes scripts/)
 deno task test           # all suites
-deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation
+deno task test:events    # one suite: core|error|spawning|settlement|docs|resident|events|messages|cancellation|admission|grants
 deno task examples       # run every example on Deno, then the bundled ones on Node
 deno task jsr:smoke      # stage only the publishable files and run a real worker against them
 deno lint .
 deno task benchmark:quick
+deno task benchmark:admission   # admission cost per task and wake latency; --json, --compare
 
 # Node (pnpm is the package manager)
 pnpm install --frozen-lockfile   # also runs prepare -> the library build
@@ -115,24 +124,26 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Nine suites, 215 tests, all in the default `deno task test` run:
+Eleven suites, 327 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| core | 26 | scheduling, groups, pooling, retention, queue scaling, limits at scale |
+| core | 31 | scheduling, groups, pooling, retention, queue scaling, limits at scale, `KeyedConcurrentLimitGroup` |
 | error-handling | 12 | worker failure, restart, requeue |
 | spawning | 13 | dynamic spawning, `onCompleteDescendants()`, draining on shutdown |
 | settlement | 34 | exactly-once settlement, counter cardinality, requeue, self-termination, attempts and backoff |
 | resident-groups | 12 | resident admission, weighted costs, affinity |
-| resource-events | 25 | `resource.*` events, gauges, admission queue |
+| resource-events | 26 | `resource.*` events, gauges, admission queue |
 | messages | 19 | `emit()`: ordering, gating, cap, cloning, inline/threaded parity |
-| cancellation | 33 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
-| docs | 41 | **executes every snippet in README.md and AGENTS.md** |
+| grants | 25 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, opt-in grants, uncloneable grants, the forced stop, re-entry while a worker is created; requests for particular units, per-set queues, FIFO across sets, resident requests |
+| cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
+| docs | 55 | **executes every snippet in README.md and AGENTS.md** |
+| admission | 66 | wake paths with the heartbeat off (including a worker becoming ready, and a free slot for a task waiting on a new worker), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task, unit requests, a group throwing at dispatch; time-based wakes (rate windows, `slot-released`, a raised limit) and what they cost the main loop |
 
-`deno task test:scripts` is separate and not included in `deno task test` — it
-unit-tests `scripts/publishOutput.ts`.
+`deno task test:scripts` is separate and not included in `deno task test`. It
+unit-tests `scripts/` and the known-gap rules in `tests/harness.ts`.
 
-Two conventions worth keeping:
+Three conventions worth keeping:
 
 - **A new documented claim needs a docs test.** The docs suite is what stops the
   documentation drifting from the code.
@@ -141,6 +152,16 @@ Two conventions worth keeping:
   and confirm the test fails, then restore it. Run only the tests meant to
   catch it, and stop at the first failure:
   `deno task test:settlement --only "requeue" --bail --timeout 5000`.
+- **Land a planned behaviour as a known gap, not a skipped test.**
+  - Write the test for the behaviour you want, and pass
+    `{ knownGap: { reason, failsWith } }` to `runTest`. It must fail, with an
+    error containing `failsWith`, and the run stays green.
+  - Once it starts passing it fails the run, so the change that closes a gap
+    deletes its `knownGap` in the same commit.
+  - A wake-up test must turn the heartbeat off
+    (`periodicRetryIntervalMs: 1_000_000_000`). Otherwise the 50 ms periodic
+    retry rescues every missed wake, and the bug shows up only as latency.
+    `tests/suites/admission.ts` is the pattern.
 
 Every test has a timeout, 60 s by default, enforced by `runTest` in
 `tests/harness.ts`, which every suite delegates to. Without it a mutation, or a
@@ -211,7 +232,7 @@ no build step, but only if it is erasable. `AGENTS.md` §3 documents the
 conditions and the docs suite tests them.
 
 **`publish.exclude` in `deno.json` is an allowlist** (`**` plus `!` exceptions),
-so a new published module must be added explicitly. It currently ships 18 files.
+so a new published module must be added explicitly. It currently ships 20 files.
 
 **The package must have no dependencies.** `scripts/` uses `@std/path` and is
 kept out of the package by the allowlist alone — Deno has no devDependencies — so

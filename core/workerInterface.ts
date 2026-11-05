@@ -77,6 +77,38 @@ export interface WorkerConfig {
     [key: string]: any;
 }
 
+/** Freeze an object or array one level down, and return it. @internal */
+export function freezeShallow<T>(value: T): T {
+    return value !== null && typeof value === 'object' ? Object.freeze(value) : value;
+}
+
+const NO_GRANTS: Readonly<Record<string, unknown>> = Object.freeze({});
+
+/**
+ * A context's `grants`: the worker's resident ones, then the task's own, which
+ * win on a clash. Always an object, so `grants.gpu` needs no guard at runtime.
+ * @internal
+ */
+export function mergeGrants(
+    resident?: Readonly<Record<string, unknown>>,
+    task?: Readonly<Record<string, unknown>>
+): Readonly<Record<string, unknown>> {
+    if (!task) return resident ? freezeGrants(resident) : NO_GRANTS;
+    if (!resident) return freezeGrants(task);
+    return freezeGrants({ ...resident, ...task });
+}
+
+/**
+ * Frozen one level down, as the scheduler hands them out. Again here because a
+ * thread receives a structured clone, which is never frozen - and inline and
+ * threaded must look the same. Idempotent, and only grants that exist pay.
+ */
+function freezeGrants(grants: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+    if (Object.isFrozen(grants)) return grants;
+    for (const value of Object.values(grants)) freezeShallow(value);
+    return Object.freeze(grants);
+}
+
 // Enhanced worker communication protocol
 /**
  * Messages a worker thread sends back to its ThreadWrapper.
@@ -143,6 +175,17 @@ export interface BaseWorkerContext {
      * listens, and a pool's `messages` option bounds how much can be.
      */
     emit: (name: string, data?: unknown) => void;
+    /**
+     * What this worker's resident groups granted it, per group id - for a
+     * `UnitGroup`, the units it holds for its lifetime, as an array:
+     * `workerContext.grants.gpu` is `['gpu1']`. Set before the constructor
+     * runs, so `setup()` can load onto the right device.
+     *
+     * Only groups that returned a grant have an entry. A copy, frozen one level
+     * down. Optional in the type, so a context built by hand in a test still
+     * compiles; the library always sets it, to `{}` when there is nothing.
+     */
+    readonly grants?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -180,6 +223,18 @@ export interface TaskWorkerContext extends BaseWorkerContext {
      * cloned). Whatever `run()` does next, the task ends cancelled.
      */
     readonly signal: AbortSignal;
+    /**
+     * What this attempt was granted, per group id: `context.grants.gpu` is
+     * `['gpu1']`. The worker's own resident grants are included, and the
+     * task's win on a clash, so a task asks "which card am I on" without caring
+     * which of the two holds it.
+     *
+     * Per attempt. A retry or a requeue is granted afresh and may get a
+     * different unit, so read it on every attempt rather than caching it. For
+     * a keyed group the entry is `{ [key]: grant }`. Otherwise as
+     * {@link BaseWorkerContext.grants}.
+     */
+    readonly grants?: Readonly<Record<string, unknown>>;
 }
 
 /**

@@ -5,13 +5,28 @@ import type {
   ResourceGroupMetrics,
   ResourceGroupStats
 } from './resourceGroup.ts';
-import type { RateWindow } from './rateLimitGroup.ts';
+import { type RateWindow, windowFreesAt } from './rateLimitGroup.ts';
 
 /** Shape the group needs from a task in order to derive its key. */
 export interface KeyedTaskLike {
   id?: string;
   limitKey?: string;
   payload?: any;
+}
+
+/**
+ * What `keyFrom` returned, as `keyFor` returns it: one key as a string,
+ * several as a list without empty entries, nothing as undefined. Duplicates
+ * are left to the scheduler, which collapses them for every keyed group.
+ * @internal
+ */
+export function normalizeKeys(raw: unknown): string | string[] | undefined {
+  const present = (k: unknown) => k !== undefined && k !== null && k !== '';
+  if (Array.isArray(raw)) {
+    const keys = raw.filter(present).map(k => String(k));
+    return keys.length === 0 ? undefined : keys.length === 1 ? keys[0] : keys;
+  }
+  return present(raw) ? String(raw) : undefined;
 }
 
 export interface KeyedRateLimitGroupOptions {
@@ -25,9 +40,11 @@ export interface KeyedRateLimitGroupOptions {
    * new KeyedRateLimitGroup(windows, { id: 'api', keyFrom: t => t.payload.endpoint })
    * ```
    *
-   * Returning undefined or an empty string makes `addTask` throw.
+   * Return a list for a task that needs several buckets at once; it is
+   * admitted only when every one has room. Returning undefined, an empty
+   * string or an empty list makes `addTask` throw.
    */
-  keyFrom?: (task: KeyedTaskLike) => string | undefined;
+  keyFrom?: (task: KeyedTaskLike) => string | string[] | undefined;
   /**
    * How long a key with no running tasks is kept after its last activity.
    * Defaults to twice the largest window, which is the point past which the key
@@ -64,8 +81,8 @@ interface KeyState {
  * over the limit wait in a per-key blocked queue, so a saturated key never
  * delays tasks belonging to another key.
  *
- * Like the other groups this is optimistic: a key's limit can be briefly
- * exceeded by up to `maxThreads x maxConcurrentTasks` under race conditions.
+ * No more than a window's `limit` tasks of one key start within its
+ * `windowMs`; completions count against the window too.
  */
 export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
   readonly id: string;
@@ -73,7 +90,7 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
   readonly keyed = true;
 
   private windows: RateWindow[];
-  private keyFrom: (task: KeyedTaskLike) => string | undefined;
+  private keyFrom: (task: KeyedTaskLike) => string | string[] | undefined;
   private idleKeyTtlMs: number;
   private keys = new Map<string, KeyState>();
   private stats = {
@@ -91,10 +108,9 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
     this.idleKeyTtlMs = options.idleKeyTtlMs ?? Math.max(...windows.map(w => w.windowMs)) * 2;
   }
 
-  /** Bucket this task belongs to. The scheduler throws if this returns nothing. */
-  keyFor(task: unknown): string | undefined {
-    const key = this.keyFrom(task as KeyedTaskLike);
-    return key === undefined || key === null || key === '' ? undefined : String(key);
+  /** Bucket(s) this task belongs to. The scheduler throws if this returns nothing. */
+  keyFor(task: unknown): string | string[] | undefined {
+    return normalizeKeys(this.keyFrom(task as KeyedTaskLike));
   }
 
   /**
@@ -153,6 +169,25 @@ export class KeyedRateLimitGroup extends EventTarget implements ResourceGroup {
     this.dispatchEvent(new CustomEvent('slot-released', {
       detail: { groupId: this.id, key: resolved }
     }));
+  }
+
+  /**
+   * When `key`'s bucket next has room again, as a `Date.now()` time, if a
+   * window of it is full now; undefined while it has room. As
+   * {@link RateLimitGroup.nextCapacityAt}, per key: each key's waiters are
+   * woken when that key's window rolls over.
+   */
+  nextCapacityAt(key?: string): number | undefined {
+    const state = this.keys.get(key ?? '');
+    if (!state) return undefined; // An untouched key has a full bucket
+    const now = Date.now();
+    let at: number | undefined;
+    for (let i = 0; i < this.windows.length; i++) {
+      const { limit, windowMs } = this.windows[i];
+      const freesAt = windowFreesAt(state.completed[i], state.runningStartTimes, limit, windowMs, now);
+      if (freesAt !== undefined && (at === undefined || freesAt > at)) at = freesAt;
+    }
+    return at;
   }
 
   /**

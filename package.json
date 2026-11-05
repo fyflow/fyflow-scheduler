@@ -1,6 +1,6 @@
 {
   "name": "fyflow-scheduler",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Parallel task scheduler with resource management, worker pools, and cross-platform support",
   "main": "./dist/node/index.js",
   "browser": "./dist/browser/index.js",
@@ -21,6 +21,8 @@
     "test:events": "npm run build:dev && node dev-dist/node/tests/runner.js events",
     "test:messages": "npm run build:dev && node dev-dist/node/tests/runner.js messages",
     "test:cancellation": "npm run build:dev && node dev-dist/node/tests/runner.js cancellation",
+    "test:admission": "npm run build:dev && node dev-dist/node/tests/runner.js admission",
+    "test:grants": "npm run build:dev && node dev-dist/node/tests/runner.js grants",
     "test:performance": "npm run build:dev && node dev-dist/node/tests/runner.js performance",
     "test:deno": "deno task test",
     "test:deno:core": "deno task test:core",
@@ -41,6 +43,7 @@
     "benchmark:startup": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories startup",
     "benchmark:contention": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories contention",
     "benchmark:overlapping": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --categories overlapping",
+    "benchmark:admission": "npm run build:dev && node dev-dist/node/benchmark/admission.js",
     "benchmark:help": "npm run build:dev && node dev-dist/node/benchmark/runBenchmarks.js --help"
   },
   "keywords": ["scheduler", "task", "worker", "async", "concurrency", "workflow", "parallel", "typescript"],

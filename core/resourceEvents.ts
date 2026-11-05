@@ -44,10 +44,24 @@ export type ResourceReleaseReason = 'settled' | 'worker-teardown' | 'shutdown';
  * exactly rather than only the set of waiting tasks.
  */
 export type ResourceUnblockReason =
-  /** Moved to the ready queue - the ordinary exit. */
+  /**
+   * Admitted - the ordinary exit. It is dispatched in the same turn, and its
+   * `resource.acquired` follows; if its pool has no free slot it waits in the
+   * ready queue for one, holding nothing.
+   */
   | 'admitted'
-  /** Admitted via a different group and spliced out of this one. */
+  /**
+   * No longer emitted. It named a task admitted via a different group and
+   * spliced out of this one, which needed a task listed in two queues at once -
+   * and a waiter is now in exactly one. Kept so code naming it still compiles.
+   */
   | 'superseded'
+  /**
+   * Woken by this group, but another group it needs is still full: it moved
+   * to the tail of that group's queue. The `resource.blocked` for that queue
+   * is emitted just before this. Still waiting - not admitted.
+   */
+  | 'migrated'
   /**
    * Its worker pool no longer exists. The task is failed terminally rather than
    * dropped - `task.failed`, then `task.user_action` unless it is optional, and
@@ -58,6 +72,13 @@ export type ResourceUnblockReason =
    * happen silently.
    */
   | 'orphaned'
+  /**
+   * One of its groups threw while it was being admitted - a `limitFor`,
+   * `keyFrom` or `requestFrom` answering badly after `addTask`, or a custom
+   * group's `canRun`. Failed terminally, as for `orphaned`, with the group's
+   * error as `cause`: the same answer would fail every attempt.
+   */
+  | 'failed'
   /** The task was cancelled while it waited. `task.cancelled` follows. */
   | 'cancelled'
   /** The scheduler is tearing down and discarded every waiter. */
@@ -81,11 +102,33 @@ export interface ResourceEventDetail {
   cost: number;
   /** The bucket, for keyed groups. */
   key?: string;
+  /**
+   * What the group granted, on `resource.acquired` and `resource.released`
+   * only, and only for a group that returns one - a `UnitGroup`'s units, e.g.
+   * `['gpu1']`, so a viewer can show which card is busy. The same copy the work
+   * sees, frozen one level down. Absent for every group that grants nothing.
+   */
+  grant?: unknown;
+  /**
+   * What the waiter asked of the group, on `resource.blocked` and
+   * `resource.unblocked` only, and only when it made a request - a
+   * `UnitGroup` waiter pinned to a unit carries `{ from: ['gpu1'] }`.
+   */
+  request?: unknown;
+  /**
+   * Which of the group's queues the waiter is in, on `resource.blocked` and
+   * `resource.unblocked`, for a group that queues per wait set - a
+   * `UnitGroup` queues per candidate set. Opaque: compare it, do not parse
+   * it. Absent for the group's plain queue, which holds every waiter that
+   * made no request or one that does not narrow the units (`prefer` alone).
+   * `queuePosition` counts within (`key`, `waitSet`).
+   */
+  waitSet?: string;
   /** `Date.now()` at emit, matching every other timestamp in the library. */
   timestamp: number;
   /**
    * Group state **after** the operation, one entry per gauge the group
-   * declares. Never clamped: an optimistic group may read above its limit.
+   * declares. Never clamped: a group may read above a limit lowered under running tasks.
    */
   readings: GaugeReading[];
 }
@@ -135,10 +178,15 @@ export interface AdmissionWaiter {
   cost: number;
   /**
    * 0-based **within its own queue**, and the head gates everything behind it.
-   * A keyed group has one queue per key, so several waiters in the same group
-   * can each be at position 0 - pair this with `key`.
+   * A keyed group has one queue per key, and a `UnitGroup` one per wait set,
+   * so several waiters in the same group can each be at position 0 - pair
+   * this with `key` and `waitSet`.
    */
   position: number;
   /** The bucket, for keyed groups. */
   key?: string;
+  /** What it asked of the group, when it made a request - as on `resource.blocked`. */
+  request?: unknown;
+  /** Its queue, for a group with wait sets - as on `resource.blocked`. Absent for the plain queue. */
+  waitSet?: string;
 }

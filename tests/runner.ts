@@ -87,8 +87,14 @@ class TestRunner {
       // Run task cancellation tests
       await this.runSuite('Cancellation', `./suites/cancellation${ext}`);
 
+      // Run admission and wake-up tests
+      await this.runSuite('Admission', `./suites/admission${ext}`);
+
       // Run worker -> host message tests
       await this.runSuite('Worker Messages', `./suites/messages${ext}`);
+
+      // Run grant tests: what a group's onStart returns, carried to the work
+      await this.runSuite('Grants', `./suites/grants${ext}`);
 
       // Run the executable documentation examples
       await this.runSuite('Documentation Examples', `./suites/docs${ext}`);
@@ -117,6 +123,8 @@ class TestRunner {
       'resource-events': `./suites/resource-events${ext}`,
       'messages': `./suites/messages${ext}`,
       'cancellation': `./suites/cancellation${ext}`,
+      'admission': `./suites/admission${ext}`,
+      'grants': `./suites/grants${ext}`,
       'performance': `./performance/contention-scaling${ext}`
     };
 
@@ -156,6 +164,8 @@ async function main() {
     console.log('  events       - resource.* events, gauges and the admission queue');
     console.log('  messages     - Worker -> host messages via emit()');
     console.log('  cancellation - scheduler.cancel()');
+    console.log('  admission    - Admission and wake-up paths, with known gaps');
+    console.log('  grants       - Grants: UnitGroup units and custom grants, in the work');
     console.log('  docs         - Executable documentation examples');
     console.log('  performance  - Performance tests');
     console.log('');

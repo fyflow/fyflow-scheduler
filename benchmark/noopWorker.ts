@@ -30,6 +30,18 @@ export default class NoopWorker extends BaseWorker {
         if (delay > 0) {
             await new Promise(resolve => setTimeout(resolve, delay));
         }
+        // Yield to the event loop once. A task that only awaits microtasks
+        // keeps every timer - including a benchmark's own sampler - from firing
+        // until the whole run is over (benchmark/admission.ts). A message, not
+        // setTimeout(0): that costs a whole timer tick, ~15 ms on Windows, and
+        // the run would measure the clock rather than the scheduler.
+        if (payload.yieldMacrotask) {
+            await new Promise<void>(resolve => {
+                const channel = new MessageChannel();
+                channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
+                channel.port2.postMessage(0);
+            });
+        }
         // await new Promise(resolve => setTimeout(resolve, 100));
         // for(let i = 0; i < 10000; i++) {
         //     Math.random();

@@ -56,7 +56,9 @@ export function parsePublishedFileUrls(output: string): string[] {
 
 // Matches the specifier of a static import/export or a dynamic import().
 // `import.meta.url` does not match: `.` is neither a quote nor an opening paren.
-const SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["']([^"']+)["']/g;
+// Nor does a keyword inside a string: `['from', 'prefer']` once read as a
+// dependency named ", ", because `from'` looked like the end of an import.
+const SPECIFIER = /(?:(?<!["'`])\bfrom\s*|(?<!["'`])\bimport\s*\(\s*|(?<!["'`])\bimport\s+)["']([^"']+)["']/g;
 const BLOCK_COMMENT = /\/\*[\s\S]*?\*\//g;
 // `//` not preceded by a colon, so `https://` survives as part of a specifier.
 const LINE_COMMENT = /(?<!:)\/\/.*$/gm;

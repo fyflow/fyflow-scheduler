@@ -65,6 +65,12 @@ export default class DocsWorker extends BaseWorker {
       throw new Error('DocsWorker was asked to fail');
     }
 
+    // AGENTS.md section 5, "Units with names": which unit this ran on
+    if (payload.reportGrants) {
+      const [card] = (context?.grants?.gpu ?? []) as string[];
+      return { card, grants: context?.grants, worker: this.workerContext?.grants };
+    }
+
     if (payload.reportProgress) {
       const steps = payload.reportProgress as number;
       for (let i = 0; i < steps; i++) {

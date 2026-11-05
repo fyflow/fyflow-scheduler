@@ -1,6 +1,6 @@
 {
     "name": "@fyflow/scheduler",
-    "version": "0.6.0",
+    "version": "0.7.0",
     "license": "MIT",
     "exports": "./index.ts",
     "publish": {
@@ -21,6 +21,8 @@
         "!groups/concurrentLimitGroup.ts",
         "!groups/rateLimitGroup.ts",
         "!groups/keyedRateLimitGroup.ts",
+        "!groups/keyedConcurrentLimitGroup.ts",
+        "!groups/unitGroup.ts",
         "!README.md",
         "!LICENSE",
         ".claude",
@@ -60,8 +62,10 @@
       "test:events": "deno run --allow-read --allow-net tests/runner.ts events",
       "test:messages": "deno run --allow-read --allow-net tests/runner.ts messages",
       "test:cancellation": "deno run --allow-read --allow-net tests/runner.ts cancellation",
+      "test:admission": "deno run --allow-read --allow-net tests/runner.ts admission",
+      "test:grants": "deno run --allow-read --allow-net tests/runner.ts grants",
       "test:performance": "deno run --allow-read --allow-net tests/runner.ts performance",
-      "test:scripts": "deno test scripts/",
+      "test:scripts": "deno test scripts/ tests/harness_test.ts",
       "benchmark": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts",
       "benchmark:quick": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --quick",
       "benchmark:baseline": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories baseline",
@@ -69,6 +73,7 @@
       "benchmark:startup": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories startup",
       "benchmark:contention": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories contention",
       "benchmark:overlapping": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --categories overlapping",
+      "benchmark:admission": "deno run --allow-read --allow-write benchmark/admission.ts",
       "benchmark:help": "deno run --allow-read --allow-net --allow-write benchmark/runBenchmarks.ts --help"
     }
   }

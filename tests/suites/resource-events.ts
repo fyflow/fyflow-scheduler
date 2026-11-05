@@ -23,7 +23,8 @@ import {
   FyflowTask,
   ConcurrentLimitGroup,
   RateLimitGroup,
-  KeyedRateLimitGroup
+  KeyedRateLimitGroup,
+  KeyedConcurrentLimitGroup
 } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 import type {
@@ -264,6 +265,7 @@ class ResourceEventsTestSuite {
     this.results.push(await this.runTest('Shutdown Unblocks Every Remaining Waiter', () => this.testShutdownUnblocks()));
     this.results.push(await this.runTest('A Retry Is One Acquire/Release Pair Per Attempt', () => this.testRetryPairsPerAttempt()));
     this.results.push(await this.runTest('Keyed Groups Read Per Bucket, Not In Aggregate', () => this.testKeyedReadings()));
+    this.results.push(await this.runTest('A Keyed Concurrency Group Reads Each Key Against Its Own Limit', () => this.testKeyedConcurrentReadings()));
     this.results.push(await this.runTest('S2 - The Five Events Carry A Timestamp', () => this.testTimestamps()));
     this.results.push(await this.runTest('Criterion 4 - Head-Of-Line Is Legible', () => this.testHeadOfLine()));
     this.results.push(await this.runTest('Criterion 4b - The Fold And The Accessor Agree, In Order', () => this.testFoldMatchesAccessor()));
@@ -932,6 +934,52 @@ class ResourceEventsTestSuite {
    * the key it was taken for. The keyless read reports nothing rather than an
    * aggregate that looks like utilisation and cannot say whether anything runs.
    */
+  /**
+   * KeyedConcurrentLimitGroup: one `units` level gauge per key, each against
+   * that key's own limit from `limitFor`. The release that empties a key reads
+   * 0 there, although the key's state is gone by then.
+   */
+  private async testKeyedConcurrentReadings(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(3, { id: 'disk', limitFor: key => (key === 'usb' ? 1 : 3) });
+    const scheduler = this.track(new FyflowScheduler(
+      { A: this.pool({ maxConcurrentTasks: 8, groups: ['disk'] }) },
+      { disk }
+    ));
+    const seen = this.record(scheduler);
+
+    await Promise.all([
+      scheduler.addTask(this.task('ssd-1', 'A', { limitKey: 'ssd' }), { createPromise: true }),
+      scheduler.addTask(this.task('ssd-2', 'A', { limitKey: 'ssd' }), { createPromise: true }),
+      scheduler.addTask(this.task('usb-1', 'A', { limitKey: 'usb' }), { createPromise: true })
+    ]);
+
+    const described = disk.describe().gauges;
+    if (described.length !== 1 || described[0].id !== 'units' || described[0].kind !== 'level' || described[0].limit !== 3) {
+      throw new Error(`describe() should be one level gauge 'units' with the default limit 3, got ${JSON.stringify(described)}`);
+    }
+    const acquires = seen.filter(r => r.name === 'acquired');
+    const releases = seen.filter(r => r.name === 'released');
+    for (const record of [...acquires, ...releases]) {
+      if (!record.detail.key) throw new Error('A keyed event arrived with no key');
+      const [reading, ...rest] = record.detail.readings;
+      if (!reading || rest.length > 0 || reading.id !== 'units') {
+        throw new Error(`Expected one 'units' reading, got ${JSON.stringify(record.detail.readings)}`);
+      }
+      const expected = record.detail.key === 'usb' ? 1 : 3;
+      if (reading.limit !== expected) throw new Error(`${record.detail.key} read limit ${reading.limit}, expected its own ${expected}`);
+    }
+    const ssd = acquires.filter(r => r.detail.key === 'ssd').map(r => r.detail.readings[0].value);
+    const usb = acquires.filter(r => r.detail.key === 'usb').map(r => r.detail.readings[0].value);
+    if (Math.max(...ssd) !== 2) throw new Error(`ssd peaked at ${Math.max(...ssd)}, expected 2`);
+    if (usb.length !== 1 || usb[0] !== 1) throw new Error(`usb read ${usb.join(',')}; ssd's units leaked into it`);
+    // Every key ends at 0, read after its state was dropped
+    for (const key of ['ssd', 'usb']) {
+      const last = releases.filter(r => r.detail.key === key).at(-1);
+      if (last?.detail.readings[0].value !== 0) throw new Error(`${key}'s last release read ${last?.detail.readings[0].value}, expected 0`);
+    }
+    if (disk.read().length !== 0) throw new Error('A keyless read() returned an aggregate rather than nothing');
+  }
+
   private async testKeyedReadings(): Promise<void> {
     const api = new KeyedRateLimitGroup([{ limit: 2, windowMs: 500 }], { id: 'api' });
     const scheduler = this.track(new FyflowScheduler(
@@ -982,11 +1030,16 @@ class ResourceEventsTestSuite {
   /**
    * A 20-unit pool waiting on a 24-unit group held by 2-unit workers.
    *
-   * The cheap pools keep cycling - short idle timeout, work arriving - so units
-   * are released and retaken throughout, and every release runs
-   * `_retryBlockedTasksForGroup`. That is the loop where a task is shifted out
-   * of a blocked queue and unshifted back within one synchronous pass, which is
-   * exactly what criterion 4b exists to catch.
+   * Three phases, each a different way a release reaches the queue:
+   *
+   * 1. Churn on warm Small workers. They are already held, so these tasks cost
+   *    nothing extra and run past the head without being admission at all.
+   * 2. An idle gap. The Smalls are reaped, every release wakes the queue, and
+   *    each wake must stop at the head: 18 units free, the head needs 20, and
+   *    the cheap waiter behind it - which fits - must not overtake.
+   * 3. Arrivals that need a new Small worker. They fit too, and must queue
+   *    behind the head rather than past it. Not awaited: they cannot run until
+   *    a Hold worker idles out, long after this returns.
    *
    * `observe` is called between dispatch passes; it receives the scheduler,
    * because a sampler that closed over a variable assigned after this returns
@@ -994,7 +1047,7 @@ class ResourceEventsTestSuite {
    */
   private async runHeadOfLineScenario(
     observe: (scheduler: FyflowScheduler, seen: Recorded[]) => void
-  ): Promise<{ scheduler: FyflowScheduler; seen: Recorded[] }> {
+  ): Promise<{ scheduler: FyflowScheduler; seen: Recorded[]; arrivals: string[] }> {
     const vram = new ConcurrentLimitGroup(24, 'vram');
 
     const pools: Record<string, any> = {
@@ -1043,23 +1096,19 @@ class ResourceEventsTestSuite {
       freeWhileQueued = Math.max(freeWhileQueued, vram.limit - vram.running);
       observe(scheduler, seen);
     }, 10);
+    const arrivals = Array.from({ length: 9 }, (_, i) => `arrival-${i}`);
     try {
-      // Rounds of churn separated by idle gaps. The gaps matter: every settle
-      // calls _schedulePeriodicRetry, which CLEARS the pending timer and starts
-      // a new one, so a continuously busy scheduler resets the 50ms retry
-      // forever and `_retryBlockedTasksForGroup` is never reached at all. An
-      // earlier version of this scenario churned without pausing and passed
-      // while testing nothing.
-      for (let round = 1; round <= 3; round++) {
-        await Promise.all(
-          Array.from({ length: 9 }, (_, i) =>
-            scheduler.addTask(this.task(`churn-${round}-${i}`, `Small${i}`), { createPromise: true })
-          )
-        );
-        // Longer than idleTimeout + idleCheckIntervalMs and than the retry
-        // interval, so workers are reaped AND the retry actually fires
-        await new Promise(resolve => setTimeout(resolve, 150));
-      }
+      // 1. Warm churn
+      await Promise.all(
+        Array.from({ length: 9 }, (_, i) =>
+          scheduler.addTask(this.task(`churn-${i}`, `Small${i}`), { createPromise: true })
+        )
+      );
+      // 2. Longer than idleTimeout + idleCheckIntervalMs, so the Smalls are reaped
+      await new Promise(resolve => setTimeout(resolve, 150));
+      // 3. Arrivals needing a worker, which must queue behind the head
+      arrivals.forEach((id, i) => scheduler.addTask(this.task(id, `Small${i}`)));
+      await new Promise(resolve => setTimeout(resolve, 100));
     } finally {
       clearInterval(timer);
     }
@@ -1072,7 +1121,7 @@ class ResourceEventsTestSuite {
       );
     }
 
-    return { scheduler, seen };
+    return { scheduler, seen, arrivals };
   }
 
   /**
@@ -1084,7 +1133,7 @@ class ResourceEventsTestSuite {
     let sawSomeoneBehind = false;
     const problems: string[] = [];
 
-    const { scheduler } = await this.runHeadOfLineScenario(sched => {
+    const { scheduler, arrivals } = await this.runHeadOfLineScenario(sched => {
       const queue = sched.getAdmissionQueue('vram').vram;
       if (!queue || queue.length === 0) return;
 
@@ -1124,6 +1173,17 @@ class ResourceEventsTestSuite {
         `The cheap waiter reached "${cheap?.state}" - it overtook the 20-unit head, ` +
         `which is how an expensive pool starves forever`
       );
+    }
+    // Arrivals too: each fits, and each would have overtaken before arrival
+    // admission was head-of-line
+    const overtook = arrivals.filter(id => scheduler.tasks.get(id)?.state !== 'pending');
+    if (overtook.length > 0) {
+      throw new Error(`Arrivals overtook the head: ${overtook.join(', ')}`);
+    }
+    const order = scheduler.getAdmissionQueue('vram').vram.map(w => w.holderId);
+    const expected = ['big-1', 'cheap-behind', ...arrivals];
+    if (order.join(',') !== expected.join(',')) {
+      throw new Error(`Queue is [${order}], expected [${expected}] - arrivals belong behind, in arrival order`);
     }
   }
 

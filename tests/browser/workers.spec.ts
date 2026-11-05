@@ -350,6 +350,45 @@ test.describe('FyFlow Web Worker Functionality', () => {
     expect(inline).toContain('c:log:2:{"i":2} c:failed');
   });
 
+  // Grants cross the boundary twice: a task's with its run message, a resident
+  // worker's with its init. Both must arrive the same inline and in a Web Worker
+  test('should deliver grants identically inline and in a Web Worker', async ({ page }) => {
+    const shapes = await page.evaluate(async () => {
+      const { FyflowScheduler, FyflowTask, WorkerManager, UnitGroup } = await import('/dev-dist/browser/index.js');
+
+      const out: string[] = [];
+      for (const inline of [true, false]) {
+        const gpu = new UnitGroup(['g0', 'g1', 'g2'], { id: 'gpu' });
+        const seat = new UnitGroup(['s0', 's1'], { id: 'seat' });
+        const pool = new WorkerManager('/dev-dist/browser/tests/workers/grantWorker.js', {
+          maxThreads: 1, maxConcurrentTasks: 2, inline, idleTimeout: 0, residentGroups: { gpu: 2 }, groups: ['seat']
+        });
+        const scheduler = new FyflowScheduler({ G: pool }, { gpu, seat });
+        const run = (id: string) => Promise.race([
+          scheduler.addTask(new FyflowTask({ id, workerType: 'G', payload: { holdMs: 30 } }), { createPromise: true }),
+          new Promise(resolve => setTimeout(() => resolve('timeout'), 5000))
+        ]);
+        const [a, b] = await Promise.all([run('a'), run('b')]) as any[];
+        out.push(JSON.stringify({
+          ctor: a.ctor, setup: a.setup, a: a.task, b: b.task, frozen: a.frozen, busy: gpu.getBusyUnits()
+        }));
+        await scheduler.shutdown();
+        out.push(JSON.stringify(gpu.getBusyUnits()));
+      }
+      return out;
+    });
+
+    const [inline, inlineAfter, threaded, threadedAfter] = shapes;
+    expect(threaded).toBe(inline);
+    expect(JSON.parse(inline)).toEqual({
+      ctor: { gpu: ['g0', 'g1'] }, setup: { gpu: ['g0', 'g1'] },
+      a: { gpu: ['g0', 'g1'], seat: ['s0'] }, b: { gpu: ['g0', 'g1'], seat: ['s1'] },
+      frozen: true, busy: ['g0', 'g1']
+    });
+    expect(inlineAfter).toBe('[]');
+    expect(threadedAfter).toBe('[]');
+  });
+
   // The cancel reaches a Web Worker as a message its signal aborts on; one
   // that never yields cannot read it, and is terminated after its grace period
   test('should cancel a task running in a Web Worker', async ({ page }) => {

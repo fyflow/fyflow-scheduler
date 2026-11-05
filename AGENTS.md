@@ -30,15 +30,37 @@ A", either await A and then add B, or have A spawn B (§7).
 | Not available | Use instead |
 |---|---|
 | Task dependencies (`dependsOn`, `parents`, `children`) | Await a task, or spawn from inside a worker (§7) |
-| `StrictLimitGroup`, token/semaphore acquisition | `ConcurrentLimitGroup` (soft) or `RateLimitGroup` |
+| `StrictLimitGroup`, token/semaphore acquisition | `ConcurrentLimitGroup`, which is already a hard cap, or `RateLimitGroup` |
 | `DagScheduler`, `DagTask` | `FyflowScheduler`, `FyflowTask` |
 | Priorities, cron/scheduled tasks, persistence | Not implemented |
 | `context.log()`, `task.log`, log levels | `context.emit('log', ...)` and `task.message` (§6, recipe in §10) |
 | Cancelling a whole run, or a task's descendants, in one call | `scheduler.cancel(id)` per task (§5, recipe in §10) |
 
-Both group types are **optimistic**: a limit can be briefly exceeded by up to
-`maxThreads × maxConcurrentTasks` under race conditions. Nothing here guarantees
-a hard cap.
+**Concurrency limits are hard caps.** No more tasks hold a `ConcurrentLimitGroup`
+than its limit, counted from `onStart` to `onFinish` - and no more hold one key of
+a `KeyedConcurrentLimitGroup` than that key's limit. A task's groups are checked
+and acquired in one synchronous turn, and every `resource.*` event goes out after
+the acquires it reports, so a listener that re-enters the scheduler - `addTask`
+dispatches synchronously - cannot slip a task in between.
+
+**A rate group caps starts.** No more than `limit` tasks start within any
+`windowMs`. Completions count against the window as well, so it can admit fewer;
+it does not cap how many run at once - pair it with a `ConcurrentLimitGroup` for
+that. `KeyedRateLimitGroup` applies the same per key.
+
+Two things look like an overshoot and are not:
+
+- **Counting events.** `task.running` minus `task.completed` can read above the
+  limit: a task's units are released before its `task.completed` fires, and the
+  freed unit can be refilled first. Read `group.getMetrics().running` instead.
+- **Lowering a limit at runtime.** `group.limit = n` takes effect at the next
+  admission. Tasks already running keep their units, and nothing new is admitted
+  until the count is below `n`. Raising it starts the waiters that now fit
+  straight away (§6).
+
+Re-entering the scheduler from inside a group's own methods (`canRun`,
+`onStart`, `onFinish`) or from the group's own `EventTarget` events is not
+supported: those run in the middle of admission.
 
 ---
 
@@ -257,6 +279,16 @@ export default class MyWorker extends BaseWorker {
     return sum;
   }
   ```
+- `grants` says *which* units a group gave this work, where a group returns
+  one - a `UnitGroup` (§5) names its units. `context.grants.gpu` is the task
+  attempt's, e.g. `['gpu1']`; `this.workerContext.grants.gpu` is the worker's
+  resident one, set **before the constructor runs**, so `setup()` can load onto
+  the right device. A task's `context.grants` includes its worker's resident
+  grants too, its own winning on a clash. It is per attempt: a retry or a
+  requeue is granted afresh and may get a different unit, so read it on every
+  attempt rather than caching it. Always an object, `{}` when nothing was
+  granted, and frozen one level down - a copy, on inline pools too. Optional in
+  the type, so a context you build by hand in a unit test still compiles
 - One instance is created per worker, lazily, and reused across tasks. Instance
   state persists between tasks — do not assume a fresh object per task.
 - Throwing from `run()` fails that task. Throwing from `setup()` fails the
@@ -271,19 +303,21 @@ export default class MyWorker extends BaseWorker {
 ```typescript
 import {
   FyflowScheduler, FyflowTask, WorkerManager,   // core
-  ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup,
+  ConcurrentLimitGroup, RateLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup,
+  UnitGroup,                                    // units with names
   BaseWorker, WorkerTerminationError,           // worker authoring
   CancelledError                                // what a cancelled task rejects with
 } from 'fyflow-scheduler';
 
 import type {
   FyflowSchedulerOptions, AddTaskOptions, CancelOptions,
-  WorkerManagerOptions, WorkerConfig, WorkerInterface, WorkerStatus,
+  WorkerManagerOptions, ResidentGroupRequest, WorkerConfig, WorkerInterface, WorkerStatus,
   WorkerInstanceState, BaseWorkerContext, TaskWorkerContext, WorkerContext,
   SpawnTaskConfig, ProgressData,
   TaskMessageDetail, WorkerMessageDetail, MessageOptions,     // emitted events
   ResourceGroup, ResourceGroupMetrics, ResourceGroupStats,
-  RateWindow, KeyedRateLimitGroupOptions, KeyedTaskLike,
+  RateWindow, KeyedRateLimitGroupOptions, KeyedConcurrentLimitGroupOptions, KeyedTaskLike,
+  UnitGroupOptions, UnitRequest, UnitId,
   GaugeKind, GaugeSpec, GaugeReading, GaugeDescription,       // gauges
   ResourceLifetime, HolderKind, ResourceReleaseReason,        // resource events
   ResourceUnblockReason, ResourceEventDetail,
@@ -304,7 +338,7 @@ worker wrappers the pool manages for you - you should not construct them.
 | `workerPools` | `Record<string, WorkerManager>` | Keys are the `workerType` values tasks refer to |
 | `resourceGroups` | `Record<string, ResourceGroup>` | Keys are the group ids used in `groups` / `workerGroups` |
 | `options.maxCompletedTasks` | `number` | Cap on retained terminal tasks. Default: unlimited |
-| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks. Default `50` |
+| `options.periodicRetryIntervalMs` | `number` | Heartbeat for waking blocked tasks that nothing else wakes: a custom group whose capacity changes without a `slot-released` or a `nextCapacityAt` (§6). The fallback, not the usual path. Default `50` |
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -368,7 +402,8 @@ task's too.
 | `retryPolicy` | `{ maxRetries, backoffMs }` | none | A retry starts no earlier than `backoffMs` after the attempt failed, however busy the scheduler is |
 | `attemptsSpent` | `number` | `0` | Attempts already made, e.g. before a restart. Reduces the retries left; a task whose budget is already spent **still runs once**. `TypeError` if not a number, `RangeError` if negative, fractional, `NaN` or infinite |
 | `workerGroups` | `string[]` | `[]` | **Added to** the pool's groups, not a replacement |
-| `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` with no custom `keyFrom` |
+| `limitKey` | `string` | none | Bucket for keyed groups. Required if the task belongs to a `KeyedRateLimitGroup` or `KeyedConcurrentLimitGroup` with no custom `keyFrom` |
+| `units` | `Record<string, unknown>` | none | Requests per group id, for a group that takes one: `{ gpu: { from: ['gpu1'] } }` pins the task to a `UnitGroup` unit (§5). A request naming a unit the group does not have throws at `addTask` |
 | `handleRejection` | `boolean` | `true` | Silences unhandled rejections for fire-and-forget |
 
 Readable after the run: `state`, `result`, `error`, `attempts`, `attemptNumber`,
@@ -415,7 +450,7 @@ this task plus everything it spawns (§7).
 | `inline` | `false` | `true` runs in the main process — right for async/IO, wrong for CPU-bound |
 | `config` | `{}` | First constructor argument for every worker instance |
 | `groups` | `[]` | Group ids every task in this pool must acquire |
-| `residentGroups` | `{}` | Groups held for a **worker's** lifetime — see below |
+| `residentGroups` | `{}` | Groups held for a **worker's** lifetime — see below. A value may be `{ cost?, from?, prefer? }`, a request to a `UnitGroup` (§5) |
 | `idleTimeout` | `5000` | Ms before an idle worker is terminated. `0` = never |
 | `idleCheckIntervalMs` | `5000` | How often idle workers are swept |
 | `requeueFailedTasks` | `true` | Requeue in-flight tasks when a worker dies |
@@ -425,7 +460,11 @@ this task plus everything it spawns (§7).
 
 Management: `getWorkerIds()`, `getWorkerStatus(id)`, `getAllWorkerStatuses()`,
 `restartWorker(id, newConfig?)`, `replaceWorker(...)` (alias),
-`updateWorkerConfig(id, config)`, `getResidentUsage()`, `shutdown()`.
+`updateWorkerConfig(id, config)`, `getResidentUsage()`, `getResidentGrants(id)`
+(what a worker's resident groups granted it, as its `workerContext.grants`
+shows it), `shutdown()`. `restartWorker` returns the old worker's resident
+units and takes fresh ones for the replacement; one that no longer fits is not
+created, and the next dispatch creates a worker once there is room.
 
 #### `residentGroups` — resources a worker holds by existing
 
@@ -454,13 +493,28 @@ new WorkerManager(url, { residentGroups: ['vram'] })
 
 A worker is not created while its cost does not fit, and tasks needing one wait
 until a holder is torn down — which happens on the normal idle-timeout path, so
-a pool with work arriving keeps its worker and its loaded model. Admission is
-head-of-line: a waiting expensive pool is not overtaken by cheaper ones.
+a pool with work arriving keeps its worker and its loaded model — **or until a
+worker the pool already has frees a slot**, whichever comes first. A task
+waiting for a new worker takes that slot from wherever it is in the queue: it
+no longer needs resident capacity, so it overtakes nobody. A pool allowed more
+workers than its units can hold runs on the workers it has.
+
+Admission is **head-of-line**: a waiting expensive pool is not overtaken by
+cheaper ones. That holds for new arrivals too - a task that would need a new
+worker queues behind anyone already waiting on one of that pool's resident
+groups, **even when its own cost fits**. Without that, a steady stream of cheap
+arrivals keeps an expensive waiter out forever. A task that has just waited for
+another group, a CPU limit say, counts as an arrival here: it waited for that
+group, not for a worker. A task for a pool whose worker already exists costs
+nothing extra and is not affected.
 
 Costs must be positive integers and no larger than the group's limit; both are
-rejected at construction, as is an unknown group id. Because the release is
+rejected at construction, as is an unknown group id, and a
+`KeyedConcurrentLimitGroup` - a worker holds its units across tasks, and so
+across keys, so there is no key to hold them under. Because the release is
 driven by the idle sweep, hand-over takes up to `idleTimeout + idleCheckIntervalMs`
-— lower `idleCheckIntervalMs` if that matters.
+— lower `idleCheckIntervalMs` if that matters. The release itself wakes the
+waiting pool straight away; it does not wait for the heartbeat.
 
 ##### `idleTimeout: 0` deadlocks a *contended* resident group
 
@@ -538,9 +592,11 @@ Use `inline: false` for that.
 new ConcurrentLimitGroup(limit: number, id?: string)
 new RateLimitGroup(windows: { limit: number, windowMs: number }[], id?: string)
 new KeyedRateLimitGroup(windows, { id?, keyFrom?, idleKeyTtlMs? })
+new KeyedConcurrentLimitGroup(limit: number, { id?, keyFrom?, limitFor? })
+new UnitGroup(units: (string | number)[] | number, { id?, requestFrom? })
 ```
 
-All three expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
+All five expose `canRun()`, `getMetrics()`, `getStats()`, and `describe()` /
 `read()` for gauges (below). Tasks over a limit wait in a blocked queue and are
 retried — never dropped. Multiple rate-limit windows are enforced together.
 
@@ -577,6 +633,220 @@ at once.
 
 ---
 
+#### Per-key concurrency limits
+
+`KeyedConcurrentLimitGroup` is a `ConcurrentLimitGroup` **per key**, for a
+resource that comes in independent instances - one disk each, one database
+each - where a single global limit would make work on one hold up work on
+another:
+
+```typescript
+const disk = new KeyedConcurrentLimitGroup(4, {      // 4 at once PER DISK
+  id: 'disk',
+  keyFrom: t => t.payload.drive,
+  limitFor: drive => (drive === 'E:' ? 1 : 4)        // a slow USB disk
+});
+
+const pool = new WorkerManager(url, { groups: ['disk'], inline: true });
+const scheduler = new FyflowScheduler({ CopyWorker: pool }, { disk });
+```
+
+- Keyed exactly like `KeyedRateLimitGroup`: `keyFrom` defaults to
+  `t => t.limitKey`, **a task with no derivable key throws at `addTask`**, and
+  blocked tasks are queued per key, so a saturated disk never delays another
+- A hard cap per key (§1): no more tasks hold a key than its limit
+- **`limitFor(key)`** gives a key its own limit; without it every key gets
+  `limit`. It must return a positive integer, and a bad answer throws at
+  `addTask`. The value is read when a key becomes active - its first running
+  task - and kept until the key is idle again, so a running task never sees its
+  own limit move; a key that comes back reads it afresh
+- **A key is dropped as soon as nothing holds it.** There is no history to keep,
+  so there is no `idleKeyTtlMs`, and high-cardinality keys cost nothing once done
+- `getMetrics()` is the aggregate plus `activeKeys`: `limit` is the default
+  per-key limit, and `available` / `utilization` are against the sum of the
+  active keys' own limits. `getKeyMetrics(key)` gives one key, `getActiveKeys()`
+  lists them
+- Not usable in `residentGroups` - rejected at construction
+
+##### Several keys per task
+
+A task that touches two disks - a copy from C: to D: - names both, by returning
+a list from `keyFrom`:
+
+```typescript
+const disk = new KeyedConcurrentLimitGroup(2, {
+  id: 'disk',
+  keyFrom: t => [t.payload.from, t.payload.to]
+});
+
+scheduler.addTask(new FyflowTask({
+  id: 'copy-1', workerType: 'CopyWorker', payload: { from: 'C:', to: 'D:' }
+}));
+```
+
+- **All or nothing.** The task is admitted only when every key has room, and
+  then holds one unit of each. It holds nothing while it waits, so it never
+  blocks a disk it has not got yet, and there is nothing to deadlock on
+- Duplicates collapse - a C: -> C: copy holds one unit - and empty entries are
+  dropped; a list with nothing left throws at `addTask`, like a missing key
+- It waits in the queue of the key refusing it now. Woken while its other key
+  is still full, it moves there (`resource.unblocked` with reason `migrated`),
+  to the back of that key's queue
+- Events are per (group, key): a two-disk copy emits two `resource.acquired`
+  and two `resource.released`, each with its own `key` and readings for that
+  key. `key` on an event is always one string
+- `KeyedRateLimitGroup` takes a list the same way, and counts the task against
+  every key's windows. So can a custom keyed group: `keyFor` may return
+  `string | string[]`
+- Use `keyFrom` for this: `task.limitKey` is a single string
+
+**Not fair to multi-key tasks.** Admission is greedy and nothing reserves a key,
+so a steady stream of single-disk tasks on either disk can keep a two-disk task
+waiting indefinitely. If that matters, give the two-disk work its own pool or
+throttle the single-disk stream.
+
+---
+
+#### Units with names
+
+`UnitGroup` is a concurrency limit whose units are told apart: two accelerator
+cards, licence seats, a port range. A holder takes free units, and the work is
+told **which**:
+
+```typescript
+const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });   // new UnitGroup(2): units 0 and 1
+
+const pool = new WorkerManager(url, { groups: ['gpu'], inline: true });
+const scheduler = new FyflowScheduler({ GpuWorker: pool }, { gpu });
+
+// in the worker
+async run(payload: any, context?: TaskWorkerContext) {
+  const [card] = context!.grants!.gpu as string[];             // 'gpu0' or 'gpu1'
+}
+```
+
+- **What it grants is an array, always**, at a cost of 1 too: `['gpu1']`. The
+  lowest-index free unit is granted
+- A hard cap (§1), like `ConcurrentLimitGroup`; `limit` is the number of units,
+  fixed for the group's lifetime. Not keyed
+- **Resident: one worker per device.** In `residentGroups` each worker holds
+  its `cost` units from creation to teardown, and sees them in
+  `this.workerContext.grants` from its constructor on:
+
+  ```typescript
+  const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+  new WorkerManager(modelUrl, { maxThreads: 2, residentGroups: { gpu: 1 } })
+  // two workers, one card each: setup() loads onto this.workerContext.grants.gpu[0]
+  ```
+
+  A cost above 1 grants that many units, all named. Teardown frees exactly the
+  units the worker held, and a replacement worker gets its own
+- `getBusyUnits()`, `getFreeUnits()`, `isBusy(unit)` read its state;
+  `getMetrics()` counts units like `ConcurrentLimitGroup`
+- A task's grant is per attempt: read it on every attempt, never cache it
+  across them
+- `onFinish` throws on a unit it did not grant, or one already free, and
+  `onStart` throws if asked for more units than are free. Admission is a hard
+  cap, so neither happens through the scheduler; they surface a bug rather than
+  absorb it
+
+##### Asking for particular units
+
+Not every holder will take any unit: a task may need *the* card its data
+sits on, and a pool may be pinned to some devices. A request is a **candidate
+set**, `from`, and the group grants from it; `prefer` is a hint that never
+blocks:
+
+| Want | Request |
+|---|---|
+| any unit | no request |
+| exactly `gpu1` | `{ from: ['gpu1'] }` |
+| any one of two cards | `{ from: ['gpu0', 'gpu1'] }` |
+| both of them, together - resident only | `{ cost: 2, from: ['gpu0', 'gpu1'] }` |
+| `gpu1` if free, else any | `{ prefer: ['gpu1'] }` |
+
+```typescript
+// a task: per group, on the task
+new FyflowTask({ id, workerType: 'GpuWorker', payload, units: { gpu: { from: ['gpu1'] } } })
+
+// a pool: where residentGroups takes a cost
+new WorkerManager(modelUrl, { maxThreads: 2, residentGroups: { gpu: { cost: 1, from: ['gpu0', 'gpu1'] } } })
+```
+
+- **Validated up front.** A unit the group does not have, in `from` or
+  `prefer`, throws at `addTask`; a pool's request is checked when the scheduler
+  is constructed, where a cost above the size of its `from` throws too. A
+  task-held hold always costs 1
+- `units[id]` is where the group reads a task's request by default; give the
+  group `requestFrom: task => ...` to derive it from the payload instead. It is
+  read when the task is added, and again for each attempt; change the object
+  afterwards and nothing notices
+- **`prefer` changes which unit, never whether.** A busy preferred unit is
+  skipped, and the task takes another. "The unit this task used last" is a
+  `prefer` - pass the previous attempt's grant back in
+- **A pinned waiter holds up nobody.** Waiters queue per candidate set, and a
+  release wakes only the heads of those queues: a task pinned to a busy `gpu1`
+  is never looked at when `gpu0` frees, and does not stop "any" tasks from
+  using it
+- **A freed unit goes to the oldest waiter that can use it**, whether it asked
+  for that unit or for any. So a pinned waiter cannot be starved by a stream of
+  "any" tasks: once it is the oldest one `gpu1` suits, it gets the next `gpu1`.
+  A task added from a listener of that very release can still take it first -
+  as it can for every group, since the release event comes before the wake
+- **Resident head-of-line is per set.** A pool waiting for a busy unit holds up
+  only pools whose sets overlap its own; one that wants a free unit goes ahead
+- A waiter's request is on its `resource.blocked` and `resource.unblocked`
+  (`request`), and on its `getAdmissionQueue()` entry. It is never a `key`:
+  `key` stays the bucket of a keyed group
+- **The queue it waits in is `waitSet`**, on the same events and entry: an
+  opaque string, to compare and never parse, and absent for the group's plain
+  queue. Each queue is numbered from 0, so read a position as "within
+  (`key`, `waitSet`)". Requests that differ can share a queue: no request and
+  `prefer` alone both wait in the plain one. `getAdmissionQueue()` lists the
+  queues in turn order - by when their head arrived, which is the order a
+  release serves them in
+- `{ cost: 2 }` with no request is `2` written as an object, for any group
+
+##### A custom group can grant too
+
+A group that sets `grants: true` grants what its `onStart` returns, and the
+scheduler carries it to the work, under the group's id. Returning nothing
+grants nothing:
+
+```typescript
+interface ResourceGroup {
+  readonly grants?: boolean;                                            // true: onStart's return value is a grant
+  canRun(key?: string, cost?: number, request?: unknown): boolean;
+  onStart?(key?: string, cost?: number, request?: unknown): unknown;
+  onFinish?(key?: string, cost?: number, grant?: unknown): void;
+}
+```
+
+- **Opt-in.** Without `grants: true` the return value is ignored and
+  `onFinish` gets `undefined`, as before grants existed - so a group written
+  then keeps working whatever its `onStart` returns, an `async onStart`'s
+  Promise included. `UnitGroup` sets it
+
+- `onFinish` gets **the original**, the very object `onStart` returned, so a
+  group can use identity. The work and the events get a copy
+- The grant must survive `structuredClone`. It is copied once, at acquire, on
+  inline pools as well, so a value that cannot be copied fails the same way
+  everywhere: the task fails with an error naming the group, and the units are
+  released. For a resident group the worker is never created, and the task
+  that would have created it fails
+- For a keyed group the entry is per key, `context.grants[id]` being
+  `{ [key]: grant }` - for a task naming one key too, so the shape depends on
+  the group and never on how many keys a task has
+- `request` is what the holder asked for, and the scheduler never reads it. A
+  group with a request language implements `requestFor(task)` (called at
+  `addTask`, so it can throw) and, for resident requests, `checkRequest`. To
+  queue its waiters apart, as `UnitGroup` does, it implements
+  `waitSetFor(request)` and `waitSetsOverlap(a, b)`. Without that, all its
+  waiters share one queue, where a head that cannot be granted holds up
+  everyone behind it
+
+---
+
 #### Gauges — how a group describes itself
 
 A group's state is not always one number. `RateLimitGroup` enforces *10/sec AND
@@ -602,6 +872,8 @@ group.read(key?)   // GaugeReading[]            dynamic: id, value, limit, reset
 | `ConcurrentLimitGroup` | 1 × `level`, id `units` |
 | `RateLimitGroup` | one `window` per configured window, ids `window-0`, `window-1`, … |
 | `KeyedRateLimitGroup` | the same windows, **per key** — `read()` requires a key and returns `[]` without one |
+| `KeyedConcurrentLimitGroup` | 1 × `level`, id `units`, **per key**, each reading against that key's own limit — `read()` requires a key, as above |
+| `UnitGroup` | 1 × `level`, id `units`. *Which* units are busy is not a number: it is the `grant` on `resource.acquired` / `resource.released`, and `getBusyUnits()` |
 | anything else | 1 × `level` derived from `getMetrics()` |
 
 **Both methods are optional.** A group implementing only `canRun`, `onStart`,
@@ -613,9 +885,10 @@ Two rules that are part of the contract, not implementation detail:
 
 - **An unrecognised `kind` renders as `level`**, using `value` and `limit`.
   Without this, adding a third kind later breaks every viewer already deployed.
-- **Readings are never clamped.** Groups are optimistic, so a `level` reading may
-  exceed its limit; clamping would make the event disagree with `getMetrics()`
-  exactly when the disagreement matters.
+- **Readings are never clamped.** A `level` reading can still exceed its limit -
+  after a limit is lowered under running tasks (§1), or from a custom group -
+  and clamping would make the event disagree with `getMetrics()` exactly when
+  the disagreement matters.
 
 `ResourceGroup.type` is `string`, not a closed union, so a group defined outside
 this library can name itself. Do not `switch` exhaustively on it — that is what
@@ -811,7 +1084,10 @@ interface ResourceEventDetail {
   holderId:   string;              // task id, or worker id
   workerType: string;              // the POOL KEY - see the warning below
   cost:       number;              // units taken. Always 1 except for a weighted resident hold
-  key?:       string;              // the bucket, for keyed groups
+  key?:       string;              // the bucket, for keyed groups - one per event, even for a task naming several
+  grant?:     unknown;             // acquired/released only: what the group granted, e.g. ['gpu1']. Absent if it grants nothing
+  request?:   unknown;             // blocked/unblocked only: what the waiter asked for, e.g. { from: ['gpu1'] }
+  waitSet?:   string;              // blocked/unblocked only: which of a UnitGroup's queues - opaque; absent for the plain queue
   timestamp:  number;
   readings:   GaugeReading[];      // group state AFTER the operation
 }
@@ -842,18 +1118,22 @@ resident acquire twice and see conservation drift by exactly the resident share.
 > the task spread flat, so `workerType` *looks* like the task's own field and is
 > not.
 
-**A blocked task leaves its queue five ways**, and `unblocked.reason` says which:
+A blocked task is in **exactly one** queue at a time: the queue of the group
+it is short of. **It leaves that queue seven ways**, and `unblocked.reason` says
+which:
 
 | `reason` | What happened |
 |---|---|
-| `admitted` | Moved to the ready queue — the ordinary exit |
-| `superseded` | Admitted via a *different* group and spliced out of this one |
+| `admitted` | Every group it needs has room for it. It is dispatched straight away, or, if its pool has no free slot, waits in the ready queue for one. The ordinary exit |
+| `migrated` | This group (or key) freed up, but another group it needs - or another key of the same group, for a task naming several - is still full. It moves to the **tail** of that queue. The `resource.blocked` for the new queue comes **before** this event, so a fold never sees the task in no queue |
+| `superseded` | No longer emitted: it came from a task listed in two queues at once, which cannot happen any more. Kept in the type so code that names it still compiles |
 | `orphaned` | Its worker pool no longer exists. The task is **failed terminally** — `task.failed`, then `user_action` unless it is optional, and its promise rejects. Retries are skipped: the pool is gone |
+| `failed` | One of its groups threw while it was being admitted — a `limitFor`, `keyFrom` or `requestFrom` answering badly after `addTask`, or a custom group's `canRun`. **Failed terminally**, as for `orphaned`, with the group's error as `cause`: the same answer would fail every attempt. A task the dispatch loop was about to start fails the same way, with no `unblocked`, since it was in no queue |
 | `shutdown` | The scheduler tore down and discarded every remaining waiter |
 | `cancelled` | It was cancelled while it waited (§5) |
 
-**Do not switch exhaustively on `reason`.** `cancelled` was added after the
-first four, and the union may grow again - the same rule as for `groupType`.
+**Do not switch exhaustively on `reason`.** `cancelled`, `migrated` and
+`failed` were added later, and the union may grow again - the same rule as for `groupType`.
 Treat a reason you do not recognise as an exit.
 
 Two invariants worth folding against, because a fold can stay internally
@@ -876,14 +1156,22 @@ interface AdmissionWaiter {
   workerType: string;                    // its pool
   lifetime:   'task-held' | 'resident';  // what it is waiting to acquire
   cost:       number;                    // the pool's per-worker cost, or 1 for task-held
-  position:   number;                    // 0-based; 0 is the head, and the head gates the rest
+  position:   number;                    // 0-based; 0 is the head, and it is admitted first
   key?:       string;                    // the bucket, for keyed groups
+  request?:   unknown;                   // what it asked of the group, if anything - e.g. { from: ['gpu1'] }
+  waitSet?:   string;                    // which of a UnitGroup's queues it is in; absent for the plain queue
 }
 ```
 
 Keyed by **group id**, with the bucket on the waiter. A keyed group has one
-sub-queue per key; they are concatenated in key order, each numbered from 0. A
+sub-queue per key; they are concatenated in key order, each numbered from 0.
+A `UnitGroup` has one per wait set, concatenated in the order their heads
+arrived, each numbered from 0 (§5). A
 group with an empty queue is absent rather than present-and-empty.
+
+It lists **every** waiter. A task is admitted from the head when the group frees
+up, one at a time, until the group has no more room. A task waiting on two groups
+is listed once, under the group it is short of right now.
 
 `cost` is what makes a stall legible: a 20-unit waiter at position 0 is the
 entire reason four 2-unit pools are not starting, because head-of-line admission
@@ -899,13 +1187,89 @@ a fold.
 
 Two mechanisms, and knowing which applies explains the latency you see:
 
-- **Directly**, when a slot frees. Releasing a task-held group retries that
-  group's queue in the same turn, so a task waiting on a concurrency limit
-  starts as soon as one finishes.
+- **Directly**, when capacity frees. Releasing a task-held group admits from
+  that group's queue in the same turn, so a task waiting on a concurrency limit
+  starts as soon as one finishes. A worker torn down wakes its resident groups'
+  queues the same way, a microtask later. A task waiting on two groups waits in
+  the queue of the one it is short of, so whichever release it needs is the one
+  that wakes it. A task waiting for a new worker is also admitted when one of
+  its pool's existing workers settles a task and has a slot free.
+- **When a rate window rolls over.** Capacity that comes back with time
+  rather than with a release has a time the group can name, and
+  `RateLimitGroup` and `KeyedRateLimitGroup` name it (`nextCapacityAt`,
+  below). The scheduler wakes that queue - that key's, for a keyed group - at
+  that time, so a rate-limited waiter starts when its window frees, as
+  closely as the runtime's timers allow, not on the next heartbeat. Timers
+  on Windows can run 10-15ms late.
+- **When a group says so.** A group emitting `slot-released` has its waiters
+  woken a microtask later - for a keyed group, those of `detail.key`, if it
+  names one. An unkeyed group's waiters are all woken, whatever the detail
+  says. `ConcurrentLimitGroup` emits it when you **raise** its `limit`, even
+  from inside another group's release.
 - **On the heartbeat**, every `periodicRetryIntervalMs` (default 50ms), for
-  everything with no such signal — a **rate-limit window** rolling over, and
-  **resident admission**, neither of which raises an event when it becomes
-  satisfiable.
+  anything none of these covers: a custom group whose capacity changes
+  without saying so. Also one deliberate case: a pool at the head of a
+  resident queue whose task-held group is full when its units free up. It
+  keeps its place, so the pools behind it cannot take those units, and is
+  retried by the heartbeat.
+
+A rate window counts a finished task from when it **finished**: with 1 per
+50ms, the next task starts 50ms after the previous one finished, not after
+it started. That is the group's rule, not wake latency. A task finishing
+after the scheduler asked moves the time later, and the wake at the earlier
+time finds no room and asks again - one more timer, not a missed wake.
+
+**What time wakes cost.** One timer for the whole scheduler, set for the
+earliest time, however many keys wait - 200 keys rolling over at 200
+different times are one pending timer, not 200. The group is asked when a
+queue starts waiting, and again when its time comes with waiters left - not
+per waiter, not on every release, not on the heartbeat. A group cannot put
+the scheduler into a hot loop: a time that is not a finite number is
+ignored, and that queue falls back to the heartbeat. A time already due is
+woken at once - it is real at a millisecond boundary, or when an arrival
+took the room first - but again and again with no waiter admitted, each
+repeat waits twice as long, up to `periodicRetryIntervalMs`. The same goes
+for a group that refuses a waiter and then says it has room, provided
+`canRun` agrees: `Date.now()` can step back a millisecond, or a window's
+last millisecond pass between the two calls. A group that names no time and
+still refuses is left to its release, and is not polled. A time further off
+than a timer can wait - a window over about 24.8 days - is waited for in
+24.8-day steps. With no group that names a time, none of this runs.
+
+A custom group whose capacity comes back by itself can take part:
+
+```typescript
+class QuotaGroup extends EventTarget {
+  // ...canRun, onStart, onFinish, getMetrics...
+
+  // When canRun(key) may next be true with no release, as a Date.now() time;
+  // undefined while there is room, or when only a release can make room
+  nextCapacityAt(key?: string): number | undefined { /* ... */ }
+
+  // Capacity came back from outside - a quota topped up, a limit raised
+  topUp(key?: string) {
+    this.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: this.id, key } }));
+  }
+}
+```
+
+- `nextCapacityAt` is looked up when the scheduler is constructed. A group
+  given one later is not asked
+- The scheduler does not ask again while a time is pending, because a rate
+  window's time only moves later. A group whose time can move **earlier**
+  should emit `slot-released` when it does
+- If it throws, the scheduler warns once per group and leaves that group to
+  the heartbeat. It is a hint, so no task fails over it
+- A `slot-released` emitted from inside the scheduler's own release of that
+  group - the library's groups emit one from `onFinish` - wakes nothing
+  twice: that release has woken those waiters already. So is one emitted
+  while the scheduler is waking that group's waiters, from `canRun`, say:
+  that wake is asking the group already. Emit it when room comes back from
+  outside, not on every check
+
+A release admits only what it freed. One finished task admits one waiter, and a
+weighted release admits as many as now fit. The cost of a release does not
+depend on how many tasks are waiting.
 
 The heartbeat runs on a fixed interval while work exists. It used to be
 restarted on every settle, which made it a debounce: a scheduler completing
@@ -1058,9 +1422,9 @@ resources, until `run()` returns.
 | Compile error extending `BaseWorker` | `setup()` / `teardown()` not implemented — both are abstract |
 | Task ends in `user_action`, not `failed` | Non-optional task, retries exhausted |
 | Memory grows in a long-running process | Completed tasks are retained; set `maxCompletedTasks` |
-| Limit briefly exceeded | Groups are optimistic by design (§1) |
+| A limit looks exceeded | Counted from `task.running`/`task.completed`, which overshoot - read `group.getMetrics().running`. Or the limit was lowered while tasks held it (§1) |
 | A resource group has no effect at all | The pool never declared it. Registering a group on the scheduler is not enough - add it to the pool's `groups` or the task's `workerGroups` |
-| `Missing limit key for group "x"` | The task belongs to a `KeyedRateLimitGroup` but has no `limitKey`, and the group's `keyFrom` returned nothing |
+| `Missing limit key for group "x"` | The task belongs to a keyed group (`KeyedRateLimitGroup`, `KeyedConcurrentLimitGroup`) but has no `limitKey`, and the group's `keyFrom` returned nothing |
 | `Task "x" was cancelled - create a new FyflowTask to run it again` | `addTask` with a task object that was cancelled. A new `FyflowTask` may reuse the id |
 | `Promise.all` over a run rejects with `CancelledError` | One of its tasks was cancelled, and a cancelled task's promise rejects. Use `Promise.allSettled`, or catch `CancelledError` |
 | A cancelled threaded task ends `forced`, and its worker is replaced | The worker did not stop within `cancelGraceMs`: check `context.signal`, and yield in CPU-bound loops (§4) |

@@ -54,8 +54,9 @@ export interface GaugeSpec {
  * The dynamic half - carried on every resource event, and the state *after*
  * whatever the event reports.
  *
- * `value` is not clamped: groups are optimistic, so a `level` reading may
- * exceed its limit. Clamping would make the event disagree with `getMetrics()`.
+ * `value` is not clamped: a `level` reading can exceed its limit - after the
+ * limit is lowered under running tasks, or from a custom group. Clamping would
+ * make the event disagree with `getMetrics()`.
  */
 export interface GaugeReading {
   /** Matches a {@link GaugeSpec.id} from the same group. */
@@ -90,11 +91,23 @@ export interface ResourceGroup extends EventTarget {
   readonly keyed?: boolean;
 
   /**
-   * Key this task belongs to, for keyed groups. Returning undefined or an empty
-   * string makes `addTask` throw - a task with no key would otherwise silently
-   * bypass or share a bucket.
+   * True when what `onStart` returns is a **grant** - see
+   * {@link ResourceGroup.onStart}. Opt-in, so a group written before grants
+   * keeps working whatever its `onStart` happens to return: an
+   * `async onStart` returns a Promise, which is not a grant and cannot be
+   * copied. `UnitGroup` sets it.
    */
-  keyFor?(task: unknown): string | undefined;
+  readonly grants?: boolean;
+
+  /**
+   * Key this task belongs to, for keyed groups - or several, for a task that
+   * needs more than one: a copy from C: to D: holds both disks. The task is
+   * admitted only when every key has room, and holds one unit of each;
+   * duplicates collapse. Returning undefined, an empty string or an empty list
+   * makes `addTask` throw - a task with no key would otherwise silently bypass
+   * or share a bucket.
+   */
+  keyFor?(task: unknown): string | string[] | undefined;
 
   /**
    * Capacity check (synchronous). `key` is supplied only for keyed groups; a
@@ -103,18 +116,66 @@ export interface ResourceGroup extends EventTarget {
    *
    * `cost` is how many units the caller intends to take, defaulting to 1. Only
    * concurrency groups weigh it - see {@link ResourceGroup.onStart}.
+   *
+   * `request` is what the holder asked of this group, passed through
+   * unread: the scheduler never interprets it. Only a group that defines a
+   * request language - `UnitGroup`'s `{ from, prefer }` - looks at it.
    */
-  canRun(key?: string, cost?: number): boolean;
+  canRun(key?: string, cost?: number, request?: unknown): boolean;
 
   /**
    * Take `cost` units (default 1). Called synchronously at the moment the
    * scheduler commits to running a task, or to creating a worker that declares
    * the group in `residentGroups`.
+   *
+   * For a group that sets {@link ResourceGroup.grants}, a return value other
+   * than `undefined` is a **grant**: what the holder got, as opposed to how
+   * much - which card, which seat. The scheduler hands a copy to the work
+   * (`context.grants[groupId]` for a task, `workerContext.grants[groupId]` for
+   * a resident worker) and the original back to `onFinish`. It must survive
+   * `structuredClone`; one that does not fails the dispatch, and the units are
+   * released. Without `grants: true` the return value is ignored, as it was
+   * before grants existed.
    */
-  onStart?(key?: string, cost?: number): void;
+  onStart?(key?: string, cost?: number, request?: unknown): unknown;
 
-  /** Return `cost` units (default 1). Must mirror the matching `onStart`. */
-  onFinish?(key?: string, cost?: number): void;
+  /**
+   * Return `cost` units (default 1). Must mirror the matching `onStart`.
+   * `grant` is exactly what that `onStart` returned - the same object, not a
+   * copy - or undefined if it returned nothing or the group does not grant.
+   */
+  onFinish?(key?: string, cost?: number, grant?: unknown): void;
+
+  /**
+   * The request `task` makes of this group, for a group with a request
+   * language. Called at `addTask`, so a bad request throws there; the result
+   * is what `canRun` and `onStart` receive for that task. Omit it and the
+   * group never gets one.
+   */
+  requestFor?(task: unknown, cost?: number): unknown;
+
+  /**
+   * Throws if `request` could never be granted `cost` units. Called when a
+   * pool declares a request in `residentGroups`, which a group without this
+   * method rejects.
+   */
+  checkRequest?(request: unknown, cost?: number): void;
+
+  /**
+   * The queue a waiter with `request` waits in: one per distinct answer, so a
+   * waiter that cannot use what was freed is never looked at. `undefined` is
+   * the group's plain queue. A release wakes every queue of the group, oldest
+   * head first. Without it, all of the group's waiters share one queue, in
+   * which a head that cannot be granted holds up everyone behind it.
+   */
+  waitSetFor?(request: unknown): string | undefined;
+
+  /**
+   * Whether waiters in two wait sets compete - share a unit. Resident
+   * admission is head-of-line only between those that do. Defaults to
+   * equality.
+   */
+  waitSetsOverlap?(a: string | undefined, b: string | undefined): boolean;
 
   // Get current metrics
   getMetrics(): ResourceGroupMetrics;
@@ -144,7 +205,31 @@ export interface ResourceGroup extends EventTarget {
    */
   read?(key?: string): GaugeReading[];
 
+  /**
+   * For capacity that comes back with time rather than with a release - a
+   * rate window rolling over: when `canRun(key)` may next be true, as a
+   * `Date.now()` time. Undefined when there is room now, or when only a
+   * release or an outside change can make room.
+   *
+   * Optional. The scheduler asks when a queue starts waiting on this group
+   * (per key, for a keyed group), and again when that time comes and waiters
+   * are left - not per waiter, and not while a time is pending. It keeps one
+   * timer for every group and key together, at the earliest time asked for.
+   * A time that is not a finite number is ignored, and the heartbeat covers
+   * that queue. A time already due wakes it at once; repeated with nobody
+   * admitted, it backs off, doubling up to `periodicRetryIntervalMs`.
+   * Undefined just after a refusal counts as due only if `canRun` then
+   * agrees there is room. A
+   * group whose capacity can come back sooner than it said should emit
+   * `slot-released`. Looked up when the scheduler is constructed.
+   */
+  nextCapacityAt?(key?: string): number | undefined;
+
   // Events emitted by all groups:
-  // - 'slot-released': When resource becomes available
+  // - 'slot-released': When resource becomes available. The scheduler wakes
+  //   that group's waiters - for a keyed group, those of `detail.key`, if it
+  //   names one - a microtask later. Emitted from inside the scheduler's own
+  //   release of the group, or while it is waking the group's waiters, it
+  //   changes nothing, since that release or wake covers them already.
   // - 'capacity-exhausted': When limit reached
 }

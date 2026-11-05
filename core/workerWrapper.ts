@@ -2,12 +2,14 @@
 // Handles message protocol and dynamically imports the actual worker class
 
 import type { WorkerMessage, ProgressData, SpawnTaskConfig, BaseWorkerContext, TaskWorkerContext } from './workerInterface.ts';
-import { isWorkerTerminationError } from './workerInterface.ts';
+import { isWorkerTerminationError, mergeGrants } from './workerInterface.ts';
 import { WorkerMessageChannel } from './messageChannel.ts';
 
 let WorkerClass: any = null;
 let workerInstance: any = null;
 let workerId: string | null = null;
+// What this worker's resident groups granted it, from init
+let residentGrants: Readonly<Record<string, unknown>> | undefined;
 
 // Messages that end something: an attempt, setup, the worker. A port is FIFO,
 // so flushing the emitted events first is what guarantees they arrive before it
@@ -59,14 +61,16 @@ function createBaseWorkerContext(): BaseWorkerContext {
         workerId: workerId!,
         terminateWithError: (error, metadata) =>
             requestTermination('worker_termination_request', error, metadata),
-        emit: (name, data) => channel.emitWorker(name, data)
+        emit: (name, data) => channel.emitWorker(name, data),
+        grants: mergeGrants(residentGrants)
     };
 }
 
 function createWorkerContext(
     taskId: string,
     stream: ReturnType<WorkerMessageChannel['openAttempt']>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    grants?: Readonly<Record<string, unknown>>
 ): TaskWorkerContext {
     const baseContext = createBaseWorkerContext();
     return {
@@ -84,12 +88,13 @@ function createWorkerContext(
             sendMessage({ type: 'spawn_task', taskId, data: config });
         },
         emit: (name, data) => channel.emitTask(stream, name, data),
-        signal
+        signal,
+        grants: mergeGrants(residentGrants, grants)
     };
 }
 
 self.onmessage = async (e) => {
-    const { taskId, payload, action, config, workerUrl, workerId: receivedWorkerId, gate, messages } = e.data;
+    const { taskId, payload, action, config, workerUrl, workerId: receivedWorkerId, gate, messages, grants } = e.data;
 
     // Never replies, and is handled before the action dispatch: a cancel can
     // arrive after its attempt has ended or after teardown, and the 'Invalid
@@ -112,6 +117,7 @@ self.onmessage = async (e) => {
         if (action === 'init') {
             // Store the worker ID for context creation
             workerId = receivedWorkerId;
+            residentGrants = grants;
             // Before the first await, so a 'gate' sent after this message is
             // applied after it rather than overwritten by it
             if (messages) channel.configure(messages);
@@ -173,7 +179,7 @@ self.onmessage = async (e) => {
             // finds it
             const controller = new AbortController();
             controllers.set(taskId, controller);
-            const context = createWorkerContext(taskId, stream, controller.signal);
+            const context = createWorkerContext(taskId, stream, controller.signal, grants);
 
             // Run task with context. The attempt's emits close when run() ends,
             // either way, so a stray promise cannot add to a settled attempt;

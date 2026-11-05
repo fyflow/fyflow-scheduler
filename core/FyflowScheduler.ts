@@ -8,7 +8,7 @@ import type {
 } from './resourceEvents.ts';
 import { TaskQueue } from './taskQueue.ts';
 import type { TaskMessageDetail } from './workerInterface.ts';
-import { AttemptStoppedError, CancelledError } from './workerInterface.ts';
+import { AttemptStoppedError, CancelledError, freezeShallow } from './workerInterface.ts';
 import { validateGraceMs } from './workerManager.ts';
 
 /**
@@ -21,6 +21,17 @@ import { validateGraceMs } from './workerManager.ts';
  * hand.
  */
 const BLOCKED_QUEUE_SEPARATOR = '\u0000';
+
+/**
+ * One thing a task holds, or would: a group, a key of a keyed group, and what
+ * it asked of a group that takes requests.
+ */
+type Hold = { id: string; group: any; key: string | undefined; request?: unknown };
+
+/** A pending wake of every wait set of one group, rather than of one queue. */
+const SWEEP_PREFIX = '\u0001';
+/** The longest delay setTimeout takes: 2^31 - 1 ms, about 24.8 days. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * A unit of work handed to a worker pool.
@@ -113,12 +124,39 @@ export class FyflowTask {
      * can derive the key from the payload instead.
      */
     limitKey?: string;
+    /**
+     * What this task asks of a group that takes requests, per group id - for
+     * a {@link UnitGroup}, which units it will accept: `{ gpu: { from: ['gpu1'] } }`.
+     * Read by the group's default `requestFrom`; validated at `addTask`.
+     */
+    units?: Record<string, unknown>;
     _resourcesPreAllocated?: boolean; // Flag to track if resources are pre-allocated
     /**
-     * Keys resolved at dispatch, per keyed group id. Held so release uses the
-     * same bucket acquisition used, even if the payload changed meanwhile.
+     * Keys resolved at dispatch, per keyed group id - one or more, without
+     * duplicates. Held so release uses the same buckets acquisition used, even
+     * if the payload changed meanwhile.
      */
-    _resourceKeys?: Record<string, string>;
+    _resourceKeys?: Record<string, string[]>;
+    /**
+     * What each hold's `onStart` returned, for the holds that returned
+     * something: `raw` goes back to `onFinish` as it was, `copy` is what the
+     * work and the events see. Per attempt - a retry or requeue is granted
+     * afresh.
+     */
+    _grants?: Map<string, { raw: unknown; copy: unknown }>;
+    /**
+     * Requests resolved with the keys, per group id, for groups that take one.
+     * Held for the same reason: the acquire, the wait and the release all use
+     * the request the task was admitted under.
+     */
+    _requests?: Record<string, unknown>;
+    /**
+     * When it joined its blocked queue, as a scheduler-wide sequence. A release
+     * a group's several wait sets compete for goes to the oldest head.
+     */
+    _blockedSeq?: number;
+    /** `context.grants` for this attempt, built from {@link _grants}. */
+    _grantView?: Record<string, unknown>;
     /**
      * Set while this attempt is being settled, so the same outcome arriving from
      * both the pool's `task.failed` event and the task promise settles once.
@@ -140,6 +178,13 @@ export class FyflowTask {
     _queuedIn?: 'ready' | 'blocked' | 'backoff';
     /** Which blocked queue, while `_queuedIn` is `blocked`. */
     _blockedQueueId?: string;
+    /**
+     * Admitted from a resident queue and not yet dispatched. It has waited its
+     * turn for a worker, so it is not held behind the resident queue again
+     * when it creates one - see {@link FyflowScheduler._checkAndBlockResident}.
+     * Not set for a waiter admitted from a task-held queue.
+     */
+    _admittedByWake?: boolean;
     /** The pending `cancel()` of a dispatched task, resolved when it settles. */
     _cancelPending?: { promise: Promise<boolean>; resolve: (cancelled: boolean) => void };
 
@@ -167,8 +212,11 @@ export class FyflowTask {
      * @param config.limitKey Bucket for keyed resource groups, e.g. the endpoint
      *   or tenant this task belongs to. Required when the task belongs to a
      *   keyed group that has no custom `keyFrom`.
+     * @param config.units Requests for groups that take one, per group id - for
+     *   a `UnitGroup`, `{ gpu: { from: ['gpu1'] } }` pins the task to one unit.
+     *   A request naming a unit the group does not have throws at `addTask`.
      */
-    constructor({id, workerType, payload, optional = false, retryPolicy, attemptsSpent = 0, workerGroups = [], handleRejection = true, limitKey}: any) {
+    constructor({id, workerType, payload, optional = false, retryPolicy, attemptsSpent = 0, workerGroups = [], handleRejection = true, limitKey, units}: any) {
       if (typeof attemptsSpent !== 'number') {
         throw new TypeError(`attemptsSpent must be a number, got ${typeof attemptsSpent}`);
       }
@@ -179,6 +227,7 @@ export class FyflowTask {
       this.attempts = attemptsSpent;
       this.id = id;
       this.limitKey = limitKey;
+      this.units = units;
       this.workerType = workerType;
       this.payload = payload;
       this.optional = optional;
@@ -310,6 +359,48 @@ export class FyflowTask {
      */
     private shutDown = false;
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /**
+     * Time-based wakes: queue id -> the `Date.now()` its group said capacity
+     * comes back (`nextCapacityAt`). At most one per queue, for queues that
+     * wait on a group with such a time.
+     */
+    private timeWakes = new Map<string, number>();
+    /**
+     * The same times as a min-heap of `[at, queueId]`, so the earliest is
+     * found in O(log n) however many keys wait. An entry whose `at` no longer
+     * matches `timeWakes` is stale, and skipped when it surfaces.
+     */
+    private timeWakeHeap: Array<[number, string]> = [];
+    /** One timer for every time-based wake, set for the earliest. */
+    private timeWakeTimer: ReturnType<typeof setTimeout> | null = null;
+    private timeWakeTimerAt = Infinity;
+    /**
+     * The delay for a queue's next wake on a time already due, doubled each
+     * time it is used without the queue making progress and capped at the
+     * heartbeat interval: a group answering "now" with no room would
+     * otherwise wake its queue every millisecond. Reset by progress.
+     */
+    private timeWakeDue = new Map<string, number>();
+    /** Groups whose `nextCapacityAt` threw, warned about once. */
+    private timeWakeWarned = new WeakSet<object>();
+    /**
+     * Whether any group has a `nextCapacityAt`. With none - concurrency
+     * limits, units - time wakes cost a wake one boolean test.
+     */
+    private timeWakeGroups = false;
+
+    /**
+     * Groups inside the scheduler's own release of them. A `slot-released`
+     * such a group emits from there is ignored: the release wakes its waiters
+     * itself, in the same turn. Per group, so another group changed from
+     * inside that call - a limit raised from a listener - still wakes its own.
+     */
+    private releasingGroups = new Set<unknown>();
+    /** The queue the wake loop is waking now, while `waking`. */
+    private wakingQueue = '';
+    /** Group wakes due in a microtask, by `groupId` or queue id. */
+    private groupWakes = new Map<string, { groupId: string; key?: string }>();
     /**
      * Tasks sitting out a retry backoff, by id. Held outside every queue, so no
      * dispatch can start them early - they used to wait in the ready queue,
@@ -355,6 +446,7 @@ export class FyflowTask {
       super();
       this.workerPools = workerPools;
       this.groups = groups;
+      this.timeWakeGroups = Object.values(groups).some(g => typeof (g as any)?.nextCapacityAt === 'function');
       this.options = {
         periodicRetryIntervalMs: 50, // Default to 50ms - optimal balance of speed and efficiency
         ...options
@@ -392,11 +484,31 @@ export class FyflowTask {
     }
 
     /** Resident groups a pool holds per worker, as {@link _groupsForTask} entries. */
-    private _residentGroupsForPool(pool: any): Array<{ id: string; group: any; cost: number }> {
+    private _residentGroupsForPool(pool: any): Array<{ id: string; group: any; cost: number; request?: unknown }> {
       const declared: Record<string, number> = pool?.residentGroups || {};
+      const requests: Record<string, unknown> = pool?.residentRequests || {};
       return Object.entries(declared)
-        .map(([id, cost]) => ({ id, group: this.groups[id], cost }))
+        .map(([id, cost]) => ({ id, group: this.groups[id], cost, request: requests[id] }))
         .filter(entry => entry.group);
+    }
+
+    /**
+     * Whether a resident waiter of `entry` would arrive behind someone. Per
+     * wait set for a group that has them: a pool pinned to a busy unit must
+     * not hold up a pool that wants a free one, so only a waiter whose set
+     * overlaps this one's counts. Any waiter at all, for every other group.
+     */
+    private _residentQueueBehind(entry: { id: string; group: any; request?: unknown }): boolean {
+      if (!FyflowScheduler._hasWaitSets(entry.group)) {
+        return (this.blockedQueues.get(entry.id)?.length ?? 0) > 0;
+      }
+      const own = FyflowScheduler._waitSetOf(entry.group, entry.request);
+      for (const queueId of this._queuesOfGroup(entry.id)) {
+        if ((this.blockedQueues.get(queueId)?.length ?? 0) === 0) continue;
+        const { set } = this._splitQueueId(queueId);
+        if (entry.group.waitSetsOverlap?.(own, set) ?? own === set) return true;
+      }
+      return false;
     }
 
     /**
@@ -409,13 +521,30 @@ export class FyflowTask {
     private _checkAndBlockResident(task: FyflowTask, pool: any): true | 'blocked' {
       const entries = this._residentGroupsForPool(pool);
       if (entries.length === 0) return true;
-      if (pool.canHoldAnotherWorker?.() !== false) return true;
 
-      // Queue against the first group without room. Its release wakes the task.
-      const short = entries.find(({ group, cost }) => !group.canRun(undefined, cost)) ?? entries[0];
-      const queueId = this._blockedQueueId(short.id);
-      if (!this.blockedQueues.has(queueId)) this.blockedQueues.set(queueId, this._newBlockedQueue());
-      const queue = this.blockedQueues.get(queueId)!;
+      // Head-of-line on arrival, too: a task that would create a worker queues
+      // behind anyone already waiting on one of its resident groups, even when
+      // its own cost fits. Admitting it would let a stream of cheap arrivals
+      // keep an expensive waiter out forever - which used to happen, because
+      // only the retry path applied the rule. A task admitted from a resident
+      // queue has already waited its turn and is not sent back. One woken
+      // from a task-held queue waited for that group, not for these, so it
+      // queues here like any arrival: exempted, cheap tasks cycling through a
+      // CPU queue took the units an expensive pool was waiting for.
+      const fits = pool.canHoldAnotherWorker?.() !== false;
+      const behind = task._admittedByWake
+        ? undefined
+        : entries.find(entry => this._residentQueueBehind(entry));
+      if (fits && !behind) return true;
+
+      // Queue against the first group without room, or the queue it must wait
+      // behind. That group's release wakes the task.
+      const short = (fits ? behind : undefined)
+        ?? entries.find(({ group, cost, request }) => !group.canRun(undefined, cost, request))
+        ?? entries[0];
+      const queueId = this._blockedQueueId(short.id, FyflowScheduler._waitSetOf(short.group, short.request));
+      // Refused by that group, unless it is waiting behind a resident queue
+      const queue = this._blockedQueue(queueId, !fits);
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
       this.stats.queued = Math.max(0, this.stats.queued - 1);
@@ -423,6 +552,8 @@ export class FyflowTask {
       task._blockedQueueId = queueId;
       if (!queue.includes(task)) {
         queue.push(task);
+        task._blockedSeq = ++this.blockedSeq;
+        this._noteResidentWait(task);
         if (this._resourceObserved) {
           this._emitResource('resource.blocked', short.group, {
             groupId: short.id,
@@ -459,14 +590,132 @@ export class FyflowTask {
      * Inverse of {@link _blockedQueueId}. The delimiter is NUL - splitting on a
      * space instead mis-keys every keyed group without erroring.
      */
-    private _splitQueueId(queueId: string): { groupId: string; key?: string } {
+    private _splitQueueId(queueId: string): { groupId: string; key?: string; set?: string; suffix?: string } {
       const separator = queueId.indexOf(BLOCKED_QUEUE_SEPARATOR);
-      return separator === -1
-        ? { groupId: queueId }
-        : {
-            groupId: queueId.slice(0, separator),
-            key: queueId.slice(separator + 1)
-          };
+      if (separator === -1) return { groupId: queueId };
+      const groupId = queueId.slice(0, separator);
+      const suffix = queueId.slice(separator + 1);
+      // A keyed group's queues are per key; any other group's are per wait
+      // set, which is never a key and never reaches an event as one
+      return this.groups[groupId]?.keyed
+        ? { groupId, key: suffix, suffix }
+        : { groupId, set: suffix, suffix };
+    }
+
+    /** A group that queues its waiters per candidate set - `UnitGroup`. */
+    private static _hasWaitSets(group: any): boolean {
+      return typeof group?.waitSetFor === 'function';
+    }
+
+    /** The wait set a request queues in; undefined is the group's plain queue. */
+    private static _waitSetOf(group: any, request: unknown): string | undefined {
+      return request === undefined ? undefined : group?.waitSetFor?.(request);
+    }
+
+    /** The plain queue of a group and every per-key or per-set queue it has. */
+    private _queuesOfGroup(groupId: string): string[] {
+      const ids = [groupId];
+      for (const suffix of this.blockedKeys.get(groupId) ?? []) ids.push(this._blockedQueueId(groupId, suffix));
+      return ids;
+    }
+
+    /** Arrival order across every blocked queue - see {@link FyflowTask._blockedSeq}. */
+    private blockedSeq = 0;
+
+    /**
+     * Tasks waiting in a resident queue - for a worker their pool cannot yet
+     * create - per worker type, oldest first, with the `_blockedSeq` of that
+     * wait. Pruned lazily: an entry is live only while its task is still
+     * blocked with that same seq, since every push takes a new one. Kept so a
+     * free slot finds its pool's waiters without walking queues that may hold
+     * thousands of other pools' tasks.
+     */
+    private _residentWaits = new Map<string, Map<FyflowTask, number>>();
+    private _admittingResidentRoom = false;
+
+    private _noteResidentWait(task: FyflowTask): void {
+      let waits = this._residentWaits.get(task.workerType);
+      if (!waits) this._residentWaits.set(task.workerType, waits = new Map());
+      // Re-inserted, so the map stays in seq order
+      waits.delete(task);
+      waits.set(task, task._blockedSeq!);
+    }
+
+    /**
+     * Admit waiters for a new worker whose pool has a free slot on a worker it
+     * already has. Run at the end of every dispatch loop, so after a settle.
+     *
+     * Such a task needs no resident capacity any more, so it leaves the
+     * resident queue from wherever it is. Head-of-line orders waiters for
+     * resident capacity, and this one takes none, so it overtakes nobody. It
+     * used to wait for a resident release instead: with `idleTimeout: 0` the
+     * pool's workers keep their units for good, so one that held the only unit
+     * stalled its own pool's next task forever.
+     */
+    private _admitResidentWaitersWithRoom(): void {
+      if (this._residentWaits.size === 0 || this._admittingResidentRoom) return;
+      if (!this._hasBlockedTasks()) {
+        // Every entry is stale; drop them, and the tasks they hold on to
+        this._residentWaits.clear();
+        return;
+      }
+      this._admittingResidentRoom = true;
+      try {
+        for (const [workerType, waits] of this._residentWaits) {
+          const pool = this.workerPools[workerType];
+          while (waits.size > 0 && pool && !this._needsNewWorker(pool)) {
+            const [task, seq] = waits.entries().next().value!;
+            waits.delete(task);
+            if (task._queuedIn !== 'blocked' || task._blockedSeq !== seq) continue;
+            // Parked: the slot was not its to take after all - the pool is
+            // backing off a capacity race. The rest keep their places rather
+            // than all parking in the ready queue behind it.
+            if (this._admitOutOfTurn(task, pool)) break;
+          }
+          if (waits.size === 0) this._residentWaits.delete(workerType);
+        }
+      } finally {
+        this._admittingResidentRoom = false;
+      }
+    }
+
+    /**
+     * Take a resident waiter out of its queue, wherever it is, and admit or move it.
+     *
+     * @returns true if it was admitted but parked, for want of a free slot.
+     */
+    private _admitOutOfTurn(task: FyflowTask, pool: any): boolean {
+      const queueId = task._blockedQueueId!;
+      const queue = this.blockedQueues.get(queueId);
+      if (!queue) return false;
+      const { groupId } = this._splitQueueId(queueId);
+      const group = this.groups[groupId];
+      // Another of its holds full: wait there, where a release can admit it
+      let refusing: Hold | undefined;
+      let error: unknown;
+      try {
+        refusing = this._holdsFor(task, pool).find(hold => !hold.group.canRun(hold.key, 1, hold.request));
+      } catch (e) {
+        error = e ?? new Error('a resource group threw');
+      }
+      let parked = false;
+      if (refusing) {
+        this._migrate(task, pool, queue, groupId, undefined, refusing);
+      } else {
+        // Not tombstoned: unlike a cancelled task it may come back to this
+        // queue, where a tombstone would hide it
+        if (queue.at(0) === task) queue.shift();
+        else queue.remove(task);
+        if (error !== undefined) {
+          task._queuedIn = undefined;
+          task._blockedQueueId = undefined;
+        } else {
+          parked = this._admitWaiter(task, pool, group, groupId, undefined, true);
+        }
+      }
+      this._dropBlockedQueueIfEmpty(queueId);
+      if (error !== undefined) this._failUndispatched(task, FyflowScheduler._groupError(task, error), queueId, 'failed');
+      return parked;
     }
 
     /**
@@ -476,23 +725,105 @@ export class FyflowTask {
      *   otherwise silently share a bucket with every other keyless task, or skip
      *   the limit entirely - both discovered only once something is throttled.
      */
-    private _resolveResourceKeys(task: FyflowTask, pool: any): Record<string, string> {
-      const keys: Record<string, string> = {};
+    private _resolveResourceKeys(task: FyflowTask, pool: any): Record<string, string[]> {
+      const keys: Record<string, string[]> = {};
+      let requests: Record<string, unknown> | undefined;
 
       for (const { id, group } of this._groupsForTask(task, pool)) {
+        // A group that takes requests resolves - and validates - the task's
+        // here, so a request naming a unit that does not exist throws at
+        // addTask rather than waiting forever
+        if (typeof group.requestFor === 'function') {
+          const request = group.requestFor(task, 1);
+          if (request !== undefined) (requests ??= {})[id] = request;
+        }
         if (!group.keyed) continue;
 
-        const key = group.keyFor?.(task);
-        if (key === undefined) {
+        // One key, or several: a copy from C: to D: holds both disks. Empty
+        // entries are dropped and duplicates collapse, so a C: -> C: copy
+        // holds one unit, not two; nothing left is a missing key.
+        const raw = group.keyFor?.(task);
+        const list = Array.isArray(raw) ? raw : [raw];
+        const resolved = [...new Set(
+          list.filter(k => k !== undefined && k !== null && k !== '').map(k => String(k))
+        )];
+        if (resolved.length === 0) {
           throw new Error(
             `Missing limit key for group "${id}" on task "${task.id}". ` +
             `Set task.limitKey, or give the group a keyFrom that derives one.`
           );
         }
-        keys[id] = key;
+        keys[id] = resolved;
       }
 
+      task._requests = requests;
       return keys;
+    }
+
+    /**
+     * Every (group, key) a task holds or would hold: one entry per key of a
+     * keyed group, one with no key for any other. The unit admission and
+     * release work in - a task naming two disks is two holds, checked
+     * together and acquired together.
+     */
+    private _holdsFor(
+      task: FyflowTask, pool: any, keys: Record<string, string[]> = task._resourceKeys ?? {}
+    ): Hold[] {
+      const holds: Hold[] = [];
+      const requests = task._requests;
+      for (const entry of this._groupsForTask(task, pool)) {
+        // A keyless hold is the entry itself, `key` absent: this runs for every
+        // waiter a wake examines, and a copy per group showed up as heap
+        if (!entry.group.keyed) {
+          const request = requests?.[entry.id];
+          holds.push(request === undefined
+            ? entry as Hold
+            : { id: entry.id, group: entry.group, key: undefined, request });
+          continue;
+        }
+        for (const key of keys[entry.id] ?? []) holds.push({ id: entry.id, group: entry.group, key });
+      }
+      return holds;
+    }
+
+    /** Where a hold's grant is kept on the task: per (group, key). */
+    private static _holdId(groupId: string, key: string | undefined): string {
+      return key === undefined ? groupId : `${groupId}${BLOCKED_QUEUE_SEPARATOR}${key}`;
+    }
+
+    /**
+     * Copy this attempt's grants and build `context.grants` from them: per
+     * group, the grant itself - or, for a keyed group, `{ [key]: grant }`, so
+     * the shape depends on the group and never on how many keys a task has.
+     *
+     * Copied once, here, on inline pools as well: what the work sees is the
+     * same whether or not a thread boundary is crossed, the rule `emit()`
+     * follows. Frozen, one level down, because the copy is shared by the work
+     * and the events.
+     *
+     * @returns the error for a grant that cannot be copied, which fails the
+     *   attempt. Its units are still released: the original is kept.
+     */
+    private _copyGrants(task: FyflowTask, holds: Hold[]): Error | undefined {
+      const view: Record<string, unknown> = {};
+      let error: Error | undefined;
+      for (const { id, group, key } of holds) {
+        const grant = task._grants!.get(FyflowScheduler._holdId(id, key));
+        if (!grant) continue;
+        try {
+          grant.copy = freezeShallow(structuredClone(grant.raw));
+        } catch (e: any) {
+          error ??= new Error(
+            `Resource group "${id}" granted a value that cannot be copied with structuredClone: ${e?.message ?? e}`
+          );
+          continue;
+        }
+        if (group.keyed) ((view[id] ??= {}) as Record<string, unknown>)[key!] = grant.copy;
+        else view[id] = grant.copy;
+      }
+      for (const value of Object.values(view)) freezeShallow(value);
+      task._grantView = Object.freeze(view);
+      return error;
     }
 
     // Any task waiting on a resource group. Blocked tasks are subtracted from
@@ -512,6 +843,70 @@ export class FyflowTask {
 
     private _newBlockedQueue(): TaskQueue<FyflowTask> {
       return new TaskQueue<FyflowTask>({ trackMembership: true, counter: this.blockedLive });
+    }
+
+    /**
+     * Keys with a blocked queue, per keyed group - or wait sets, for a group
+     * that has them (see {@link _splitQueueId}). Kept in step with
+     * `blockedQueues` by the two methods below, so finding a keyed group's
+     * waiting keys is a lookup rather than a scan of every queue.
+     */
+    private blockedKeys = new Map<string, Set<string>>();
+
+    /**
+     * Queues being iterated right now, with their nesting depth. Such a queue
+     * must not be deleted: the loop holds the object, a listener it calls can
+     * empty the queue and a later push recreate it, and the loop would then
+     * put tasks back into the detached object, where nothing ever finds them.
+     */
+    private blockedInUse = new Map<string, number>();
+
+    /** The queue for `queueId`, created and indexed if it does not exist. */
+    private _blockedQueue(queueId: string, refused = false): TaskQueue<FyflowTask> {
+      let queue = this.blockedQueues.get(queueId);
+      if (!queue) {
+        queue = this._newBlockedQueue();
+        this.blockedQueues.set(queueId, queue);
+        const { groupId, suffix } = this._splitQueueId(queueId);
+        if (suffix !== undefined) {
+          let keys = this.blockedKeys.get(groupId);
+          if (!keys) this.blockedKeys.set(groupId, keys = new Set());
+          keys.add(suffix);
+        }
+      }
+      // Called for a waiter its group just refused: if the group knows when
+      // it has room again and no time is pending, wake the queue then. On
+      // every push, not only when the queue is created - a queue whose last
+      // wake left it with no time pending can be joined later, by a waiter
+      // refused on its way out of the ready queue, and nothing would wake it
+      if (this.timeWakeGroups) this._armTimeWake(queueId, refused);
+      return queue;
+    }
+
+    /**
+     * Delete `queueId`'s queue if it is empty and nothing is iterating it.
+     *
+     * Blocked queues exist only while they hold a waiter. They used to live
+     * forever, so a keyed group kept one per key that had ever blocked - 1,000
+     * empty queues after a 1,000-key run - and every heartbeat walked them all.
+     */
+    private _dropBlockedQueueIfEmpty(queueId: string | undefined): void {
+      if (queueId === undefined || this.blockedInUse.has(queueId)) return;
+      const queue = this.blockedQueues.get(queueId);
+      if (!queue || queue.length > 0) return;
+      this.blockedQueues.delete(queueId);
+      const { groupId, suffix } = this._splitQueueId(queueId);
+      if (suffix !== undefined) {
+        const keys = this.blockedKeys.get(groupId);
+        keys?.delete(suffix);
+        if (keys?.size === 0) this.blockedKeys.delete(groupId);
+      }
+      // Its heap entry goes stale. With none left, nothing should keep a
+      // timer pending - nor the process alive
+      if (this.timeWakeGroups) {
+        this.timeWakeDue.delete(queueId);
+        if (this.timeWakes.delete(queueId) && this.timeWakes.size === 0) this._clearTimeWakes();
+      }
     }
 
     _checkCompletion() {
@@ -683,7 +1078,7 @@ export class FyflowTask {
 
     _dispatchLoop() {
       let tasksProcessed = 0;
-      let keyedSkips = 0; // Bounds the extra scanning keyed groups can cause
+      let blockedSkips = 0; // Bounds the scanning past blocked tasks
       const maxTasksPerLoop = 1000; // Prevent excessive iterations in extreme contention
 
 
@@ -714,21 +1109,25 @@ export class FyflowTask {
           const task = queue.shift()!;
           task._queuedIn = undefined;
 
-          // Check if we can dispatch this task
-          const canDispatchResult = this._canDispatchTask(task, pool);
+          // Check if we can dispatch this task. Undefined: a group threw, and
+          // the task has failed.
+          const canDispatchResult = this._tryCanDispatch(task, pool);
+          if (canDispatchResult === undefined) continue;
           if (canDispatchResult === true) {
             // Dispatch the task (synchronous dispatch, async execution)
             this._dispatchTask(task, pool);
             tasksProcessed++;
           } else if (canDispatchResult === 'blocked' || canDispatchResult === 'blocked-keyed') {
             // Moved to a blocked queue; the blocking check has already taken it
-            // out of stats.queued, before telling anyone
-
-            if (canDispatchResult === 'blocked-keyed' && keyedSkips < maxTasksPerLoop) {
-              // Only this task's key is exhausted. Keep scanning: the next task
-              // may belong to a key with room, and stopping here would let one
-              // hot key stall every other key sharing the worker type.
-              keyedSkips++;
+            // out of stats.queued, before telling anyone.
+            //
+            // Keep scanning, keyed or not. The next task may need a group, or a
+            // key, with room; and every waiter belongs in a blocked queue, not
+            // stranded in the ready queue behind a blocked head - where it was
+            // invisible to getAdmissionQueue() and resource.blocked, and woken
+            // only by the dispatch loop happening to reach it.
+            if (blockedSkips < maxTasksPerLoop) {
+              blockedSkips++;
               continue;
             }
 
@@ -747,9 +1146,11 @@ export class FyflowTask {
         }
       }
 
+      this._admitResidentWaitersWithRoom();
+
       // Clear periodic retry if no more tasks queued or blocked
       const hasReadyTasks = Array.from(this.readyQueuesByWorker.values()).some(q => q.length > 0);
-      const hasBlockedTasks = Array.from(this.blockedQueues.values()).some(q => q.length > 0);
+      const hasBlockedTasks = this._hasBlockedTasks();
       const hasQueuedInStats = this.stats.queued > 0;
       if (!hasReadyTasks && !hasBlockedTasks && !hasQueuedInStats) {
         this._clearPeriodicRetry();
@@ -767,21 +1168,20 @@ export class FyflowTask {
         return true;
       }
 
-      const entries = this._groupsForTask(task, pool);
       const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
       task._resourceKeys = keys;
 
-      // Check if resources are available
-      for (const { id, group } of entries) {
-        const key = group.keyed ? keys[id] : undefined;
-        if (!group.canRun(key)) {
+      // Every hold must have room - every group, and every key of a keyed
+      // one. Checked here and acquired by _dispatchTask in the same turn, so
+      // all-or-nothing needs no locking, and with no partial hold there is
+      // nothing to deadlock on.
+      for (const { id, group, key, request } of this._holdsFor(task, pool, keys)) {
+        if (!group.canRun(key, 1, request)) {
           const blockedOnKey = Boolean(group.keyed);
-          // Blocked on this group - and on this key, when the group is keyed
-          const queueId = this._blockedQueueId(id, key);
-          if (!this.blockedQueues.has(queueId)) {
-            this.blockedQueues.set(queueId, this._newBlockedQueue());
-          }
-          const blockedQueue = this.blockedQueues.get(queueId)!;
+          // Blocked on this group - and on this key, when the group is keyed,
+          // or in the queue of its candidate set, for a group that has them
+          const queueId = this._blockedQueueId(id, key ?? FyflowScheduler._waitSetOf(group, request));
+          const blockedQueue = this._blockedQueue(queueId, true);
           // It has left the ready queue: count it out of `queued` before
           // resource.blocked fires, so a listener sees consistent stats
           this.stats.queued = Math.max(0, this.stats.queued - 1);
@@ -792,6 +1192,7 @@ export class FyflowTask {
           task._blockedQueueId = queueId;
           if (!blockedQueue.includes(task)) {
             blockedQueue.push(task);
+            task._blockedSeq = ++this.blockedSeq;
             if (this._resourceObserved) {
               this._emitResource('resource.blocked', group, {
                 groupId: id,
@@ -820,13 +1221,46 @@ export class FyflowTask {
      * touching a queue or emitting anything.
      */
     private _poolHasRoom(pool: any): boolean {
+      if (pool._capacityRaceBackoff) return false;
       if (pool.threads.some((t: any) => t.canAcceptTask && t.canAcceptTask())) return true;
-      const initializingCount = pool.initializingThreads ? pool.initializingThreads.size : 0;
-      return (pool.threads.length + initializingCount) < pool.maxThreads;
+      return pool.threads.length < pool.maxThreads;
+    }
+
+    /**
+     * {@link _canDispatchTask}, for a task already out of the ready queue and
+     * still counted in `queued`. The checks call into the task's groups, whose
+     * callbacks can throw: `keyFrom` or `requestFrom` on a retry, which
+     * resolves them afresh, or `limitFor` for a key that has gone idle since
+     * `addTask`. That fails the task, terminally - the same answer would fail
+     * every attempt - where it used to escape the dispatch loop, with the task
+     * in no queue: it never settled, and the throw reached whatever had
+     * started the loop, a settle or a timer.
+     *
+     * @returns undefined once the task has been failed.
+     */
+    private _tryCanDispatch(task: FyflowTask, pool: any): boolean | 'blocked' | 'blocked-keyed' | undefined {
+      try {
+        return this._canDispatchTask(task, pool);
+      } catch (error) {
+        // Nothing has queued it: every check that blocks a task does so last
+        this.stats.queued = Math.max(0, this.stats.queued - 1);
+        this._failUndispatched(task, FyflowScheduler._groupError(task, error), undefined, 'failed');
+        return undefined;
+      }
+    }
+
+    /** The error a task fails with when one of its groups threw. */
+    private static _groupError(task: FyflowTask, error: unknown): Error {
+      const message = error instanceof Error ? error.message : String(error);
+      const wrapped = new Error(`A resource group threw while admitting task "${task.id}": ${message}`);
+      (wrapped as any).cause = error;
+      return wrapped;
     }
 
     // NEW: Non-optimistic mode helper methods
     _canDispatchTask(task: FyflowTask, pool: any): boolean | 'blocked' | 'blocked-keyed' {
+      // See the capacity race in _dispatchTask
+      if (pool._capacityRaceBackoff) return false;
       // Check if we have an immediately available thread (no async creation)
       const availableThreads = pool.threads.filter((t: any) =>
         t.canAcceptTask && t.canAcceptTask()
@@ -842,9 +1276,8 @@ export class FyflowTask {
       }
 
       // No available threads - can we create one?
-      // Account for threads being initialized (same logic as enqueueNoQueue)
-      const initializingCount = pool.initializingThreads ? pool.initializingThreads.size : 0;
-      const canCreateThread = (pool.threads.length + initializingCount) < pool.maxThreads;
+      // A starting worker is in `threads` already (same check as enqueueNoQueue)
+      const canCreateThread = pool.threads.length < pool.maxThreads;
       if (canCreateThread) {
         // Check resource groups before creating thread
         const resourceResult = this._checkAndBlockResources(task, pool);
@@ -873,6 +1306,7 @@ export class FyflowTask {
       task._queuedIn = undefined;
       // A fresh attempt may be settled again
       task._settling = false;
+      task._admittedByWake = undefined;
       const token = ++task._dispatchToken;
       // A requeue repeats the number, because it leaves `attempts` alone
       task.attemptNumber = task.attempts + 1;
@@ -884,16 +1318,32 @@ export class FyflowTask {
       this.stats.running++;
 
       // Acquire resources immediately (thread will be created if needed)
-      const entries = this._groupsForTask(task, pool);
       const keys = task._resourceKeys ?? this._resolveResourceKeys(task, pool);
       task._resourceKeys = keys;
       task._resourcesPreAllocated = true;
+      const holds = this._holdsFor(task, pool, keys);
 
-      entries.forEach(({ id, group }) => {
-        const key = group.keyed ? keys[id] : undefined;
-        group.onStart(key);
+      // Every group first, then the events. A resource.acquired listener can
+      // re-enter the scheduler - addTask dispatches synchronously - and with
+      // the events in between, a task dispatched from there passed canRun on a
+      // group this one had checked but not yet taken, and both took it: a
+      // concurrency group held more than its limit.
+      for (const hold of holds) {
+        const returned = hold.group.onStart(hold.key, 1, hold.request);
+        // Only a group that says it grants: one written before grants may
+        // return anything - an async onStart returns a Promise
+        const grant = hold.group.grants === true ? returned : undefined;
+        if (grant !== undefined) {
+          (task._grants ??= new Map()).set(FyflowScheduler._holdId(hold.id, hold.key), { raw: grant, copy: undefined });
+        }
+      }
+      // Copied before any event, so the events carry it; a grant that cannot
+      // be copied fails the attempt below, its units released by the settle
+      const grantError = task._grants ? this._copyGrants(task, holds) : undefined;
+      holds.forEach(({ id, group, key }) => {
         // After the mutation, so `readings` are the state a fold should land on
         if (this._resourceObserved) {
+          const grant = task._grants?.get(FyflowScheduler._holdId(id, key));
           this._emitResource('resource.acquired', group, {
             groupId: id,
             lifetime: 'task-held',
@@ -901,7 +1351,8 @@ export class FyflowTask {
             holderId: task.id,
             workerType: task.workerType,
             cost: 1, // _dispatchTask passes no cost, so onStart defaults to 1
-            key
+            key,
+            ...(grant?.copy !== undefined ? { grant: grant.copy } : {})
           });
         }
       });
@@ -912,9 +1363,13 @@ export class FyflowTask {
         this._settleTask(task, pool, { ok: false, error: new CancelledError(task.id) }, token);
         return;
       }
+      if (grantError) {
+        this._settleTask(task, pool, { ok: false, error: grantError }, token);
+        return;
+      }
 
       // Get/create thread and execute task
-      pool.enqueueNoQueue(task.id, task.payload)
+      pool.enqueueNoQueue(task.id, task.payload, task._grantView)
         .then((result: any) => {
           this._onTaskComplete(task, result, pool, token);
         })
@@ -927,8 +1382,15 @@ export class FyflowTask {
             return;
           }
 
-          // Handle race condition: thread filled up between check and dispatch
-          if (error.message === 'Worker at maximum concurrent task capacity') {
+          // The capacity race: the pool's room went between the check and the
+          // hand-over. A worker filled up, or there was none and no room for
+          // one - the second is what a resource.acquired listener adding a
+          // task causes, since that task is dispatched into the slot this one
+          // was about to take. Neither is the task's fault; it used to fail
+          // the second way for good, in user_action.
+          const message = typeof error?.message === 'string' ? error.message : '';
+          if (message === 'Worker at maximum concurrent task capacity'
+              || message.startsWith('No worker thread available')) {
             // Being cancelled: it ends here rather than going back in the queue
             if (task.cancellation) {
               this._onTaskFailed(task, error, pool, token);
@@ -950,11 +1412,18 @@ export class FyflowTask {
               task._queuedIn = 'ready';
             }
 
-            // Release pre-allocated resources
+            // Release pre-allocated resources. That release wakes waiters, which
+            // are dispatched on the spot - to this same pool, whose capacity
+            // check just lied, and so on with no timer in between. So the pool
+            // reports no room until the retry below.
+            pool._capacityRaceBackoff = true;
             this._releaseResourcesForTask(task, pool);
 
             // Retry dispatch (thread should be available soon)
-            setTimeout(() => this._dispatchLoop(), 10);
+            setTimeout(() => {
+              pool._capacityRaceBackoff = false;
+              this._dispatchLoop();
+            }, 10);
           } else {
             this._onTaskFailed(task, error, pool, token);
           }
@@ -964,16 +1433,30 @@ export class FyflowTask {
     _releaseResourcesForTask(task: FyflowTask, pool: any) {
       if (!task._resourcesPreAllocated) return;
 
-      const entries = this._groupsForTask(task, pool);
       // Release the exact buckets that were acquired, not whatever keyFrom would
       // return now - a payload the worker mutated must not send the release to a
       // different key than the acquire
-      const keys = task._resourceKeys ?? {};
+      const holds = this._holdsFor(task, pool);
+      const grants = task._grants;
+      // Taken off the task first: the release reaches listeners, and whatever
+      // they do, these grants are returned once
+      task._grants = undefined;
+      task._grantView = undefined;
 
       // Release all resources first, then retry blocked tasks
-      for (const { id, group } of entries) {
-        const key = group.keyed ? keys[id] : undefined;
-        group.onFinish(key);
+      for (const { id, group, key } of holds) {
+        // The original, as onStart returned it: a group may rely on identity
+        const grant = grants?.get(FyflowScheduler._holdId(id, key));
+        // Counted as ours, so a slot-released the group emits from here wakes
+        // nothing twice. Only this group: another one changed from inside
+        // the call is outside this release, and wakes its own waiters
+        const nested = this.releasingGroups.has(group);
+        this.releasingGroups.add(group);
+        try {
+          group.onFinish(key, 1, grant?.raw);
+        } finally {
+          if (!nested) this.releasingGroups.delete(group);
+        }
         if (this._resourceObserved) {
           this._emitResource('resource.released', group, {
             groupId: id,
@@ -983,6 +1466,7 @@ export class FyflowTask {
             workerType: task.workerType,
             cost: 1,
             key,
+            ...(grant?.copy !== undefined ? { grant: grant.copy } : {}),
             reason: 'settled'
           });
         }
@@ -992,9 +1476,7 @@ export class FyflowTask {
       task._resourceKeys = undefined;
 
       // Retry blocked tasks AFTER all resources are released
-      for (const { id, group } of entries) {
-        this._retryBlockedTasksForGroup(id, group.keyed ? keys[id] : undefined);
-      }
+      for (const { id, key } of holds) this._retryBlockedTasksForGroup(id, key);
     }
 
     /**
@@ -1282,6 +1764,7 @@ export class FyflowTask {
         case 'blocked':
           // Blocked tasks are counted in no stats key
           this.blockedQueues.get(task._blockedQueueId!)?.tombstone(task);
+          this._dropBlockedQueueIfEmpty(task._blockedQueueId);
           break;
         // undefined: in transit between queues, counted nowhere; whoever is
         // moving it sees the terminal state and leaves it
@@ -1340,7 +1823,13 @@ export class FyflowTask {
       // groups hold one queue per key, so each is retried on its own bucket -
       // otherwise a saturated key would gate every other key behind it.
       for (const [groupId, group] of Object.entries(this.groups)) {
-        if (!group || !group.canRun()) continue;
+        // Nobody waiting on it: skip before asking the group anything, so a
+        // heartbeat costs O(groups with waiters) rather than O(groups)
+        if (!group) continue;
+        if (group.keyed || FyflowScheduler._hasWaitSets(group)
+            ? !this.blockedKeys.has(groupId) && !this.blockedQueues.has(groupId)
+            : !this.blockedQueues.has(groupId)) continue;
+        if (!group.canRun()) continue;
 
         if (group.keyed) {
           for (const key of this._blockedKeysFor(groupId)) {
@@ -1353,142 +1842,351 @@ export class FyflowTask {
 
     }
 
-    /** Keys that currently have tasks blocked on this group. */
+    /**
+     * Keys that currently have tasks blocked on this group. A copy, because
+     * retrying a key can delete it from the index.
+     */
     private _blockedKeysFor(groupId: string): string[] {
-      const prefix = `${groupId}${BLOCKED_QUEUE_SEPARATOR}`;
-      const keys: string[] = [];
-      for (const [queueId, queue] of this.blockedQueues) {
-        if (queue.length > 0 && queueId.startsWith(prefix)) {
-          keys.push(queueId.slice(prefix.length));
-        }
-      }
-      return keys;
+      return [...(this.blockedKeys.get(groupId) ?? [])];
     }
 
+    /**
+     * Wake the waiters of one (group, key) queue: admit as many as the group
+     * now has room for.
+     *
+     * Through a pump, never recursively. Admitting a waiter dispatches it, which
+     * reaches listeners, which can settle a task (a cancel), whose release wakes
+     * a queue again - possibly this one. Nested, that recursion's depth is set
+     * by listener behaviour, and an outer loop holding state across it acts on
+     * a stale queue. So a wake requested while one is running is queued and run
+     * after it, in the same synchronous turn.
+     */
     _retryBlockedTasksForGroup(groupId: string, key?: string) {
-      const queueId = this._blockedQueueId(groupId, key);
+      // A group with wait sets is woken as a whole: what was freed may suit
+      // any of its sets, and they compete for it in arrival order
+      const queueId = FyflowScheduler._hasWaitSets(this.groups[groupId])
+        ? SWEEP_PREFIX + groupId
+        : this._blockedQueueId(groupId, key);
+      this.wakePending.add(queueId);
+      if (this.waking) return;
+      this.waking = true;
+      try {
+        while (this.wakePending.size > 0) {
+          const next: string = this.wakePending.values().next().value!;
+          this.wakePending.delete(next);
+          this.wakingQueue = next;
+          if (next.startsWith(SWEEP_PREFIX)) this._sweepWaitSets(next.slice(SWEEP_PREFIX.length));
+          else this._wakeQueue(next);
+        }
+      } finally {
+        this.waking = false;
+      }
+    }
+
+    /**
+     * Wake a group whose waiters queue per candidate set: admit, one at a
+     * time, the oldest head among all its queues that can go - whether it
+     * asked for one unit in particular or for any. So a pinned waiter is not
+     * starved by a stream of "any" tasks: once it is the oldest that can use
+     * a freed unit, it gets it.
+     *
+     * Heads only, never a scan: a waiter pinned to a busy unit is skipped
+     * along with its whole queue, at the cost of one comparison. A queue
+     * whose head cannot go is set aside for the rest of the sweep.
+     */
+    private _sweepWaitSets(groupId: string) {
+      // Listed once per sweep, not per admission: building the ids is string
+      // work, and it showed as heap. A queue created during the sweep holds a
+      // waiter that was just refused, which the next release wakes.
+      const candidates = this._queuesOfGroup(groupId);
+      // Each round admits or moves one waiter, or sets a queue aside, so this
+      // bounds it whatever a listener does; it is never reached in practice
+      let budget = 2 * this.blockedLive.live + candidates.length + 1;
+      // Waiters parked for want of a slot, across every round: each round is
+      // one wake of one queue, and a parked waiter holds nothing, so counted
+      // per round one release parked every waiter of a full pool
+      const sweep = { parked: 0 };
+      while (budget-- > 0 && candidates.length > 0) {
+        let oldest = -1;
+        let oldestSeq = Infinity;
+        for (let i = 0; i < candidates.length; i++) {
+          const head = this.blockedQueues.get(candidates[i])?.at(0);
+          if (head && (head._blockedSeq ?? 0) < oldestSeq) {
+            oldest = i;
+            oldestSeq = head._blockedSeq ?? 0;
+          }
+        }
+        if (oldest === -1) return;
+        // Its head cannot go: set aside for the rest of the sweep
+        if (this._wakeQueue(candidates[oldest], 1, sweep) === 0) candidates.splice(oldest, 1);
+      }
+    }
+
+    private wakePending = new Set<string>();
+    private waking = false;
+
+    /**
+     * @param sweep carries the parked count between the rounds of a
+     *   {@link _sweepWaitSets}.
+     * @returns how many waiters left the queue; at most `maxExits`.
+     */
+    private _wakeQueue(queueId: string, maxExits = Infinity, sweep?: { parked: number }): number {
       const blockedTasks = this.blockedQueues.get(queueId);
-      if (!blockedTasks || blockedTasks.length === 0) return;
+      if (!blockedTasks || blockedTasks.length === 0) return 0;
 
+      // Held for the whole wake - see blockedInUse - and deleted after, if the
+      // wake, or anything it reached, emptied it
+      this.blockedInUse.set(queueId, (this.blockedInUse.get(queueId) ?? 0) + 1);
+      let exits = 0;
+      try {
+        const { groupId, key } = this._splitQueueId(queueId);
+        exits = this._admitFromQueue(queueId, groupId, blockedTasks, key, maxExits, sweep);
+        return exits;
+      } finally {
+        const depth = this.blockedInUse.get(queueId)! - 1;
+        if (depth > 0) this.blockedInUse.set(queueId, depth);
+        else this.blockedInUse.delete(queueId);
+        // Progress: a time already due is woken promptly again
+        if (exits > 0 && this.timeWakeGroups) this.timeWakeDue.delete(queueId);
+        this._dropBlockedQueueIfEmpty(queueId);
+        // Waiters left, and no time pending for them: ask again
+        if (this.timeWakeGroups && this.blockedQueues.has(queueId)) this._armTimeWake(queueId, exits === 0);
+      }
+    }
+
+    /**
+     * Admit on wake. Each waiter at the head is admitted and dispatched - which
+     * acquires its groups - before the next one is examined, so `canRun()`
+     * itself ends the loop: one release admits what it freed, and no more.
+     *
+     * It used to move every waiter back to the ready queue while `canRun()`
+     * stayed true, because nothing was acquired until dispatch - the whole
+     * queue for one free slot, all but one re-blocked by the dispatch loop.
+     * Harmless while the queue held one task; quadratic once it held them all,
+     * as a keyed group's queues always did (50K tasks over 10 keys: 7.4
+     * minutes, 1,630 resource.blocked per task).
+     *
+     * The head is examined without being removed, so a waiter that cannot go
+     * is never taken out and put back: every move below is a real exit, and
+     * its event is emitted once it has landed.
+     */
+    private _admitFromQueue(
+      queueId: string, groupId: string, blockedTasks: TaskQueue<FyflowTask>, key?: string, maxExits = Infinity,
+      sweep?: { parked: number }
+    ): number {
       const group = this.groups[groupId];
-      if (!group || !group.canRun(key)) return;
+      if (!group) return 0;
+      let exits = 0;
 
-      // Move tasks from blocked queue back to ready queue
-      const tasksToRetry: FyflowTask[] = [];
-      const stillBlocked: FyflowTask[] = [];
-      // Waiters whose pool has gone. Failed after the loop, never during it.
+      // Waiters moved to a ready queue whose pool had no free slot. They hold
+      // nothing yet, so they count against the capacity this wake hands out -
+      // or a full pool would pull the whole queue into its ready queue. A
+      // group that does not weigh `cost` (a rate group) cannot be asked for
+      // more than one, so at most one goes that way per wake - or per sweep.
+      let parked = sweep?.parked ?? 0;
+      // Asked only once something has parked: most wakes never need it, and
+      // a group with several wait sets is woken one queue at a time
+      let weighsCost: boolean | undefined;
+      // Waiters whose pool has gone, or whose group threw. Failed after the
+      // loop, never during it.
       const orphaned: FyflowTask[] = [];
+      const failed: Array<{ task: FyflowTask; error: unknown }> = [];
 
-      while (blockedTasks.length > 0 && group.canRun(key)) {
-        const task = blockedTasks.shift()!;
-        // In transit until it lands somewhere below
-        task._queuedIn = undefined;
+      while (blockedTasks.length > 0 && exits < maxExits) {
+        const task = blockedTasks.at(0)!;
+        if (parked > 0 && !(weighsCost ??= !group.canRun(key, Number.MAX_SAFE_INTEGER))) break;
 
         const pool = this.workerPools[task.workerType];
         if (!pool) {
-          // Exit (c). Already shifted out, and there is nowhere to put it back.
-          // Collected rather than failed here: failing dispatches `task.failed`
-          // synchronously, and a listener re-entering the scheduler would do so
-          // while this loop is still mid-iteration over `blockedTasks`.
+          // Exit (c). Collected rather than failed here: failing dispatches
+          // `task.failed` synchronously, and a listener re-entering the
+          // scheduler would do so while this loop still walks `blockedTasks`.
+          blockedTasks.shift();
+          task._queuedIn = undefined;
+          task._blockedQueueId = undefined;
           orphaned.push(task);
+          exits++;
           continue;
         }
 
-        // Head-of-line admission for resident groups. If this task would need a
-        // new worker and its pool's cost does not fit, stop scanning: nothing
-        // behind it may overtake. Letting cheaper tasks through instead starves
-        // an expensive pool indefinitely - a stream of 2-unit workers can keep a
-        // 20-unit worker out of a 24-unit group forever.
-        if (this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false) {
-          blockedTasks.unshift(task);
-          task._queuedIn = 'blocked';
-          break;
+        // Waiting here for a worker's resident units, rather than for a group
+        // the task itself holds - the same derivation `_blockedHoldingFor` uses
+        // Built once per waiter: the checks below all read it
+        const holds = this._holdsFor(task, pool);
+        const own = holds.find(({ id, key: k }) => id === groupId && k === key);
+        const residentWait = own === undefined;
+        // What it asked of this group: its own request, or its pool's
+        const request = residentWait ? pool.residentRequests?.[groupId] : own.request;
+        // The groups are asked below, and a group's callbacks can throw - a
+        // limitFor answering badly for a key not active since addTask. That
+        // fails this waiter, not the release that woke it.
+        let canGo: boolean;
+        let workerShort: boolean;
+        let refusing: Hold | undefined;
+        try {
+          canGo = group.canRun(key, parked + 1, request);
+          workerShort = canGo && this._needsNewWorker(pool) && pool.canHoldAnotherWorker?.() === false;
+          refusing = canGo && !workerShort
+            ? holds.find(hold => hold !== own && !hold.group.canRun(hold.key, 1, hold.request))
+            : undefined;
+        } catch (error) {
+          blockedTasks.shift();
+          task._queuedIn = undefined;
+          task._blockedQueueId = undefined;
+          failed.push({ task, error });
+          exits++;
+          continue;
         }
+        if (!canGo) break;
 
-        const entries = this._groupsForTask(task, pool);
-        const keys = task._resourceKeys ?? {};
-        const runnable = entries.every(({ id, group: g }) =>
-          g.canRun(g.keyed ? keys[id] : undefined)
-        );
-
-        if (!runnable) {
-          // Another of this task's groups is still full. Keep it queued - it used
-          // to be dropped here, leaving it in no queue at all, which only stayed
-          // invisible because single-group tasks can never reach this branch.
-          stillBlocked.push(task);
+        // Its pool's per-worker cost does not fit.
+        if (workerShort) {
+          // In a resident queue: stop. Head-of-line - nothing behind it may
+          // overtake. Letting cheaper tasks through instead starves an
+          // expensive pool indefinitely: a stream of 2-unit workers can keep a
+          // 20-unit worker out of a 24-unit group forever.
+          if (residentWait) break;
+          // In a task-held queue: wait in the resident group it is short of,
+          // whose release can admit it, at the back, behind the pools already
+          // waiting there. Stopping here instead blocked every waiter behind
+          // it - including ones that need no worker - until the heartbeat.
+          const resident = this._residentGroupsForPool(pool);
+          const short = resident.find(({ group: g, cost, request: r }) => !g.canRun(undefined, cost, r)) ?? resident[0];
+          this._migrate(task, pool, blockedTasks, groupId, key, { ...short, key: undefined }, true);
+          exits++;
           continue;
         }
 
-        // Remove from the queues of its other groups. Exit (b): here the array
-        // operation IS the logical exit, unlike the shift/unshift below.
-        for (const { id, group: g } of entries) {
-          const otherKey = g.keyed ? keys[id] : undefined;
-          const otherQueueId = this._blockedQueueId(id, otherKey);
-          if (otherQueueId === queueId) continue;
-          const otherQueue = this.blockedQueues.get(otherQueueId);
-          if (otherQueue) {
-            if (otherQueue.remove(task)) {
-              if (this._resourceObserved) {
-                this._emitResource('resource.unblocked', g, {
-                  groupId: id,
-                  ...this._blockedHoldingFor(task, pool, id),
-                  holderKind: 'task',
-                  holderId: task.id,
-                  workerType: task.workerType,
-                  key: otherKey,
-                  reason: 'superseded'
-                });
-              }
-            }
-          }
+        // Another of its holds still full - another group, or another key of
+        // this one: wait there instead. Its release is what can admit the task
+        // now, and this queue's never could - a task left here waited for the
+        // heartbeat.
+        if (refusing) {
+          // Except out of a resident queue. Moved, it gives up its place at the
+          // head; the pools behind it take the units it was waiting for, and
+          // once its group frees it no longer fits and joins the back - the
+          // same starvation as above. It keeps its place and is retried by
+          // the heartbeat, a cost paid only by a pool whose worker and task
+          // are both short at once.
+          if (residentWait) break;
+          this._migrate(task, pool, blockedTasks, groupId, key, refusing);
+          exits++;
+          continue;
         }
-        tasksToRetry.push(task);
+
+        // Exit (a): admitted
+        blockedTasks.shift();
+        exits++;
+        if (this._admitWaiter(task, pool, group, groupId, key, residentWait)) parked++;
       }
+      if (sweep) sweep.parked = parked;
 
-      // Preserve arrival order for anything that could not run yet
-      if (stillBlocked.length > 0) {
-        blockedTasks.unshift(...stillBlocked);
-        for (const task of stillBlocked) task._queuedIn = 'blocked';
-      }
-
-      // Add tasks back to ready queue and dispatch
-      if (tasksToRetry.length > 0) {
-        for (const task of tasksToRetry) {
-          // Cancelled by a listener on an earlier task's 'admitted', while
-          // this one was in transit: it is settled, and goes nowhere
-          if (task.state === 'cancelled') continue;
-          const workerQueue = this.readyQueuesByWorker.get(task.workerType);
-          if (workerQueue) {
-            workerQueue.unshift(task);
-            task._queuedIn = 'ready';
-            // Increment queued count since task is back in ready queue
-            this.stats.queued++;
-
-            // Exit (a), emitted HERE rather than at the shift() above. The loop
-            // shifts a task out and unshifts it back within one synchronous
-            // pass - `stillBlocked`, and the head-of-line break - so an event
-            // tied to the array operation drifts from the queue permanently and
-            // silently. This is the logical move to the ready queue, and by now
-            // the blocked queue is in its final shape.
-            if (this._resourceObserved) {
-              this._emitResource('resource.unblocked', group, {
-                groupId,
-                ...this._blockedHoldingFor(task, this.workerPools[task.workerType], groupId),
-                holderKind: 'task',
-                holderId: task.id,
-                workerType: task.workerType,
-                key,
-                reason: 'admitted'
-              });
-            }
-          }
-        }
-        this._dispatchLoop();
-      }
-
-      // Last, with the queue in its final shape and the dispatch already done,
-      // so a listener re-entering on task.failed sees consistent state
+      // Last, with the queue in its final shape, so a listener re-entering on
+      // task.failed sees consistent state
       for (const task of orphaned) this._failOrphanedTask(task, queueId);
+      for (const { task, error } of failed) this._failUndispatched(task, FyflowScheduler._groupError(task, error), queueId, 'failed');
+      return exits;
+    }
+
+    /**
+     * Exit (a), for a waiter already taken out of its queue. Into the ready
+     * queue first, so stats and `_queuedIn` are true while its event is out;
+     * dispatched from there.
+     *
+     * @param residentWait it waited in a resident queue - for a worker - so it
+     *   has had its turn there, and resident head-of-line does not send it to
+     *   the back again. One that waited for a task-held group has not.
+     * @returns true if it was left in the ready queue for want of a free slot.
+     */
+    private _admitWaiter(
+      task: FyflowTask, pool: any, group: any, groupId: string, key: string | undefined, residentWait: boolean
+    ): boolean {
+      task._blockedQueueId = undefined;
+      const workerQueue = this.readyQueuesByWorker.get(task.workerType)!;
+      workerQueue.unshift(task);
+      task._queuedIn = 'ready';
+      if (residentWait) task._admittedByWake = true;
+      this.stats.queued++;
+      if (this._resourceObserved) {
+        this._emitResource('resource.unblocked', group, {
+          groupId,
+          ...this._blockedHoldingFor(task, pool, groupId),
+          holderKind: 'task',
+          holderId: task.id,
+          workerType: task.workerType,
+          key,
+          reason: 'admitted'
+        });
+      }
+
+      // A listener may have cancelled it, or moved things: dispatch it only
+      // if it is still where it was put
+      if (task._queuedIn !== 'ready' || workerQueue.at(0) !== task) return false;
+      workerQueue.shift();
+      task._queuedIn = undefined;
+      const result = this._tryCanDispatch(task, pool);
+      if (result === undefined) return false;
+      if (result === true) {
+        this._dispatchTask(task, pool);
+      } else if (result === false) {
+        // No free slot: it waits for one in the ready queue, which the
+        // pool's next settle drains
+        workerQueue.unshift(task);
+        task._queuedIn = 'ready';
+        return true;
+      }
+      // 'blocked': a listener changed something and it is queued again, its
+      // events already out
+      return false;
+    }
+
+    /**
+     * Move the head of `from` to the queue of the group now refusing it - one
+     * exit and one entry, so the membership fold stays balanced. It joins the
+     * tail: it has not waited in that queue, and an insertion anywhere else
+     * would break the order the fold reconstructs.
+     *
+     * The entry is announced before the exit. Both events go out with the task
+     * already in its new queue, so a listener that cancels it - from either
+     * event - has it leave that queue, with its own `cancelled`, and that needs
+     * the `blocked` it balances to be out already. Announced the other way
+     * round, a cancel from the `migrated` listener left an exit from the new
+     * queue with no entry.
+     */
+    private _migrate(
+      task: FyflowTask, pool: any, from: TaskQueue<FyflowTask>, fromGroupId: string, fromKey: string | undefined,
+      to: Hold, toResident = false
+    ) {
+      const toKey = to.key;
+      const toQueueId = this._blockedQueueId(to.id, toKey ?? FyflowScheduler._waitSetOf(to.group, to.request));
+      if (from.at(0) === task) from.shift();
+      else from.remove(task);
+      const target = this._blockedQueue(toQueueId, true);
+      target.push(task);
+      task._blockedSeq = ++this.blockedSeq;
+      if (toResident) this._noteResidentWait(task);
+      task._queuedIn = 'blocked';
+      task._blockedQueueId = toQueueId;
+      if (!this._resourceObserved) return;
+      this._emitResource('resource.blocked', to.group, {
+        groupId: to.id,
+        ...this._blockedHoldingFor(task, pool, to.id),
+        holderKind: 'task',
+        holderId: task.id,
+        workerType: task.workerType,
+        key: toKey,
+        queuePosition: target.length - 1
+      });
+      // Unconditional: whatever that listener did, the task has left `from`
+      this._emitResource('resource.unblocked', this.groups[fromGroupId], {
+        groupId: fromGroupId,
+        ...this._blockedHoldingFor(task, pool, fromGroupId),
+        holderKind: 'task',
+        holderId: task.id,
+        workerType: task.workerType,
+        key: fromKey,
+        reason: 'migrated'
+      });
     }
 
     /**
@@ -1517,6 +2215,21 @@ export class FyflowTask {
      * it was not, it was silent.
      */
     private _failOrphanedTask(task: FyflowTask, leftQueueId: string): void {
+      this._failUndispatched(task, new Error(
+        `Worker pool "${task.workerType}" no longer exists - task "${task.id}" ` +
+        `was waiting on a resource group and can never be dispatched`
+      ), leftQueueId, 'orphaned');
+    }
+
+    /**
+     * Fail, terminally, a task that is pending and in no queue: no retry, and
+     * not through `_settleTask`, for the reasons {@link _failOrphanedTask}
+     * gives. `leftQueueId` is the blocked queue it has just been taken out of,
+     * if any, whose exit is announced with `reason`.
+     */
+    private _failUndispatched(
+      task: FyflowTask, error: Error, leftQueueId: string | undefined, reason: 'orphaned' | 'failed'
+    ): void {
       // Guarded on the task having ended, not on `_settling`. That flag is per
       // attempt and stays set after a retry or requeue decision until the next
       // dispatch, so a waiter that had already failed once returned here
@@ -1525,18 +2238,16 @@ export class FyflowTask {
       if (this._isTerminal(task.state)) return;
       task._settling = true;
 
-      const error = new Error(
-        `Worker pool "${task.workerType}" no longer exists - task "${task.id}" ` +
-        `was waiting on a resource group and can never be dispatched`
-      );
-
       // Announce the exit it has already made, then leave no membership behind:
       // a queue still holding it would never drain in a consumer's fold
-      this._emitOrphanedExit(task, leftQueueId);
+      if (leftQueueId !== undefined) this._emitExit(task, leftQueueId, reason);
+      const left: string[] = [];
       for (const [queueId, queue] of this.blockedQueues) {
-        if (!queue.remove(task)) continue;
-        this._emitOrphanedExit(task, queueId);
+        if (queue.remove(task)) left.push(queueId);
       }
+      // Deleted before any event, and outside the iteration
+      for (const queueId of left) this._dropBlockedQueueIfEmpty(queueId);
+      for (const queueId of left) this._emitExit(task, queueId, reason);
 
       task.error = error.message;
       task.endTime = Date.now();
@@ -1561,8 +2272,8 @@ export class FyflowTask {
       this._checkCompletion();
     }
 
-    /** One `orphaned` exit, for the queue named by `queueId`. */
-    private _emitOrphanedExit(task: FyflowTask, queueId: string): void {
+    /** One `orphaned` or `failed` exit, for the queue named by `queueId`. */
+    private _emitExit(task: FyflowTask, queueId: string, reason: 'orphaned' | 'failed'): void {
       if (!this._resourceObserved) return;
 
       const { groupId, key } = this._splitQueueId(queueId);
@@ -1573,7 +2284,7 @@ export class FyflowTask {
         holderId: task.id,
         workerType: task.workerType,
         key,
-        reason: 'orphaned'
+        reason
       });
     }
 
@@ -1591,7 +2302,10 @@ export class FyflowTask {
      * That is a stall, not a slow path. A task-held group is retried directly
      * by `_releaseResourcesForTask` when its own slot frees, so the damage was
      * confined to the waiters with no other wakeup: rate-limit windows rolling
-     * over, and resident admission, neither of which raises an event.
+     * over, and resident admission, neither of which raised an event then.
+     * Both have their own wakes now - a timer at `nextCapacityAt`, and the
+     * resident release - so this is the fallback for a custom group that
+     * changes without saying so.
      *
      * Leaving a pending timer alone is what makes it a heartbeat. It costs one
      * `_retryBlockedTasks()` per interval while work exists, and that
@@ -1603,7 +2317,7 @@ export class FyflowTask {
 
       // Only schedule retry if there are queued tasks or blocked tasks (fallback for groups without events)
       const hasReadyTasks = Array.from(this.readyQueuesByWorker.values()).some(q => q.length > 0);
-      const hasBlockedTasks = Array.from(this.blockedQueues.values()).some(queue => queue.length > 0);
+      const hasBlockedTasks = this._hasBlockedTasks();
       if (hasReadyTasks || hasBlockedTasks) {
         this.retryTimer = setTimeout(() => {
           // Cleared before the work, so the re-arm below is not a no-op
@@ -1813,9 +2527,15 @@ export class FyflowTask {
         workerId: string;
         groupId: string;
         cost: number;
+        grant?: unknown;
         reason?: ResourceReleaseReason;
       }
     ): void {
+      // A worker gave its units back: wake the group's waiters. In a microtask,
+      // because the pool notifies from inside its own teardown, and a wake
+      // dispatches - possibly into that same pool - before it has finished.
+      if (notice.type === 'released') this._queueGroupWake(notice.groupId);
+
       if (!this._resourceObserved) return;
 
       this._emitResource(
@@ -1828,6 +2548,7 @@ export class FyflowTask {
           holderId: notice.workerId,
           workerType,
           cost: notice.cost,
+          ...(notice.grant !== undefined ? { grant: notice.grant } : {}),
           ...(notice.type === 'released' ? { reason: notice.reason } : {})
         }
       );
@@ -1849,16 +2570,221 @@ export class FyflowTask {
       task: FyflowTask,
       pool: any,
       groupId: string
-    ): { lifetime: ResourceLifetime; cost: number } {
+    ): { lifetime: ResourceLifetime; cost: number; request?: unknown; waitSet?: string } {
       const taskHeld = this._groupsForTask(task, pool).some(entry => entry.id === groupId);
-      return taskHeld
+      const request = taskHeld ? task._requests?.[groupId] : pool?.residentRequests?.[groupId];
+      const holding: { lifetime: ResourceLifetime; cost: number; request?: unknown; waitSet?: string } = taskHeld
         ? { lifetime: 'task-held', cost: 1 }
         : { lifetime: 'resident', cost: pool?.residentGroups?.[groupId] ?? 1 };
+      if (request !== undefined) {
+        holding.request = request;
+        // The queue it waits in, derived as its queue id is: requests that
+        // differ can share one - "any" and a prefer both wait in the plain queue
+        const waitSet = FyflowScheduler._waitSetOf(this.groups[groupId], request);
+        if (waitSet !== undefined) holding.waitSet = waitSet;
+      }
+      return holding;
     }
 
+    /**
+     * Honour `slot-released`: capacity a group gives back outside a release
+     * of ours - a raised `limit`, or a custom group whose capacity is
+     * external - wakes its waiters a microtask later. Those of the key it
+     * names, for a keyed group.
+     *
+     * The scheduler's own releases wake directly, and a `slot-released` from
+     * inside one is ignored, so the hot path pays one listener call and a
+     * lookup. So is one a group emits while the scheduler is waking that
+     * group's waiters - from `canRun`, say: that wake is asking the group
+     * already, and honoured, a group emitting on every `canRun` would wake
+     * its queue from inside each wake, a microtask chain that never yields.
+     * Wakes requested in one turn are deduplicated, so a burst of events is
+     * one wake per queue.
+     *
+     * `detail.key` counts only for a keyed group. Any other group keeps its
+     * waiters under no key, so a key would name a queue that does not exist.
+     */
     _setupGroupEventListeners() {
-      // Note: We no longer need event listeners on slot-released because we explicitly call
-      // _retryBlockedTasksForGroup() after releasing resources in _releaseResourcesForTask()
+      for (const [groupId, group] of Object.entries(this.groups)) {
+        if (typeof (group as any)?.addEventListener !== 'function') continue;
+        this._addInternalListener(group, 'slot-released', (e: Event) => {
+          if (this.shutDown || this.releasingGroups.has(group)) return;
+          if (this.waking && this._groupOfQueue(this.wakingQueue) === groupId) return;
+          const key = group.keyed ? (e as CustomEvent).detail?.key : undefined;
+          this._queueGroupWake(groupId, typeof key === 'string' && key !== '' ? key : undefined);
+        });
+      }
+    }
+
+    /** The group a blocked queue id, or a sweep id, belongs to. */
+    private _groupOfQueue(queueId: string): string {
+      if (queueId.startsWith(SWEEP_PREFIX)) return queueId.slice(SWEEP_PREFIX.length);
+      return this._splitQueueId(queueId).groupId;
+    }
+
+    /**
+     * Wake a group's waiters in a microtask: those of `key`, or with no key,
+     * every queue of the group.
+     *
+     * A microtask, because both callers are inside someone else's code - a
+     * pool tearing a worker down, a group's setter - and a wake dispatches.
+     */
+    private _queueGroupWake(groupId: string, key?: string): void {
+      const id = key === undefined ? groupId : this._blockedQueueId(groupId, key);
+      if (this.groupWakes.has(id)) return;
+      const first = this.groupWakes.size === 0;
+      this.groupWakes.set(id, { groupId, key });
+      if (!first) return;
+      queueMicrotask(() => {
+        const due = [...this.groupWakes.values()];
+        this.groupWakes.clear();
+        if (this.shutDown) return;
+        for (const { groupId, key } of due) {
+          const group = this.groups[groupId];
+          if (key !== undefined || !group?.keyed) this._retryBlockedTasksForGroup(groupId, key);
+          else {
+            // No key from a keyed group: any of its keys may have room
+            this._retryBlockedTasksForGroup(groupId);
+            for (const k of this._blockedKeysFor(groupId)) this._retryBlockedTasksForGroup(groupId, k);
+          }
+        }
+      });
+    }
+
+    /**
+     * Ask `queueId`'s group when it has room again, and wake the queue then.
+     *
+     * Asked when a waiter joins the queue, and when a wake leaves waiters in
+     * it - in both cases only while no time is pending. Not again while one
+     * is - a rate window's time only moves later as tasks start and finish,
+     * and a release wakes the queue anyway. So it costs one `nextCapacityAt`
+     * per queue per window, not per waiter or per event.
+     *
+     * @param refused the group has just refused this queue's waiter - at the
+     *   push, or in a wake that admitted nobody. If the group then says it
+     *   has room, the two answers disagree - `Date.now()` is not monotonic,
+     *   on Windows a timer firing at 219 met a `canRun` that read 218, and a
+     *   window's last millisecond can pass between the two calls - and with
+     *   no time pending nothing would wake the queue again. When `canRun`
+     *   agrees there is room now, that is treated as a time already due.
+     *   When it still refuses, only a release can make room, and the queue
+     *   is left to it.
+     */
+    private _armTimeWake(queueId: string, refused = false): void {
+      if (!this.timeWakeGroups || this.shutDown || this.timeWakes.has(queueId)) return;
+      const { groupId, key, set } = this._splitQueueId(queueId);
+      const group: any = this.groups[groupId];
+      // A wait-set group's queues are woken as a whole; none has a time
+      if (typeof group?.nextCapacityAt !== 'function' || set !== undefined) return;
+      let at: unknown;
+      try {
+        at = group.nextCapacityAt(key);
+      } catch (error) {
+        // Advisory: the heartbeat still covers the queue, so warn and go on
+        // rather than fail a task over a hint
+        if (!this.timeWakeWarned.has(group)) {
+          this.timeWakeWarned.add(group);
+          console.warn(`⚠️ Group "${groupId}" threw from nextCapacityAt - its waiters wait for the heartbeat:`, error);
+        }
+        return;
+      }
+      // Room now, yet the group refused just before: try again shortly
+      if (at === undefined && refused && group.canRun(key, 1)) at = Date.now();
+      if (typeof at !== 'number' || !Number.isFinite(at)) return;
+      let wakeAt: number = at;
+      // A time already due is real at a millisecond boundary - refused at t,
+      // asked at t + 1, free at t + 1 - and when an arrival takes the room
+      // first. Nothing else wakes the queue then, so it is woken promptly.
+      // Again and again without progress is a group answering "now" with no
+      // room, so each repeat waits twice as long, up to the heartbeat
+      // interval: never a lost wake, never a hot loop.
+      if (at <= Date.now()) {
+        const delay = this.timeWakeDue.get(queueId) ?? 1;
+        this.timeWakeDue.set(queueId, Math.min(delay * 2, Math.max(1, this.options.periodicRetryIntervalMs!)));
+        wakeAt = Date.now() + delay;
+      } else {
+        this.timeWakeDue.delete(queueId);
+      }
+      this.timeWakes.set(queueId, wakeAt);
+      FyflowScheduler._heapPush(this.timeWakeHeap, [wakeAt, queueId]);
+      this._setTimeWakeTimer(wakeAt);
+    }
+
+    /** Set the one timer for `at`, unless it is already set for no later. */
+    private _setTimeWakeTimer(at: number): void {
+      if (this.timeWakeTimer !== null && this.timeWakeTimerAt <= at) return;
+      if (this.timeWakeTimer !== null) clearTimeout(this.timeWakeTimer);
+      this.timeWakeTimerAt = at;
+      // Capped: a longer delay overflows, and runtimes fire it after 1 ms -
+      // a month-long window would wake every millisecond. Capped, the fire
+      // finds nothing due and sets the timer again
+      this.timeWakeTimer = setTimeout(() => this._onTimeWake(), Math.min(MAX_TIMER_MS, Math.max(1, at - Date.now())));
+    }
+
+    /**
+     * Wake every queue whose time has come, then set the timer for the next.
+     *
+     * Each wake admits what has room and re-asks for the waiters left, so a
+     * fire costs O(queues due) wakes plus O(log n) per heap entry. Timers can
+     * fire a millisecond early against `Date.now()`; such a time is not due
+     * yet, and the timer is set again for it.
+     */
+    private _onTimeWake(): void {
+      this.timeWakeTimer = null;
+      this.timeWakeTimerAt = Infinity;
+      if (this.shutDown) return;
+      const heap = this.timeWakeHeap;
+      const now = Date.now();
+      const due: string[] = [];
+      while (heap.length > 0 && heap[0][0] <= now) {
+        const [at, queueId] = FyflowScheduler._heapPop(heap);
+        if (this.timeWakes.get(queueId) !== at) continue; // stale
+        this.timeWakes.delete(queueId);
+        due.push(queueId);
+      }
+      for (const queueId of due) {
+        if (!this.blockedQueues.has(queueId)) continue;
+        const { groupId, key } = this._splitQueueId(queueId);
+        this._retryBlockedTasksForGroup(groupId, key);
+      }
+      while (heap.length > 0 && this.timeWakes.get(heap[0][1]) !== heap[0][0]) FyflowScheduler._heapPop(heap);
+      if (heap.length > 0) this._setTimeWakeTimer(heap[0][0]);
+    }
+
+    private _clearTimeWakes(): void {
+      if (this.timeWakeTimer !== null) clearTimeout(this.timeWakeTimer);
+      this.timeWakeTimer = null;
+      this.timeWakeTimerAt = Infinity;
+      this.timeWakes.clear();
+      this.timeWakeHeap = [];
+    }
+
+    private static _heapPush(heap: Array<[number, string]>, entry: [number, string]): void {
+      let i = heap.push(entry) - 1;
+      while (i > 0) {
+        const parent = (i - 1) >> 1;
+        if (heap[parent][0] <= entry[0]) break;
+        heap[i] = heap[parent];
+        i = parent;
+      }
+      heap[i] = entry;
+    }
+
+    private static _heapPop(heap: Array<[number, string]>): [number, string] {
+      const top = heap[0];
+      const last = heap.pop()!;
+      if (heap.length === 0) return top;
+      let i = 0;
+      for (;;) {
+        const left = 2 * i + 1;
+        if (left >= heap.length) break;
+        const child = left + 1 < heap.length && heap[left + 1][0] < heap[left][0] ? left + 1 : left;
+        if (heap[child][0] >= last[0]) break;
+        heap[i] = heap[child];
+        i = child;
+      }
+      heap[i] = last;
+      return top;
     }
 
     _setupWorkerPoolListeners() {
@@ -1875,6 +2801,16 @@ export class FyflowTask {
           }
         };
         this._addInternalListener(pool, 'task.started', taskStartedListener);
+
+        // A worker becoming ready frees its slots without anything settling.
+        // Tasks that arrived during its start-up saw it as full, and no room
+        // for another worker, so they wait in the ready queue: without this
+        // they start at the next settle or the heartbeat. A microtask, because
+        // the worker clears `initializing` after it emits this.
+        const workerReadyListener = () => {
+          queueMicrotask(() => { if (!this.shutDown) this._dispatchLoop(); });
+        };
+        this._addInternalListener(pool, 'worker.initialization.completed', workerReadyListener);
 
         // Handle progress updates from workers
         const taskProgressListener = (e: any) => {
@@ -2165,7 +3101,9 @@ export class FyflowTask {
      * composite queue id does not leak. A keyed group has one sub-queue per
      * key; they are concatenated in key order, each with its own positions, so
      * the result is deterministic and reproducible from the
-     * `resource.blocked` / `resource.unblocked` stream.
+     * `resource.blocked` / `resource.unblocked` stream. A group with wait sets
+     * has one per set, named by `waitSet`, concatenated in the order their
+     * heads arrived - reproducible from the stream too.
      *
      * Cost is `O(total blocked tasks)` and it is not capped - the panel this
      * exists for is the starvation case, which is exactly when the queue is
@@ -2178,12 +3116,12 @@ export class FyflowTask {
      */
     getAdmissionQueue(groupId?: string): Record<string, AdmissionWaiter[]> {
       // Collected per (group, key) first so sub-queues can be ordered by key
-      const byGroup = new Map<string, Array<{ key?: string; waiters: AdmissionWaiter[] }>>();
+      const byGroup = new Map<string, Array<{ key?: string; suffix?: string; waiters: AdmissionWaiter[]; headSeq: number }>>();
 
       for (const [queueId, queue] of this.blockedQueues) {
         if (queue.length === 0) continue;
 
-        const { groupId: id, key } = this._splitQueueId(queueId);
+        const { groupId: id, key, suffix } = this._splitQueueId(queueId);
         if (groupId !== undefined && id !== groupId) continue;
 
         const waiters = queue.toArray().map((task, position) => {
@@ -2201,15 +3139,18 @@ export class FyflowTask {
         });
 
         const subQueues = byGroup.get(id) ?? [];
-        subQueues.push({ key, waiters });
+        subQueues.push({ key, suffix, waiters, headSeq: queue.at(0)?._blockedSeq ?? 0 });
         byGroup.set(id, subQueues);
       }
 
       const admission: Record<string, AdmissionWaiter[]> = {};
       for (const [id, subQueues] of byGroup) {
         // Map iteration order is queue-creation order, which a consumer folding
-        // the stream cannot reproduce. Key order can be.
-        subQueues.sort((a, b) => (a.key ?? '').localeCompare(b.key ?? ''));
+        // the stream cannot reproduce. Key order can be - and for a group with
+        // wait sets, the order its heads arrived in, which is also the order
+        // a release serves its queues in.
+        if (FyflowScheduler._hasWaitSets(this.groups[id])) subQueues.sort((a, b) => a.headSeq - b.headSeq);
+        else subQueues.sort((a, b) => (a.suffix ?? '').localeCompare(b.suffix ?? ''));
         admission[id] = subQueues.flatMap(sub => sub.waiters);
       }
       return admission;
@@ -2283,6 +3224,8 @@ export class FyflowTask {
       // running is discarded with the queues, so it cannot fire into a pool
       // that no longer exists.
       this._clearPeriodicRetry();
+      this._clearTimeWakes();
+      this.timeWakeDue.clear();
       for (const { timer } of this.retryWaiting.values()) clearTimeout(timer);
       this.retryWaiting.clear();
       this._removeAllListeners();
@@ -2312,6 +3255,7 @@ export class FyflowTask {
         }
       }
       this.blockedQueues.clear();
+      this.blockedKeys.clear();
       this.blockedLive.live = 0;
       for (const task of this.tasks.values()) task._queuedIn = undefined;
 

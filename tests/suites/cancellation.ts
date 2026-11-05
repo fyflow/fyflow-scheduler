@@ -1,17 +1,18 @@
 // Task cancellation: scheduler.cancel().
 //
-// A task can be in seven places when a cancel arrives. Waiting, and removed at
+// A task can be in six places when a cancel arrives. Waiting, and removed at
 // once: 1. the ready queue, 2. a blocked queue, 3. a retry backoff. Dispatched,
-// and settled once its attempt stops: 4. on its way to a new thread
-// (enqueueNoQueue awaiting it), 5. in a thread's start-up queue, 6. inline,
-// before run(), 7. inside run() - the only one where the worker sees its
-// signal, and on a thread the only one that can need a forced stop. These
+// and settled once its attempt stops: 4. in a thread's start-up queue, 5.
+// inline, before run(), 6. inside run() - the only one where the worker sees
+// its signal, and on a thread the only one that can need a forced stop. There
+// used to be a seventh, on its way to a new thread while enqueueNoQueue awaited
+// it; the task now reaches the thread in the same turn. These
 // tests pin each, the events a listener can cancel from mid-transition, the
 // forced stop, and the counters. The counter check is exact - queued + running + done + failed +
 // cancelled + blocked equals the tasks added - because the counters are clamped
 // at 0, which hides a wrong decrement from a "never exceeds" check.
 
-import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, KeyedRateLimitGroup, CancelledError } from '../../index.ts';
+import { WorkerManager, FyflowScheduler, FyflowTask, ConcurrentLimitGroup, KeyedRateLimitGroup, KeyedConcurrentLimitGroup, CancelledError } from '../../index.ts';
 import { runTest, type TestResult } from '../harness.ts';
 
 // Node.js process declaration for cross-platform compatibility
@@ -69,6 +70,7 @@ class CancellationTestSuite {
 
     this.results.push(await this.runTest('Cancel A Queued Task', () => this.testQueued()));
     this.results.push(await this.runTest('Cancel A Blocked Task', () => this.testBlocked()));
+    this.results.push(await this.runTest('Cancel On A Keyed Concurrency Group Stays On Its Key', () => this.testBlockedKeyedConcurrent()));
     this.results.push(await this.runTest('Cancel During A Retry Backoff', () => this.testBackoff()));
     this.results.push(await this.runTest('Cancel A Running Task: Cancel Wins Over Its Result', () => this.testRunningResultDiscarded()));
     this.results.push(await this.runTest('Cancel A Running Task: No Retry After Its Failure', () => this.testRunningFailureNotRetried()));
@@ -82,7 +84,7 @@ class CancellationTestSuite {
     this.results.push(await this.runTest('scheduler.completed Without A Success', () => this.testCompletion()));
     this.results.push(await this.runTest('Spawns From A Cancelled Task Are Refused', () => this.testSpawnRefused()));
     this.results.push(await this.runTest('onCompleteDescendants Rejects For A Cancelled Root', () => this.testDescendants()));
-    this.results.push(await this.runTest('Cancelled Before Reaching A New Thread', () => this.testBeforeThread()));
+    this.results.push(await this.runTest('Cancelled In The Same Turn As Its Dispatch To A New Thread', () => this.testBeforeThread()));
     this.results.push(await this.runTest('Cancelled While Its Thread Initialises', () => this.testThreadInitialising()));
     this.results.push(await this.runTest('Cancelled Before An Inline run()', () => this.testBeforeInlineRun()));
     this.results.push(await this.runTest('Cooperative Cancel: The Worker Sees The Signal', () => this.testCooperative()));
@@ -256,10 +258,15 @@ class CancellationTestSuite {
   }
 
   // Run with stats.queued > 0, so a wrong queued decrement is not hidden by
-  // the clamp at 0
+  // the clamp at 0.
+  //
+  // The queued tasks come from a full pool, not from waiters stranded behind a
+  // blocked head: before 0.7.0 only b1 entered the blocked queue and b2-b4
+  // waited in the ready queue; since the admission rework all four are
+  // blocked. q1 and q2 are queued under either model.
   private async testBlocked(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
-    const { scheduler } = this.make({ maxConcurrentTasks: 1, maxThreads: 2, groups: ['g'] }, { g: group });
+    const { scheduler } = this.make({ maxConcurrentTasks: 1, maxThreads: 2 }, { g: group });
     const log = this.events(scheduler);
     const fold = new Map<string, number>();
     scheduler.addEventListener('resource.blocked', (e: any) => fold.set(e.detail.holderId, (fold.get(e.detail.holderId) ?? 0) + 1));
@@ -269,13 +276,16 @@ class CancellationTestSuite {
       reasons.push(`${e.detail.holderId}:${e.detail.reason}`);
     });
 
-    scheduler.addTask(this.task('holder', { delay: 150 }));
-    // One batch, so one dispatch pass: b1 is blocked, and the others wait in the
-    // ready queue behind it
-    scheduler.addTasks(['b1', 'b2', 'b3', 'b4'].map(id => this.task(id, { delay: 5 })));
+    const g = { workerGroups: ['g'] };
+    scheduler.addTask(this.task('holder', { delay: 150 }, g));
+    // The pool's second slot is still free, so b1 is checked against g and blocked
+    scheduler.addTasks(['b1', 'b2', 'b3', 'b4'].map(id => this.task(id, { delay: 5 }, g)));
+    // Fill that slot without g, then queue two more behind the full pool
+    scheduler.addTask(this.task('filler', { delay: 150 }));
+    scheduler.addTasks(['q1', 'q2'].map(id => this.task(id, { delay: 5 })));
     await sleep(20);
     const blockedBefore = scheduler.getAdmissionQueue('g').g?.map(w => w.holderId) ?? [];
-    if (!blockedBefore.includes('b1') || scheduler.stats.queued === 0) {
+    if (!blockedBefore.includes('b1') || scheduler.stats.queued < 2) {
       throw new Error(`Precondition: blocked ${blockedBefore}, queued ${scheduler.stats.queued}`);
     }
     const queuedBefore = scheduler.stats.queued;
@@ -284,11 +294,59 @@ class CancellationTestSuite {
     if (scheduler.stats.queued !== queuedBefore) throw new Error(`Cancelling a blocked task moved queued ${queuedBefore} -> ${scheduler.stats.queued}`);
     if ((scheduler.getAdmissionQueue('g').g ?? []).some(w => w.holderId === 'b1')) throw new Error('Still in the admission queue');
     if (!reasons.includes('b1:cancelled')) throw new Error(`Unblock reasons: ${reasons}`);
-    this.assertAccounted(scheduler, 5, 'after cancel');
+    this.assertAccounted(scheduler, 8, 'after cancel');
 
-    await this.until(() => scheduler.stats.done === 4);
+    await this.until(() => scheduler.stats.done === 7);
     if (log.includes('running:b1')) throw new Error('b1 ran');
     for (const [holder, balance] of fold) if (balance !== 0) throw new Error(`Fold for ${holder} ended at ${balance}`);
+    this.assertAccounted(scheduler, 8, 'end');
+  }
+
+  /**
+   * A KeyedConcurrentLimitGroup's blocked queues are per key. Cancelling a
+   * waiter leaves its key's queue and touches no other key; cancelling a
+   * holder frees a unit of its own key only, which admits that key's next
+   * waiter. Once everything settles every key is evicted.
+   */
+  private async testBlockedKeyedConcurrent(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(1, { id: 'disk' });
+    // The cancel worker honours its signal, so a cancelled holder frees its
+    // unit at once rather than when an uninterruptible inline run() returns
+    const { scheduler } = this.make({ maxConcurrentTasks: 8, groups: ['disk'] }, { disk }, this.cancelWorkerUrl);
+    const log = this.events(scheduler);
+    const reasons: string[] = [];
+    scheduler.addEventListener('resource.unblocked', (e: any) => reasons.push(`${e.detail.holderId}:${e.detail.reason}`));
+    const on = (key: string) => ({ limitKey: key });
+
+    const held = scheduler.addTask(this.task('a-holder', { delay: 400 }, on('a')), { createPromise: true }) as Promise<any>;
+    held.catch(() => { /* cancelled below */ });
+    scheduler.addTask(this.task('b-holder', { delay: 150 }, on('b')));
+    scheduler.addTasks([
+      this.task('a-2', { delay: 5 }, on('a')),
+      this.task('a-3', { delay: 5 }, on('a')),
+      this.task('b-2', { delay: 5 }, on('b'))
+    ]);
+    await sleep(20);
+    const queue = (scheduler.getAdmissionQueue('disk').disk ?? []).map(w => `${w.holderId}@${w.key}`);
+    if (queue.join(',') !== 'a-2@a,a-3@a,b-2@b') throw new Error(`Precondition: admission queue ${queue}`);
+
+    // A waiter: it leaves a's queue, and b's is untouched
+    await scheduler.cancel('a-2');
+    const after = (scheduler.getAdmissionQueue('disk').disk ?? []).map(w => `${w.holderId}@${w.key}`);
+    if (after.join(',') !== 'a-3@a,b-2@b') throw new Error(`After cancelling a-2: ${after}`);
+    if (!reasons.includes('a-2:cancelled')) throw new Error(`Unblock reasons: ${reasons}`);
+
+    // A holder: its unit goes to its own key's next waiter, well before it would have finished
+    await scheduler.cancel('a-holder', { graceMs: 0 });
+    await this.until(() => log.includes('completed:a-3'), 1000);
+    if (log.includes('completed:b-holder')) throw new Error('a-3 waited for b to free up');
+    if (log.includes('running:b-2') && log.indexOf('running:b-2') < log.indexOf('completed:b-holder')) {
+      throw new Error("b-2 started while b's holder still ran");
+    }
+
+    await this.until(() => scheduler.stats.done === 3);
+    if (log.includes('running:a-2')) throw new Error('a-2 ran');
+    if (disk.getMetrics().activeKeys !== 0) throw new Error(`Keys left: ${disk.getActiveKeys()}`);
     this.assertAccounted(scheduler, 5, 'end');
   }
 
@@ -552,11 +610,12 @@ class CancellationTestSuite {
   }
 
 
-  // --- places 4-7: dispatched ------------------------------------------------
+  // --- places 4-6: dispatched ------------------------------------------------
 
-  // Place 4. addTask runs the dispatch synchronously, and on a threaded pool
-  // with no worker yet, enqueueNoQueue awaits the new thread before calling
-  // runTask - so a cancel in the same turn lands in between
+  // Place 4, at the earliest moment. addTask runs the dispatch synchronously,
+  // and on a threaded pool with no worker yet the task is in the new thread's
+  // start-up queue before addTask returns - there is no moment in between for
+  // a cancel to land in
   private async testBeforeThread(): Promise<void> {
     const group = new ConcurrentLimitGroup(1);
     const { pool, scheduler } = this.make({ inline: false, groups: ['g'] }, { g: group }, this.cancelWorkerUrl);
@@ -569,7 +628,10 @@ class CancellationTestSuite {
 
     const task = this.task('p4');
     const promise = scheduler.addTask(task, { createPromise: true });
-    if (!(pool as any).enqueuing.has('p4')) throw new Error('Precondition: not between dispatch and its thread');
+    const wrapper = pool.threads[0] as any;
+    if (!wrapper || !wrapper.taskQueue.some((t: any) => t.taskId === 'p4')) {
+      throw new Error("Not in a new thread's start-up queue in the turn it was dispatched");
+    }
     if (await this.within(scheduler.cancel('p4'), 3000, 'cancel()') !== true) throw new Error('cancel() resolved false');
 
     if (!(await this.rejection(promise) instanceof CancelledError)) throw new Error('Promise did not reject with CancelledError');
@@ -580,7 +642,7 @@ class CancellationTestSuite {
     this.assertAccounted(scheduler, 1, 'end');
   }
 
-  // Place 5. Handed to a fresh thread, waiting in its queue for it to initialise
+  // Place 4. Handed to a fresh thread, waiting in its queue for it to initialise
   private async testThreadInitialising(): Promise<void> {
     const { pool, scheduler } = this.make({ inline: false }, {}, this.cancelWorkerUrl);
     const { log } = this.progress(scheduler);
@@ -602,7 +664,7 @@ class CancellationTestSuite {
     this.assertAccounted(scheduler, 1, 'end');
   }
 
-  // Place 6. On an inline pool the task is running from the start of runTask,
+  // Place 5. On an inline pool the task is running from the start of runTask,
   // before the worker instance exists
   private async testBeforeInlineRun(): Promise<void> {
     const { pool, scheduler } = this.make({}, {}, this.cancelWorkerUrl);
@@ -626,7 +688,7 @@ class CancellationTestSuite {
     this.assertAccounted(scheduler, 2, 'end');
   }
 
-  // Place 7, on both pool types: a worker honouring the signal stops at once
+  // Place 6, on both pool types: a worker honouring the signal stops at once
   private async testCooperative(): Promise<void> {
     for (const inline of [true, false]) {
       const kind = inline ? 'inline' : 'threaded';

@@ -352,9 +352,10 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   `scheduler.tasks` (default: unlimited). Set it for long-lived schedulers -
   completed tasks otherwise pin their payloads and results forever
 - `options.periodicRetryIntervalMs`: heartbeat for waking blocked tasks
-  (default 50ms). Groups that free a slot retry their own queue directly; this
-  covers what raises no signal - rate-limit windows rolling over, and resident
-  admission
+  (default 50ms). A fallback: releases wake their own queue directly, rate
+  windows wake theirs when they roll over, and a group emitting
+  `slot-released` is heard. This covers a custom group that changes without
+  saying so
 - `addTask(task, options?)`: Add a task. Fire-and-forget by default; pass
   `{ createPromise: true }` to get a promise back
 - `addTasks(tasks, options?)`: Batch version, optimised for bulk additions.
@@ -379,7 +380,9 @@ scheduler.addEventListener('scheduler.completed', (e) => {
 - `payload`: Data passed to worker
 - `workerGroups`: Optional resource group names
 - `optional`: Mark task as optional (failures don't block workflow)
-- `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup`)
+- `limitKey`: Bucket for keyed resource groups (see `KeyedRateLimitGroup` and
+  `KeyedConcurrentLimitGroup`)
+- `units`: Requests for particular units of a `UnitGroup`, per group id
 - `retryPolicy`: `{ maxRetries, backoffMs }`
 - `attemptsSpent`: Attempts already made, so a task re-added after a restart
   keeps its retry budget
@@ -415,8 +418,8 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   is terminated (default 2000). A forced stop is not counted as a restart
 
 **ConcurrentLimitGroup(limit, id?)**
-- Resource constraint with a concurrent execution limit. Optimistic: may briefly
-  exceed the limit by up to `maxThreads × maxConcurrentTasks` under contention
+- Resource constraint with a concurrent execution limit. A hard cap: no more
+  tasks hold it than its limit
 
 **RateLimitGroup(windows, id?)**
 - Time-window throttling, e.g. `[{ limit: 10, windowMs: 1000 }]`. Multiple
@@ -433,6 +436,27 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   window), so high-cardinality keys do not grow without bound
 - `getKeyMetrics(key)` and `getActiveKeys()` give the per-bucket view
 
+**KeyedConcurrentLimitGroup(limit, options?)**
+- A concurrent limit **per key** - one disk, one database each - so a saturated
+  key never delays another. Keyed like `KeyedRateLimitGroup`
+- `options.limitFor(key)` gives a key its own limit, e.g. 1 for a slow disk
+- `keyFrom` may return several keys - a C: -> D: copy holds both disks, and
+  starts only when both have room
+- A key is dropped as soon as nothing holds it
+
+**UnitGroup(units, options?)**
+- A limit whose units have names - two GPUs, licence seats - and the work is
+  told which it got: `context.grants.gpu` is `['gpu1']` in `run()`
+- In `residentGroups` it gives one worker per device: each worker holds its
+  units for its lifetime and reads them from `this.workerContext.grants`, from
+  its constructor on
+- A task or a pool can ask for particular units: `units: { gpu: { from: ['gpu1'] } }`
+  on a task, `residentGroups: { gpu: { from: ['gpu0', 'gpu1'] } }` on a pool,
+  and `prefer` as a hint that never blocks. A pinned waiter holds up nobody, and
+  a freed unit goes to the oldest waiter that can use it
+- `new UnitGroup(2)` names its units `0` and `1`. A custom group can grant
+  too: set `grants: true` and return the grant from `onStart` - see `AGENTS.md` §5
+
 **Worker management** (on a `WorkerManager`)
 - `getWorkerIds()`: ids of the workers that currently exist (created lazily)
 - `getWorkerStatus(id)` / `getAllWorkerStatuses()`: `{ id, state, tasksCompleted,
@@ -441,6 +465,7 @@ scheduler.addEventListener('scheduler.completed', (e) => {
   worker, optionally with new config. The replacement gets a new id
 - `updateWorkerConfig(id, config)`: merge config into a live worker
 - `getResidentUsage()`: units this pool currently holds in each resident group
+- `getResidentGrants(id)`: what a worker's resident groups granted it
 - `shutdown()`: terminate the pool
 
 **Worker self-termination** — a worker can ask to be torn down, e.g. after

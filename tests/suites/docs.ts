@@ -14,6 +14,8 @@ import {
   ConcurrentLimitGroup,
   RateLimitGroup,
   KeyedRateLimitGroup,
+  KeyedConcurrentLimitGroup,
+  UnitGroup,
   WorkerTerminationError,
   CancelledError
 } from '../../index.ts';
@@ -104,6 +106,9 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Worker Config From The Pool', () => this.docWorkerConfig()));
     this.results.push(await this.runTest('Doc: Concurrent Limit Group', () => this.docConcurrentGroup()));
     this.results.push(await this.runTest('Doc: Rate Limit Group', () => this.docRateLimitGroup()));
+    this.results.push(await this.runTest('Doc: A Concurrency Limit Is A Hard Cap, Even Re-entered', () => this.docHardCap()));
+    this.results.push(await this.runTest('Doc: A Rate Group Caps Starts Per Window', () => this.docRateCapsStarts()));
+    this.results.push(await this.runTest('Doc: Lowering A Limit Keeps Running Tasks', () => this.docLoweredLimit()));
     this.results.push(await this.runTest('Doc: Resource Metrics And Stats', () => this.docResourceMonitoring()));
     this.results.push(await this.runTest('Doc: Progress Reporting', () => this.docProgress()));
     this.results.push(await this.runTest('Doc: A Log Channel With emit()', () => this.docLogChannel()));
@@ -129,6 +134,10 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Keyed Limit Isolates A Saturated Key', () => this.docKeyedIsolation()));
     this.results.push(await this.runTest('Doc: Keyed Limit Requires A Key', () => this.docKeyedRequiresKey()));
     this.results.push(await this.runTest('Doc: Keyed Limit Metrics And Eviction', () => this.docKeyedMetrics()));
+    this.results.push(await this.runTest('Doc: Keyed Concurrency Limit Per Disk', () => this.docKeyedConcurrentLimit()));
+    this.results.push(await this.runTest('Doc: Several Keys Per Task', () => this.docSeveralKeysPerTask()));
+    this.results.push(await this.runTest('Doc: Units With Names', () => this.docUnitsWithNames()));
+    this.results.push(await this.runTest('Doc: Asking For Particular Units', () => this.docUnitRequests()));
     this.results.push(await this.runTest('Doc: An Event Detail Is A Live Reference', () => this.docDetailsAreLive()));
     this.results.push(await this.runTest('Doc: Lifecycle Events Fire Without setup()/teardown()', () => this.docLifecycleEventsAreUnconditional()));
     this.results.push(await this.runTest('Doc: Setup Failure Is Reported', () => this.docSetupFailure()));
@@ -138,6 +147,13 @@ class DocsTestSuite {
     this.results.push(await this.runTest('Doc: Cancelling A Run', () => this.docCancelRun()));
     this.results.push(await this.runTest('Doc: The Forced Stop', () => this.docForcedStop()));
     this.results.push(await this.runTest('Doc: Cancelled Tasks In Events And Descendants', () => this.docCancelEvents()));
+    this.results.push(await this.runTest('Doc: Resident Admission Is Head-Of-Line For Arrivals', () => this.docResidentArrivalsQueue()));
+    this.results.push(await this.runTest('Doc: A Task Waiting For A New Worker Takes A Free Slot', () => this.docResidentWaiterTakesSlot()));
+    this.results.push(await this.runTest('Doc: A Two-Group Waiter Migrates, And Every Waiter Is Listed', () => this.docTwoGroupMigrates()));
+    this.results.push(await this.runTest('Doc: A Rate Window Rolling Over Starts Its Waiter, Not The Heartbeat', () => this.docRateWindowWakes()));
+    this.results.push(await this.runTest('Doc: A Finished Task Counts From When It Finished', () => this.docRateCountsFromFinish()));
+    this.results.push(await this.runTest('Doc: Raising A Limit Starts The Waiters That Now Fit', () => this.docRaisedLimitWakes()));
+    this.results.push(await this.runTest('Doc: A Custom Group Names Its Time And Announces A Top-Up (QuotaGroup)', () => this.docQuotaGroup()));
     this.results.push(await this.runTest('Doc: AGENTS.md Covers Every Export', () => this.docExportsDocumented()));
 
     const totalDuration = performance.now() - this.startTime;
@@ -244,9 +260,10 @@ class DocsTestSuite {
     // with no group at all.
     const scheduler = this.makeScheduler({ groups: ['cpu'], maxThreads: 4, maxConcurrentTasks: 4 }, { cpu });
 
-    let inFlight = 0, peak = 0;
-    scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
-    scheduler.addEventListener('task.completed', () => { inFlight--; });
+    // Read from the group, not by counting task.running against task.completed,
+    // which overshoots (AGENTS.md §1)
+    let peak = 0;
+    scheduler.addEventListener('resource.acquired', () => { peak = Math.max(peak, cpu.getMetrics().running); });
 
     const tasks = Array.from({ length: 8 }, (_, i) => new FyflowTask({
       id: `doc-cpu-${i}`, workerType: 'DocsWorker',
@@ -256,14 +273,94 @@ class DocsTestSuite {
 
     if (scheduler.stats.done !== 8) throw new Error(`Expected 8 done, got ${scheduler.stats.done}`);
 
-    // Groups are optimistic, so a brief overshoot is expected - but nothing near
-    // the pool's own capacity of 16
-    if (peak > 6) {
-      throw new Error(`Group did not constrain concurrency: peak ${peak} against a limit of 2`);
+    // A hard cap, and reached: a peak below 2 would mean the group, not the
+    // pool, was never the bound
+    if (peak !== 2) {
+      throw new Error(`Expected the group to peak at its limit of 2, got ${peak}`);
     }
     if (cpu.getMetrics().running !== 0) {
       throw new Error(`Expected group drained, got ${cpu.getMetrics().running} running`);
     }
+  }
+
+  /**
+   * AGENTS.md §1: no more tasks hold a ConcurrentLimitGroup than its limit,
+   * including when a listener re-enters the scheduler from resource.acquired.
+   * Tasks need one or both of two groups, and every acquire of A adds a task
+   * needing only B - the order in which a task dispatched from inside another's
+   * acquisition could take B between that task's check and its own acquire.
+   */
+  private async docHardCap(): Promise<void> {
+    const A = new ConcurrentLimitGroup(3, 'A');
+    const B = new ConcurrentLimitGroup(2, 'B');
+    const scheduler = this.makeScheduler({ maxThreads: 4, maxConcurrentTasks: 8 }, { A, B });
+    let peakA = 0, peakB = 0, added = 0;
+    const children: Promise<any>[] = [];
+    const task = (id: string, groups: string[]) => new FyflowTask({
+      id, workerType: 'DocsWorker', workerGroups: groups, payload: { id, value: 1, awaitMs: 5 }
+    });
+    scheduler.addEventListener('resource.acquired', (e: any) => {
+      peakA = Math.max(peakA, A.getMetrics().running);
+      peakB = Math.max(peakB, B.getMetrics().running);
+      if (e.detail.groupId === 'A' && added < 40) {
+        children.push(scheduler.addTask(task(`child-${added++}`, ['B']), { createPromise: true }) as Promise<any>);
+      }
+    });
+    const parents = Array.from({ length: 40 }, (_, i) => task(`parent-${i}`, i % 2 ? ['A', 'B'] : ['A']));
+    await Promise.all(scheduler.addTasks(parents, { createPromise: true }) as Promise<any>[]);
+    await Promise.all(children);
+    if (peakA > 3 || peakB > 2) throw new Error(`Limits exceeded: A peaked at ${peakA}/3, B at ${peakB}/2`);
+    if (peakA !== 3 || peakB !== 2) throw new Error(`Limits never reached (A ${peakA}/3, B ${peakB}/2) - the test proves nothing`);
+  }
+
+  /**
+   * AGENTS.md §1: a rate group caps starts - no more than `limit` within any
+   * `windowMs` - and not how many run at once.
+   */
+  private async docRateCapsStarts(): Promise<void> {
+    const windowMs = 150;
+    const api = new RateLimitGroup([{ limit: 3, windowMs }], 'api');
+    const scheduler = this.makeScheduler({ groups: ['api'], maxThreads: 4, maxConcurrentTasks: 4 }, { api });
+    const starts: number[] = [];
+    scheduler.addEventListener('resource.acquired', (e: any) => starts.push(e.detail.timestamp));
+    const tasks = Array.from({ length: 9 }, (_, i) => new FyflowTask({
+      id: `rate-${i}`, workerType: 'DocsWorker', payload: { id: `rate-${i}`, value: i, awaitMs: 20 }
+    }));
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+    starts.sort((a, b) => a - b);
+    if (starts.length !== 9) throw new Error(`Expected 9 acquires, got ${starts.length}`);
+    // The event's timestamp is read just after the group's own clock, so allow
+    // a millisecond at the window's edge
+    for (const end of starts) {
+      const inWindow = starts.filter(t => t > end - windowMs + 1 && t <= end).length;
+      if (inWindow > 3) throw new Error(`${inWindow} starts within ${windowMs}ms ending at +${end - starts[0]}ms; limit 3`);
+    }
+  }
+
+  /**
+   * AGENTS.md §1: lowering `limit` under running tasks keeps their units, and
+   * admits nothing new until the count is below the new limit.
+   */
+  private async docLoweredLimit(): Promise<void> {
+    const cpu = new ConcurrentLimitGroup(4, 'cpu');
+    const scheduler = this.makeScheduler({ groups: ['cpu'], maxThreads: 4, maxConcurrentTasks: 4 }, { cpu });
+    const admittedOver: number[] = [];
+    scheduler.addEventListener('resource.acquired', () => {
+      const running = cpu.getMetrics().running;
+      if (cpu.limit === 1 && running > 1) admittedOver.push(running);
+    });
+    const tasks = Array.from({ length: 8 }, (_, i) => new FyflowTask({
+      id: `low-${i}`, workerType: 'DocsWorker', payload: { id: `low-${i}`, value: i, awaitMs: 40 }
+    }));
+    const all = Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+    await new Promise(r => setTimeout(r, 10));
+    if (cpu.getMetrics().running !== 4) throw new Error(`Expected 4 running before lowering, got ${cpu.getMetrics().running}`);
+    cpu.limit = 1;
+    // The four already running keep their units: the reading sits above the limit
+    if (cpu.read()[0].value !== 4) throw new Error(`Expected the reading to stay at 4, got ${cpu.read()[0].value}`);
+    await all;
+    if (admittedOver.length > 0) throw new Error(`Admitted while over the lowered limit: ${admittedOver.join(', ')}`);
+    if (scheduler.stats.done !== 8) throw new Error(`Expected 8 done, got ${scheduler.stats.done}`);
   }
 
   private async docRateLimitGroup(): Promise<void> {
@@ -966,9 +1063,12 @@ class DocsTestSuite {
       const scheduler = new FyflowScheduler({ DocsWorker: pool }, { cpu: group });
       this.schedulers.push(scheduler);
 
-      let inFlight = 0, peak = 0;
+      // In flight, from events: the undeclared run never acquires the group,
+      // so the group's own count cannot measure it
+      let inFlight = 0, peak = 0, held = 0;
       scheduler.addEventListener('task.running', () => { inFlight++; peak = Math.max(peak, inFlight); });
       scheduler.addEventListener('task.completed', () => { inFlight--; });
+      scheduler.addEventListener('resource.acquired', () => { held = Math.max(held, group.getMetrics().running); });
 
       const tasks = Array.from({ length: 40 }, (_, i) => new FyflowTask({
         id: `grp-${declare}-${i}`,
@@ -976,7 +1076,7 @@ class DocsTestSuite {
         payload: { id: `grp-${i}`, value: i, awaitMs: 25 }
       }));
       await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
-      return peak;
+      return declare ? held : peak;
     };
 
     const undeclared = await peakWith(false);
@@ -987,13 +1087,259 @@ class DocsTestSuite {
     if (undeclared <= 4) {
       throw new Error(`An undeclared group appears to constrain now (peak ${undeclared}) - docs need updating`);
     }
-    // Declared: bounded by the limit, allowing for documented optimistic overshoot
-    if (declared > 4) {
+    // Declared: the limit is a hard cap
+    if (declared !== 2) {
       throw new Error(`Declared group did not constrain: peak ${declared} for a limit of 2`);
     }
   }
 
   // Each key gets its own bucket, so N keys can run N x limit concurrently
+  // RECIPE: AGENTS.md section 5, "Per-key concurrency limits" - the snippet as
+  // published, then each claim in the list under it
+  private async docKeyedConcurrentLimit(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(4, {      // 4 at once PER DISK
+      id: 'disk',
+      keyFrom: (t: any) => t.payload.drive,
+      limitFor: drive => (drive === 'E:' ? 1 : 4)        // a slow USB disk
+    });
+    const scheduler = this.makeScheduler({ groups: ['disk'], maxThreads: 2, maxConcurrentTasks: 16 }, { disk });
+
+    // Per key, read from the group at every acquire
+    const peak = new Map<string, number>();
+    let total = 0;
+    scheduler.addEventListener('resource.acquired', (e: any) => {
+      const key = e.detail.key;
+      peak.set(key, Math.max(peak.get(key) ?? 0, disk.getKeyMetrics(key).running));
+      total = Math.max(total, disk.getMetrics().running);
+    });
+
+    const tasks = [];
+    for (const drive of ['C:', 'D:', 'E:']) {
+      for (let i = 0; i < 6; i++) {
+        tasks.push(new FyflowTask({
+          id: `copy-${drive}-${i}`, workerType: 'DocsWorker',
+          payload: { id: `copy-${drive}-${i}`, value: i, drive, awaitMs: 30 }
+        }));
+      }
+    }
+    await Promise.all(scheduler.addTasks(tasks, { createPromise: true }) as Promise<any>[]);
+
+    // A hard cap per key, at each key's own limit
+    if (peak.get('C:') !== 4 || peak.get('D:') !== 4) throw new Error(`C: and D: should peak at 4, got ${peak.get('C:')}, ${peak.get('D:')}`);
+    if (peak.get('E:') !== 1) throw new Error(`E: should peak at its limitFor of 1, got ${peak.get('E:')}`);
+    // Per key, not global: the disks ran side by side
+    if (total <= 4) throw new Error(`Only ${total} ran at once across three disks - keys are not independent`);
+    // Dropped as soon as nothing holds it
+    if (disk.getMetrics().activeKeys !== 0 || disk.getActiveKeys().length !== 0) {
+      throw new Error(`Keys left after the run: ${disk.getActiveKeys().join(',')}`);
+    }
+
+    // A task with no derivable key throws at addTask
+    let threw = '';
+    try { scheduler.addTask(new FyflowTask({ id: 'no-drive', workerType: 'DocsWorker', payload: { id: 'x', value: 1 } })); }
+    catch (e: any) { threw = e.message; }
+    if (!threw.includes('Missing limit key for group "disk"')) throw new Error(`Expected a missing-key throw, got "${threw}"`);
+
+    // Not usable in residentGroups
+    threw = '';
+    try {
+      new FyflowScheduler({ DocsWorker: new WorkerManager(this.workerUrl, { inline: true, residentGroups: { disk: 1 } }) }, { disk });
+    } catch (e: any) { threw = e.message; }
+    if (!threw.includes('is a keyed group')) throw new Error(`Expected residentGroups to reject it, got "${threw}"`);
+  }
+
+  // RECIPE: AGENTS.md section 5, "Several keys per task" - the snippet as
+  // published, with the claims under it: all or nothing, one unit per key
+  // held, duplicates collapsing, an empty list throwing, events per key
+  private async docSeveralKeysPerTask(): Promise<void> {
+    const disk = new KeyedConcurrentLimitGroup(2, {
+      id: 'disk',
+      keyFrom: (t: any) => [t.payload.from, t.payload.to]
+    });
+    const scheduler = this.makeScheduler({ groups: ['disk'], maxThreads: 1, maxConcurrentTasks: 16 }, { disk });
+    const copy = (id: string, from: string, to: string, awaitMs = 30) => new FyflowTask({
+      id, workerType: 'DocsWorker', payload: { id, value: 1, from, to, awaitMs }
+    });
+
+    // Warm the worker, so the tasks below wait on the group, not for a slot
+    await scheduler.addTask(copy('warm', 'W:', 'W:', 1), { createPromise: true });
+
+    const acquired: string[] = [];
+    let heldWhileWaiting = -1;
+    scheduler.addEventListener('resource.acquired', (e: any) => acquired.push(`${e.detail.holderId}:${e.detail.key}`));
+    scheduler.addEventListener('resource.blocked', (e: any) => {
+      if (e.detail.holderId === 'copy-1') heldWhileWaiting = disk.getKeyMetrics('D:').running;
+    });
+
+    // C: is full, so copy-1 waits - holding nothing on D:
+    const runs = [
+      scheduler.addTask(copy('c-a', 'C:', 'C:', 60), { createPromise: true }),
+      scheduler.addTask(copy('c-b', 'C:', 'C:', 60), { createPromise: true }),
+      scheduler.addTask(copy('copy-1', 'C:', 'D:'), { createPromise: true })
+    ] as Promise<any>[];
+    if (heldWhileWaiting !== 0) throw new Error(`copy-1 held ${heldWhileWaiting} of D: while it waited`);
+    if (disk.getKeyMetrics('D:').running !== 0) throw new Error('copy-1 holds D: while it waits on C:');
+    await Promise.all(runs);
+
+    // One unit per key: copy-1 acquired C: and D:, once each; C: -> C: once
+    const mine = acquired.filter(a => a.startsWith('copy-1:')).sort();
+    if (mine.join(',') !== 'copy-1:C:,copy-1:D:') throw new Error(`copy-1 acquired ${mine.join(',')}`);
+    if (acquired.filter(a => a.startsWith('c-a:')).length !== 1) throw new Error('C: -> C: was not one hold');
+    if (disk.getMetrics().activeKeys !== 0) throw new Error(`Keys left: ${disk.getActiveKeys()}`);
+
+    let threw = '';
+    try { scheduler.addTask(copy('nowhere', '', '')); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('Missing limit key for group "disk"')) throw new Error(`An empty list should throw, got "${threw}"`);
+  }
+
+  // RECIPE: AGENTS.md section 5, "Units with names" - both snippets, and the
+  // claims under them: an array at a cost of 1, lowest index first, distinct
+  // units, one worker per device seeing its card from the constructor on, a
+  // custom group's original back in onFinish
+  private async docUnitsWithNames(): Promise<void> {
+    const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+    if (new UnitGroup(2).units.join(',') !== '0,1') throw new Error('new UnitGroup(2) is not units 0 and 1');
+    const scheduler = this.makeScheduler({ groups: ['gpu'], maxThreads: 1, maxConcurrentTasks: 4 }, { gpu });
+    const run = (id: string, awaitMs = 20) => scheduler.addTask(new FyflowTask({
+      id, workerType: 'DocsWorker', payload: { id, value: 1, reportGrants: true, awaitMs }
+    }), { createPromise: true }) as Promise<any>;
+
+    const [a, b] = await Promise.all([run('a', 40), run('b', 40)]);
+    if (a.card !== 'gpu0' || b.card !== 'gpu1') throw new Error(`Lowest index first: a ran on ${a.card}, b on ${b.card}`);
+    if (!Array.isArray(a.grants.gpu) || a.grants.gpu.length !== 1) throw new Error(`Not an array of one: ${JSON.stringify(a.grants)}`);
+    if (!Object.isFrozen(a.grants)) throw new Error('context.grants is not frozen');
+
+    // Resident: one worker per device, each seeing its card from construction
+    const card = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+    const resident = this.makeScheduler({ maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: 1 } }, { gpu: card });
+    const rs = await Promise.all([0, 1, 2, 3].map(i => resident.addTask(new FyflowTask({
+      id: `r${i}`, workerType: 'DocsWorker', payload: { value: 1, reportGrants: true, awaitMs: 30 }
+    }), { createPromise: true }) as Promise<any>));
+    const cards = new Set(rs.map(r => r.worker?.gpu?.[0]));
+    if (cards.size !== 2 || !cards.has('gpu0') || !cards.has('gpu1')) throw new Error(`Workers held ${[...cards]}`);
+    if (!rs.every(r => r.grants.gpu?.[0] === r.worker.gpu[0])) throw new Error('A task did not see its worker\'s card');
+    await resident.shutdown();
+    if (card.getBusyUnits().length !== 0) throw new Error(`Units left busy after shutdown: ${card.getBusyUnits()}`);
+
+    // A custom group: what onStart returns is carried, and comes back as itself
+    const issued: object[] = [];
+    let sameBack = 0;
+    const seats = {
+      id: 'seat', type: 'seat', running: 0, grants: true,
+      canRun() { return true; },
+      onStart() { const g = { seat: issued.length }; issued.push(g); return g; },
+      onFinish(_k?: string, _c?: number, grant?: unknown) { if (issued.includes(grant as object)) sameBack++; },
+      getMetrics() { return { limit: 1, running: 0, available: 1, utilization: 0 }; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; }
+    };
+    const custom = this.makeScheduler({ groups: ['seat'] }, { seat: seats });
+    const r = await custom.addTask(new FyflowTask({
+      id: 'c', workerType: 'DocsWorker', payload: { value: 1, reportGrants: true }
+    }), { createPromise: true }) as any;
+    if ((r.grants.seat as any)?.seat !== 0) throw new Error(`The custom grant did not arrive: ${JSON.stringify(r.grants)}`);
+    if (sameBack !== 1) throw new Error('onFinish did not get the original grant back');
+
+    // Opt-in: without `grants: true` the return value is ignored - an async
+    // onStart's Promise too - and onFinish gets undefined
+    const backAsLegacy: unknown[] = [];
+    const legacy = {
+      id: 'legacy', type: 'legacy', running: 0,
+      canRun() { return true; },
+      async onStart() { /* returns a Promise */ },
+      onFinish(_k?: string, _c?: number, grant?: unknown) { backAsLegacy.push(grant); },
+      getMetrics() { return { limit: 1, running: 0, available: 1, utilization: 0 }; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; }
+    };
+    const plain = this.makeScheduler({ groups: ['legacy'] }, { legacy });
+    const l = await plain.addTask(new FyflowTask({
+      id: 'l', workerType: 'DocsWorker', payload: { value: 1, reportGrants: true }
+    }), { createPromise: true }) as any;
+    if ('legacy' in l.grants) throw new Error(`A group without grants: true granted ${JSON.stringify(l.grants)}`);
+    if (backAsLegacy.length !== 1 || backAsLegacy[0] !== undefined) throw new Error('onFinish got a grant from a group that does not grant');
+  }
+
+  // RECIPE: AGENTS.md section 5, "Asking for particular units" - the snippet
+  // and the claims under it: from pins, prefer never blocks, bad requests throw
+  // up front, a pinned waiter holds up nobody, the request on the waiter, and
+  // a pool's request with a cost
+  private async docUnitRequests(): Promise<void> {
+    const gpu = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu' });
+    const scheduler = this.makeScheduler({
+      groups: ['gpu'], maxThreads: 1, maxConcurrentTasks: 4
+    }, { gpu }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const run = (id: string, units: any, awaitMs = 20) => scheduler.addTask(new FyflowTask({
+      id, workerType: 'DocsWorker', payload: { id, value: 1, reportGrants: true, awaitMs }, units
+    }), { createPromise: true }) as Promise<any>;
+
+    // from pins; a busy pinned unit makes the task wait, not take another
+    const order: string[] = [];
+    scheduler.addEventListener('task.running', (e: any) => order.push(e.detail.id));
+    const blocked: any[] = [];
+    scheduler.addEventListener('resource.blocked', (e: any) => blocked.push(e.detail));
+    const first = run('p1', { gpu: { from: ['gpu1'] } }, 60);
+    const second = run('p2', { gpu: { from: ['gpu1'] } });
+    // A pinned waiter holds up nobody: an "any" task added behind it takes gpu0
+    const any = run('any', undefined);
+    await new Promise(r => setTimeout(r, 10));
+    const waiter = scheduler.getAdmissionQueue().gpu?.find((w: any) => w.holderId === 'p2');
+    if (JSON.stringify(waiter?.request) !== '{"from":["gpu1"]}') throw new Error(`The waiter's request: ${JSON.stringify(scheduler.getAdmissionQueue())}`);
+    if (waiter?.key !== undefined) throw new Error(`A set showed as a key: ${waiter?.key}`);
+    // Its queue is named, the same on the event, so a position reads within it
+    if (typeof waiter?.waitSet !== 'string') throw new Error(`The pinned waiter's queue is not named: ${JSON.stringify(waiter)}`);
+    if (blocked.find(d => d.holderId === 'p2')?.waitSet !== waiter.waitSet) throw new Error('resource.blocked names another queue');
+    const [r1, r2, ra] = await Promise.all([first, second, any]);
+    if (r1.card !== 'gpu1' || r2.card !== 'gpu1') throw new Error(`Pinned tasks ran on ${r1.card}, ${r2.card}`);
+    if (ra.card !== 'gpu0') throw new Error(`The "any" task ran on ${ra.card}`);
+    if (order.indexOf('any') > order.indexOf('p2')) throw new Error(`The pinned waiter held up "any": ${order}`);
+    if (!blocked.some(d => d.holderId === 'p2' && d.request?.from?.[0] === 'gpu1')) throw new Error('resource.blocked carried no request');
+
+    // prefer changes which unit, never whether
+    const hold = run('hold', { gpu: { from: ['gpu1'] } }, 60);
+    await new Promise(r => setTimeout(r, 10));
+    const pref = await run('pref', { gpu: { prefer: ['gpu1'] } });
+    if (pref.card !== 'gpu0') throw new Error(`A busy preferred unit should be skipped, ran on ${pref.card}`);
+    await hold;
+    const pref2 = await run('pref2', { gpu: { prefer: ['gpu1'] } });
+    if (pref2.card !== 'gpu1') throw new Error(`A free preferred unit should be taken, ran on ${pref2.card}`);
+
+    // Validated up front
+    let threw = '';
+    try { run('bad', { gpu: { from: ['gpu7'] } }); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('no unit "gpu7"')) throw new Error(`A unit the group lacks should throw at addTask, got "${threw}"`);
+    threw = '';
+    try { run('badp', { gpu: { prefer: ['gpu7'] } }); } catch (e: any) { threw = e.message; }
+    if (!threw.includes('no unit "gpu7"')) throw new Error(`prefer is validated too, got "${threw}"`);
+
+    // requestFrom: derived from the payload
+    const derived = new UnitGroup(['gpu0', 'gpu1'], { id: 'gpu', requestFrom: (t: any) => ({ from: [t.payload.card] }) });
+    const ds = this.makeScheduler({ groups: ['gpu'] }, { gpu: derived });
+    const d = await ds.addTask(new FyflowTask({
+      id: 'd', workerType: 'DocsWorker', payload: { value: 1, reportGrants: true, card: 'gpu1' }
+    }), { createPromise: true }) as any;
+    if (d.card !== 'gpu1') throw new Error(`requestFrom was not used: ran on ${d.card}`);
+
+    // A pool: the snippet's form, and a cost above its from throws
+    const cards = new UnitGroup(['gpu0', 'gpu1', 'gpu2'], { id: 'gpu' });
+    const pool = this.makeScheduler({
+      maxThreads: 2, maxConcurrentTasks: 1, residentGroups: { gpu: { cost: 1, from: ['gpu0', 'gpu1'] } }
+    }, { gpu: cards });
+    const rs = await Promise.all([0, 1, 2, 3].map(i => pool.addTask(new FyflowTask({
+      id: `r${i}`, workerType: 'DocsWorker', payload: { value: 1, reportGrants: true, awaitMs: 30 }
+    }), { createPromise: true }) as Promise<any>));
+    const held = new Set(rs.map(r => r.worker?.gpu?.[0]));
+    if (held.has('gpu2') || held.size === 0) throw new Error(`The pool held ${[...held]}`);
+    await pool.shutdown();
+    threw = '';
+    try {
+      this.makeScheduler({ residentGroups: { gpu: { cost: 3, from: ['gpu0', 'gpu1'] } } }, { gpu: new UnitGroup(['gpu0', 'gpu1', 'gpu2'], { id: 'gpu' }) });
+    } catch (e: any) { threw = e.message; }
+    if (!threw) throw new Error('A pool cost above its from should throw at construction');
+
+    // { cost: 2 } is 2 written as an object, for any group
+    const vram = this.makeScheduler({ residentGroups: { vram: { cost: 2 } } }, { vram: new ConcurrentLimitGroup(4, 'vram') });
+    await vram.addTask(new FyflowTask({ id: 'v', workerType: 'DocsWorker', payload: { value: 1 } }), { createPromise: true });
+  }
+
   private async docKeyedRateLimit(): Promise<void> {
     const api = new KeyedRateLimitGroup(
       [{ limit: 2, windowMs: 200 }],
@@ -1707,6 +2053,230 @@ class DocsTestSuite {
     await scheduler.cancel(holder.id);
     await this.waitFor(() => completed > 0, 2000, 'scheduler.completed');
     if (scheduler.stats.done !== 0 || scheduler.stats.cancelled !== 2) throw new Error(`Stats: ${JSON.stringify(scheduler.stats)}`);
+  }
+
+  // AGENTS.md section 4 (resident groups): a task that would need a new worker
+  // queues behind a waiting expensive pool even when its own cost fits
+  private async docResidentArrivalsQueue(): Promise<void> {
+    const vram = new ConcurrentLimitGroup(3, 'vram');
+    const pool = (cost: number) => new WorkerManager(this.workerUrl, {
+      maxThreads: 1, maxConcurrentTasks: 1, inline: true,
+      idleTimeout: 30, idleCheckIntervalMs: 10, residentGroups: { vram: cost }
+    });
+    const scheduler = new FyflowScheduler({ Small: pool(1), Big: pool(3), Cheap: pool(1) }, { vram });
+    this.schedulers.push(scheduler);
+    const task = (id: string, workerType: string, awaitMs: number) =>
+      new FyflowTask({ id, workerType, payload: { id, value: 1, awaitMs } });
+
+    const small = scheduler.addTask(task('small', 'Small', 80), { createPromise: true });
+    await this.waitFor(() => vram.running === 1, 2000, 'the small worker');
+    const big = scheduler.addTask(task('big', 'Big', 5), { createPromise: true });   // needs 3, 2 free
+    const cheap = scheduler.addTask(task('cheap', 'Cheap', 5), { createPromise: true }); // needs 1, and 1 would fit
+
+    const waiting = (scheduler.getAdmissionQueue('vram').vram ?? []).map(w => w.holderId);
+    if (waiting.join() !== 'big,cheap') throw new Error(`vram queue is [${waiting}], expected [big,cheap]`);
+    if (scheduler.tasks.get('cheap')?.state !== 'pending') throw new Error('cheap overtook the waiting big pool');
+
+    // The order workers are created in is the order the pools were admitted
+    const order: string[] = [];
+    scheduler.addEventListener('resource.acquired', (e: any) => {
+      if (e.detail.lifetime === 'resident') order.push(e.detail.workerType);
+    });
+    await Promise.all([small, big, cheap]);
+    if (order.join() !== 'Big,Cheap') throw new Error(`Workers created in order [${order}], expected [Big,Cheap]`);
+  }
+
+  // AGENTS.md section 4, resident groups: a task waiting for a new worker
+  // takes a slot its pool's existing worker frees, from behind another pool's
+  // head, and a pool allowed more workers than its units runs on those it has.
+  // idleTimeout 0 and the heartbeat off, so nothing else could start it.
+  private async docResidentWaiterTakesSlot(): Promise<void> {
+    const vram = new ConcurrentLimitGroup(1, 'vram');
+    const pool = (maxThreads: number) => new WorkerManager(this.workerUrl, {
+      maxThreads, maxConcurrentTasks: 1, inline: true, idleTimeout: 0, residentGroups: { vram: 1 }
+    });
+    const scheduler = new FyflowScheduler({ A: pool(2), B: pool(1) }, { vram }, { periodicRetryIntervalMs: 1_000_000_000 });
+    this.schedulers.push(scheduler);
+    const task = (id: string, workerType: string) => new FyflowTask({ id, workerType, payload: { id, value: 1, awaitMs: 20 } });
+
+    const a1 = scheduler.addTask(task('a1', 'A'), { createPromise: true });
+    scheduler.addTask(task('b1', 'B'));                                     // waits for a unit A's worker keeps
+    const a2 = scheduler.addTask(task('a2', 'A'), { createPromise: true }); // waits for a second A worker
+    const waiting = (scheduler.getAdmissionQueue('vram').vram ?? []).map(w => w.holderId);
+    if (waiting.join() !== 'b1,a2') throw new Error(`vram queue is [${waiting}], expected [b1,a2]`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('a2 never ran')), 1000); });
+    try { await Promise.race([Promise.all([a1, a2]), timeout]); } finally { clearTimeout(timer); }
+    if (this.poolThreads(scheduler, 'A') !== 1) throw new Error(`A has ${this.poolThreads(scheduler, 'A')} workers, expected 1`);
+  }
+
+  private poolThreads(scheduler: FyflowScheduler, type: string): number {
+    return (scheduler as any).workerPools[type].threads.length;
+  }
+
+  /** Resolves with `performance.now()` at a task's `task.running`. */
+  private startedAt(scheduler: FyflowScheduler, id: string): Promise<number> {
+    return new Promise(resolve => {
+      const listener = (e: any) => {
+        if (e.detail?.id !== id) return;
+        scheduler.removeEventListener('task.running', listener);
+        resolve(performance.now());
+      };
+      scheduler.addEventListener('task.running', listener);
+    });
+  }
+
+  /** Rejects if `promise` has not settled within `ms`. */
+  private async within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} within ${ms}ms`)), ms);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // AGENTS.md section 6, "How a blocked task wakes up": a waiter on a rate
+  // window starts when the window rolls over. The heartbeat is off, so
+  // nothing else could start it.
+  private async docRateWindowWakes(): Promise<void> {
+    const api = new RateLimitGroup([{ limit: 1, windowMs: 50 }], 'api');
+    const scheduler = this.makeScheduler({ groups: ['api'] }, { api }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1 } });
+    await scheduler.addTask(task('first'), { createPromise: true });
+    const freedBy = performance.now() + 50;
+    const second = this.startedAt(scheduler, 'second');
+    const done = scheduler.addTask(task('second'), { createPromise: true });
+    const at = await this.within(second, 1000, 'second never started');
+    if (at - freedBy > 25) throw new Error(`second started ${(at - freedBy).toFixed(0)}ms after its window freed`);
+    await done;
+  }
+
+  // AGENTS.md section 6: "with 1 per 50ms, the next task starts 50ms after
+  // the previous one finished, not after it started", and a task finishing
+  // after the scheduler asked costs one more timer, not a missed wake
+  private async docRateCountsFromFinish(): Promise<void> {
+    const api = new RateLimitGroup([{ limit: 1, windowMs: 50 }], 'api');
+    const scheduler = this.makeScheduler({ groups: ['api'] }, { api }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1, awaitMs: 20 } });
+    let firstFinished = 0;
+    const onFinish = api.onFinish.bind(api);
+    api.onFinish = () => { if (!firstFinished) firstFinished = performance.now(); onFinish(); };
+    const first = this.startedAt(scheduler, 'first');
+    const second = this.startedAt(scheduler, 'second');
+    const done = Promise.all([
+      scheduler.addTask(task('first'), { createPromise: true }),
+      scheduler.addTask(task('second'), { createPromise: true })
+    ]);
+    const at = await this.within(second, 1000, 'second never started');
+    await done;
+    if (at - (await first) < 50 + 15) throw new Error(`second started ${(at - (await first)).toFixed(0)}ms after the first started - counted from its start`);
+    if (at - firstFinished < 49) throw new Error(`second started ${(at - firstFinished).toFixed(0)}ms after the first finished`);
+    // Two timers' worth of slack: the one asked before the first finished, and the one after
+    if (at - firstFinished > 50 + 2 * 25) throw new Error(`second started ${(at - firstFinished).toFixed(0)}ms after the first finished`);
+  }
+
+  // AGENTS.md section 1 and section 6: raising a ConcurrentLimitGroup's limit
+  // starts the waiters that now fit, heartbeat off
+  private async docRaisedLimitWakes(): Promise<void> {
+    const gpu = new ConcurrentLimitGroup(1, 'gpu');
+    const scheduler = this.makeScheduler({ groups: ['gpu'] }, { gpu }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string, awaitMs: number) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1, awaitMs } });
+    const waiter = this.startedAt(scheduler, 'waiter');
+    const done = Promise.all([
+      scheduler.addTask(task('holder', 300), { createPromise: true }),
+      scheduler.addTask(task('waiter', 1), { createPromise: true })
+    ]);
+    await new Promise(r => setTimeout(r, 20));
+    const raised = performance.now();
+    gpu.limit = 2;
+    const at = await this.within(waiter, 250, 'waiter did not start before the holder finished');
+    if (at - raised > 25) throw new Error(`waiter started ${(at - raised).toFixed(0)}ms after the raise`);
+    await done;
+  }
+
+  // AGENTS.md section 6, the QuotaGroup snippet: a custom group names when
+  // its capacity comes back, and announces a top-up with slot-released.
+  // Heartbeat off: those are the only two things that can start a waiter.
+  private async docQuotaGroup(): Promise<void> {
+    class QuotaGroup extends EventTarget {
+      readonly id = 'quota';
+      readonly type = 'quota';
+      left = 1;
+      refillAt = Date.now() + 60;
+      canRun() {
+        if (Date.now() >= this.refillAt) { this.left = 1; this.refillAt = Infinity; }
+        return this.left > 0;
+      }
+      onStart() { this.left--; }
+      onFinish() {}
+      getMetrics() { return { limit: 1, running: 0, available: this.left, utilization: 0 }; }
+      nextCapacityAt(): number | undefined {
+        return this.left > 0 || !Number.isFinite(this.refillAt) ? undefined : this.refillAt;
+      }
+      topUp() {
+        this.left++;
+        this.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: this.id } }));
+      }
+    }
+    const quota = new QuotaGroup();
+    const scheduler = this.makeScheduler({ groups: ['quota'] }, { quota }, { periodicRetryIntervalMs: 1_000_000_000 });
+    const task = (id: string) => new FyflowTask({ id, workerType: 'DocsWorker', payload: { id, value: 1 } });
+    const refill = quota.refillAt;
+    const second = this.startedAt(scheduler, 'second');
+    const third = this.startedAt(scheduler, 'third');
+    const runs = ['first', 'second', 'third'].map(id => scheduler.addTask(task(id), { createPromise: true }));
+    // The second at the time the group named
+    await this.within(second, 1000, 'second never started');
+    if (Date.now() < refill) throw new Error('second started before the refill');
+    // The third only once topped up
+    await new Promise(r => setTimeout(r, 30));
+    if (scheduler.stats.running + scheduler.stats.done !== 2) throw new Error('third started with no quota');
+    const toppedUp = performance.now();
+    quota.topUp();
+    const at = await this.within(third, 250, 'third never started after the top-up');
+    if (at - toppedUp > 25) throw new Error(`third started ${(at - toppedUp).toFixed(0)}ms after the top-up`);
+    await Promise.all(runs);
+  }
+
+  // AGENTS.md section 6: a task waiting on two groups is listed once, under the
+  // group it is short of, and moves to the other group's queue with 'migrated'
+  // when the first frees - woken by the release, not the heartbeat
+  private async docTwoGroupMigrates(): Promise<void> {
+    const scheduler = this.makeScheduler({ maxThreads: 1, maxConcurrentTasks: 8 },
+      { A: new ConcurrentLimitGroup(1), B: new ConcurrentLimitGroup(1) },
+      { periodicRetryIntervalMs: 1_000_000_000 });
+    const moves: string[] = [];
+    scheduler.addEventListener('resource.unblocked', (e: any) => {
+      if (e.detail.holderId === 'both') moves.push(`${e.detail.groupId}:${e.detail.reason}`);
+    });
+    const task = (id: string, groups: string[], awaitMs: number) => new FyflowTask({
+      id, workerType: 'DocsWorker', workerGroups: groups, payload: { id, value: 1, awaitMs }
+    });
+    // Warm the worker first: arrivals while the first worker is still being
+    // created wait for it in the ready queue, not in a blocked queue
+    await scheduler.addTask(task('warm', [], 1), { createPromise: true });
+
+    const all = [
+      scheduler.addTask(task('holdA', ['A'], 40), { createPromise: true }),
+      scheduler.addTask(task('holdB', ['B'], 120), { createPromise: true }),
+      scheduler.addTask(task('both', ['A', 'B'], 5), { createPromise: true }),
+      scheduler.addTask(task('onlyA', ['A'], 5), { createPromise: true })
+    ];
+    const listed = () => {
+      const queue = scheduler.getAdmissionQueue();
+      return `A=[${(queue.A ?? []).map(w => w.holderId)}] B=[${(queue.B ?? []).map(w => w.holderId)}]`;
+    };
+    await this.waitFor(() => listed() === 'A=[both,onlyA] B=[]', 1000, `both waiters listed under A (${listed()})`);
+
+    // holdA finishes: 'both' still needs B, so it moves there; 'onlyA' runs
+    await this.waitFor(() => scheduler.tasks.get('onlyA')?.state !== 'pending', 1000, 'onlyA to be admitted');
+    if (listed() !== 'A=[] B=[both]') throw new Error(`After A freed: ${listed()}`);
+
+    await Promise.all(all);
+    if (moves.join() !== 'A:migrated,B:admitted') throw new Error(`Moves of 'both': ${moves}`);
   }
 
   /** An HTTP server that takes requests and never answers them. */
