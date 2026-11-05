@@ -442,9 +442,38 @@ does the same. Fixed after R2: the scheduler dispatches on
   accessor that emits `slot-released` when raised.
 - The known gap "a rate window rolling over admits without polling" closed.
 
+### From the review of the R3 branch
+
+Seven findings, all real, each now with a test:
+
+- **A delay past setTimeout's maximum** (2^31 - 1 ms, a window over 24.8
+  days) overflowed to 1 ms, so the timer fired every millisecond until the
+  window freed. Capped; the early fire finds nothing due and re-arms.
+- **A group emitting `slot-released` from `canRun`** woke its own queue from
+  inside each wake: a microtask chain that starved the event loop. Events
+  from a group are ignored while the scheduler is waking that group's queues.
+- **A paused window** (`limit: 0`) made `windowFreesAt` read past both
+  lists and throw. It names no time now.
+- **An unkeyed group's event naming a key** woke a queue that does not
+  exist. The key counts only for a keyed group.
+- **The own-release guard was global**: a limit raised on group B from inside
+  group A's `onFinish` was dropped. It is per group now.
+- **The push did not count as a refusal**, so a window freeing between
+  `canRun` and `nextCapacityAt` stranded the waiter. It does now - and "room
+  now" after a refusal counts as due only if `canRun` agrees, so a custom
+  group answering undefined because only a release can free it is not
+  polled. That also tightens the wake path's skew rule.
+- `_armTimeWake` had two stacked JSDoc blocks, the first claiming one ask
+  per queue. Merged and corrected.
+
 ### Mutation checks
 
-Nineteen, each caught by an assertion in the test named for it: no arm on
+Twenty-six, each caught by an assertion in the test named for it. The
+seven from the review: an uncapped timer (8 fires in 100ms for a time 30
+days off), no guard while waking (canRun called 1000 times), no paused
+guard (a TypeError), the key from an unkeyed group, a global release guard,
+the push not counted as a refusal, and no `canRun` confirmation (a
+release-only group polled 5 times). The first nineteen: no arm on
 a push (a waiter arriving after its holder finished never starts), trusting
 "room" after a wake refused (a clock stepping back strands the waiter),
 no re-arm after a wake, asking while a time is pending (asked 5 times over 4

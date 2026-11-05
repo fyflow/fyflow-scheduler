@@ -224,6 +224,13 @@ class AdmissionTestSuite {
     await this.run('Time Wakes: Cancelling The Last Waiter Leaves No Timer', () => this.testTimeWakeCleared('cancel'));
     await this.run('Time Wakes: Shutdown Leaves No Timer', () => this.testTimeWakeCleared('shutdown'));
     await this.run('nextCapacityAt: When canRun Next Says Yes', () => this.testNextCapacityAt());
+    await this.run('nextCapacityAt: A Paused Window Names No Time', () => this.testPausedWindow());
+    await this.run('Time Wakes: A Window Longer Than A Timer Can Wait Does Not Spin', () => this.testWindowPastTimerMax());
+    await this.run('Time Wakes: A Group Answering Undefined That Still Refuses Is Not Polled', () => this.testReleaseOnlyNotPolled());
+    await this.run('Time Wakes: A Waiter Refused As Its Window Frees Is Woken', () => this.testRefusedAtPush());
+    await this.run('Time Wakes: A Group Emitting slot-released From canRun Does Not Starve The Loop', () => this.testChattyCanRun());
+    await this.run('Wake: An Unkeyed Group\'s slot-released Naming A Key Admits Its Waiters', () => this.testUnkeyedEventWithKey());
+    await this.run('Wake: A Limit Raised From Inside Another Group\'s Release Admits Its Waiters', () => this.testRaisedInsideRelease());
 
     // R1: blocked queues exist only while they hold a waiter
     await this.run('Empty Blocked Queues Are Deleted', () => this.testQueuesDeleted());
@@ -1072,6 +1079,182 @@ class AdmissionTestSuite {
     } finally {
       Date.now = realNow;
     }
+  }
+
+  /** A window with a limit of 0 admits nothing, so no time frees it. */
+  private async testPausedWindow() {
+    const paused = new RateLimitGroup([{ limit: 0, windowMs: 1000 }], 'paused');
+    if (paused.canRun()) throw new Error('a limit of 0 admitted a task');
+    const at = paused.nextCapacityAt();
+    if (at !== undefined) throw new Error(`a paused window named ${at}`);
+    const both = new RateLimitGroup([{ limit: 5, windowMs: 1000 }, { limit: 0, windowMs: 60_000 }], 'both');
+    if (both.nextCapacityAt() !== undefined) throw new Error('a paused window among others named a time');
+  }
+
+  /**
+   * A time further off than setTimeout can wait - a window over 24.8 days -
+   * sets the timer for its maximum, rather than overflowing to a timer that
+   * fires every millisecond.
+   */
+  private async testWindowPastTimerMax() {
+    const rate = new RateLimitGroup([{ limit: 1, windowMs: 30 * 86_400_000 }], 'rate');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const internals = s as any;
+    let fires = 0;
+    const onTimeWake = internals._onTimeWake.bind(s);
+    internals._onTimeWake = () => { fires++; onTimeWake(); };
+    await s.addTask(this.task('first', {}, 1), { createPromise: true });
+    const waiter = (s.addTask(this.task('waiter', {}, 1), { createPromise: true }) as Promise<any>).catch(() => 'cancelled');
+    await new Promise(r => setTimeout(r, 100));
+    if (internals.timeWakes.size !== 1) throw new Error(`${internals.timeWakes.size} times pending - the test proves nothing`);
+    await s.cancel('waiter');
+    await waiter;
+    if (fires > 0) throw new Error(`the timer fired ${fires} times in 100ms for a time 30 days off`);
+  }
+
+  /**
+   * A group that names no time yet still refuses - one only a release can
+   * free - is left to that release. Taken for a time already due, it would
+   * be woken again and again for nothing.
+   */
+  private async testReleaseOnlyNotPolled() {
+    const group = new ExternalCapacityGroup('ext', false);
+    let asks = 0;
+    group.nextCapacityAt = () => { asks++; return undefined; };
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['ext'] }) }, { ext: group }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const internals = s as any;
+    let fires = 0;
+    const onTimeWake = internals._onTimeWake.bind(s);
+    internals._onTimeWake = () => { fires++; onTimeWake(); };
+    const start = this.started(s, 'waiter');
+    const done = s.addTask(this.task('waiter', {}, 1), { createPromise: true });
+    await new Promise(r => setTimeout(r, 100));
+    if (asks === 0) throw new Error('nextCapacityAt was never asked - the test proves nothing');
+    if (fires > 0 || internals.timeWakes.size > 0) {
+      throw new Error(`a release-only group was polled: ${fires} fires, ${internals.timeWakes.size} pending`);
+    }
+    const grantedAt = performance.now();
+    group.grant();
+    this.assertPrompt('waiter', grantedAt, await this.startsWithin(start, 'waiter'));
+    await done;
+  }
+
+  /**
+   * The clock ticks between the refusal and the question: refused as the
+   * window's last millisecond passes, asked a moment later, when there is
+   * room and so no time to name. The waiter is woken all the same.
+   */
+  private async testRefusedAtPush() {
+    const WINDOW = 30;
+    const rate = new RateLimitGroup([{ limit: 1, windowMs: WINDOW }], 'rate');
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['rate'] }) }, { rate }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const realNow = Date.now;
+    let skewNext = false;
+    let skewed = 0;
+    const canRun = rate.canRun.bind(rate);
+    rate.canRun = (...args: any[]) => {
+      if (!skewNext) return (canRun as any)(...args);
+      skewNext = false;
+      skewed++;
+      // Read a moment before the window freed
+      const now = realNow();
+      Date.now = () => now - WINDOW;
+      try { return (canRun as any)(...args); } finally { Date.now = realNow; }
+    };
+    try {
+      await s.addTask(this.task('first', {}, 1), { createPromise: true });
+      await new Promise(r => setTimeout(r, WINDOW + 10));
+      skewNext = true;
+      const start = this.started(s, 'waiter');
+      const addedAt = performance.now();
+      const done = s.addTask(this.task('waiter', {}, 1), { createPromise: true });
+      this.assertPrompt('waiter', addedAt, await this.startsWithin(start, 'waiter'), 2 * WAKE_BOUND_MS);
+      await done;
+      if (skewed === 0) throw new Error('no refusal met a skewed clock - the test proves nothing');
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
+  /**
+   * A group that emits slot-released from canRun, room or not. Honoured from
+   * inside the wake that called canRun, each wake would queue the next, a
+   * chain of microtasks no timer or settle could get between.
+   */
+  private async testChattyCanRun() {
+    const LIMIT = 1000;
+    class Chatty extends EventTarget {
+      readonly id = 'chatty';
+      readonly type = 'test-chatty';
+      calls = 0;
+      open = false;
+      canRun(): boolean {
+        // Stops on its own, so a regression fails the test rather than hangs it
+        if (++this.calls < LIMIT) this.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: this.id } }));
+        return this.open;
+      }
+      onStart(): void {}
+      onFinish(): void {}
+      getMetrics() { return { limit: 1, running: 0, available: 0, utilization: 0 }; }
+    }
+    const chatty = new Chatty();
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['chatty'] }) }, { chatty }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const start = this.started(s, 'waiter');
+    const done = s.addTask(this.task('waiter', {}, 1), { createPromise: true });
+    await new Promise(r => setTimeout(r, 20));
+    if (chatty.calls >= LIMIT) throw new Error(`canRun called ${chatty.calls} times - a wake chain from its own events`);
+    if (chatty.calls > 20) throw new Error(`canRun called ${chatty.calls} times for one waiter`);
+    chatty.open = true;
+    const openedAt = performance.now();
+    chatty.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: 'chatty' } }));
+    this.assertPrompt('waiter', openedAt, await this.startsWithin(start, 'waiter'));
+    await done;
+  }
+
+  /**
+   * An unkeyed group keeps its waiters under no key, so a key in its
+   * slot-released detail is ignored rather than naming a queue that does not
+   * exist.
+   */
+  private async testUnkeyedEventWithKey() {
+    const group = new ExternalCapacityGroup('ext', false);
+    const s = this.track(new FyflowScheduler({ W: this.pool({ groups: ['ext'] }) }, { ext: group }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const start = this.started(s, 'waiter');
+    const done = s.addTask(this.task('waiter', { limitKey: 'x' }, 1), { createPromise: true });
+    await new Promise(r => setTimeout(r, 10));
+    if (s.stats.running !== 0) throw new Error('the waiter started with no capacity');
+    group.free = 1;
+    const grantedAt = performance.now();
+    group.dispatchEvent(new CustomEvent('slot-released', { detail: { groupId: 'ext', key: 'x' } }));
+    this.assertPrompt('waiter', grantedAt, await this.startsWithin(start, 'waiter'));
+    await done;
+  }
+
+  /**
+   * Only the group being released is ignored. A limit raised on another
+   * group from inside that release - by a group's onFinish, or a listener on
+   * it - wakes that group's waiters.
+   */
+  private async testRaisedInsideRelease() {
+    const b = new ConcurrentLimitGroup(1, 'b');
+    class RaisesB extends ConcurrentLimitGroup {
+      override onFinish(...args: Parameters<ConcurrentLimitGroup['onFinish']>) {
+        super.onFinish(...args);
+        b.limit = 2;
+      }
+    }
+    const a = new RaisesB(1, 'a');
+    const s = this.track(new FyflowScheduler({ W: this.pool() }, { a, b }, { periodicRetryIntervalMs: HEARTBEAT_OFF }));
+    const holder = s.addTask(this.task('holder', { workerGroups: ['b'] }, 400), { createPromise: true });
+    await new Promise(r => setTimeout(r, 10));
+    const start = this.started(s, 'waiter');
+    const waiter = s.addTask(this.task('waiter', { workerGroups: ['b'] }, 1), { createPromise: true });
+    await new Promise(r => setTimeout(r, 10));
+    if (s.stats.running !== 1) throw new Error(`${s.stats.running} running - the waiter should be waiting for b`);
+    await s.addTask(this.task('raiser', { workerGroups: ['a'] }, 1), { createPromise: true });
+    const raisedAt = performance.now();
+    this.assertPrompt('waiter', raisedAt, await this.startsWithin(start, 'waiter', 300));
+    await Promise.all([waiter, holder]);
   }
 
   /** Cancelling the last waiter, or shutting down, leaves no timer behind. */

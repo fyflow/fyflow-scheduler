@@ -217,7 +217,9 @@ export interface ResourceGroup extends EventTarget {
    * timer for every group and key together, at the earliest time asked for.
    * A time that is not a finite number is ignored, and the heartbeat covers
    * that queue. A time already due wakes it at once; repeated with nobody
-   * admitted, it backs off, doubling up to `periodicRetryIntervalMs`. A
+   * admitted, it backs off, doubling up to `periodicRetryIntervalMs`.
+   * Undefined just after a refusal counts as due only if `canRun` then
+   * agrees there is room. A
    * group whose capacity can come back sooner than it said should emit
    * `slot-released`. Looked up when the scheduler is constructed.
    */
@@ -225,8 +227,9 @@ export interface ResourceGroup extends EventTarget {
 
   // Events emitted by all groups:
   // - 'slot-released': When resource becomes available. The scheduler wakes
-  //   that group's waiters - those of `detail.key`, if it names one - a
-  //   microtask later. Emitted from inside the scheduler's own release it
-  //   changes nothing, since that release wakes them already.
+  //   that group's waiters - for a keyed group, those of `detail.key`, if it
+  //   names one - a microtask later. Emitted from inside the scheduler's own
+  //   release of the group, or while it is waking the group's waiters, it
+  //   changes nothing, since that release or wake covers them already.
   // - 'capacity-exhausted': When limit reached
 }

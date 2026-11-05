@@ -30,6 +30,8 @@ type Hold = { id: string; group: any; key: string | undefined; request?: unknown
 
 /** A pending wake of every wait set of one group, rather than of one queue. */
 const SWEEP_PREFIX = '\u0001';
+/** The longest delay setTimeout takes: 2^31 - 1 ms, about 24.8 days. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * A unit of work handed to a worker pool.
@@ -389,11 +391,14 @@ export class FyflowTask {
     private timeWakeGroups = false;
 
     /**
-     * Inside the scheduler's own release of a task's groups. A
-     * `slot-released` the group emits from there is ignored: the release
-     * wakes those waiters itself, in the same turn.
+     * Groups inside the scheduler's own release of them. A `slot-released`
+     * such a group emits from there is ignored: the release wakes its waiters
+     * itself, in the same turn. Per group, so another group changed from
+     * inside that call - a limit raised from a listener - still wakes its own.
      */
-    private releasing = 0;
+    private releasingGroups = new Set<unknown>();
+    /** The queue the wake loop is waking now, while `waking`. */
+    private wakingQueue = '';
     /** Group wakes due in a microtask, by `groupId` or queue id. */
     private groupWakes = new Map<string, { groupId: string; key?: string }>();
     /**
@@ -538,7 +543,8 @@ export class FyflowTask {
         ?? entries.find(({ group, cost, request }) => !group.canRun(undefined, cost, request))
         ?? entries[0];
       const queueId = this._blockedQueueId(short.id, FyflowScheduler._waitSetOf(short.group, short.request));
-      const queue = this._blockedQueue(queueId);
+      // Refused by that group, unless it is waiting behind a resident queue
+      const queue = this._blockedQueue(queueId, !fits);
       // It has left the ready queue: count it out of `queued` before
       // resource.blocked fires, so a listener sees consistent stats
       this.stats.queued = Math.max(0, this.stats.queued - 1);
@@ -856,7 +862,7 @@ export class FyflowTask {
     private blockedInUse = new Map<string, number>();
 
     /** The queue for `queueId`, created and indexed if it does not exist. */
-    private _blockedQueue(queueId: string): TaskQueue<FyflowTask> {
+    private _blockedQueue(queueId: string, refused = false): TaskQueue<FyflowTask> {
       let queue = this.blockedQueues.get(queueId);
       if (!queue) {
         queue = this._newBlockedQueue();
@@ -873,7 +879,7 @@ export class FyflowTask {
       // every push, not only when the queue is created - a queue whose last
       // wake left it with no time pending can be joined later, by a waiter
       // refused on its way out of the ready queue, and nothing would wake it
-      if (this.timeWakeGroups) this._armTimeWake(queueId);
+      if (this.timeWakeGroups) this._armTimeWake(queueId, refused);
       return queue;
     }
 
@@ -1175,7 +1181,7 @@ export class FyflowTask {
           // Blocked on this group - and on this key, when the group is keyed,
           // or in the queue of its candidate set, for a group that has them
           const queueId = this._blockedQueueId(id, key ?? FyflowScheduler._waitSetOf(group, request));
-          const blockedQueue = this._blockedQueue(queueId);
+          const blockedQueue = this._blockedQueue(queueId, true);
           // It has left the ready queue: count it out of `queued` before
           // resource.blocked fires, so a listener sees consistent stats
           this.stats.queued = Math.max(0, this.stats.queued - 1);
@@ -1442,13 +1448,14 @@ export class FyflowTask {
         // The original, as onStart returned it: a group may rely on identity
         const grant = grants?.get(FyflowScheduler._holdId(id, key));
         // Counted as ours, so a slot-released the group emits from here wakes
-        // nothing twice. Only the group's own call: a resource.released
-        // listener changing some other group is outside this release
-        this.releasing++;
+        // nothing twice. Only this group: another one changed from inside
+        // the call is outside this release, and wakes its own waiters
+        const nested = this.releasingGroups.has(group);
+        this.releasingGroups.add(group);
         try {
           group.onFinish(key, 1, grant?.raw);
         } finally {
-          this.releasing--;
+          if (!nested) this.releasingGroups.delete(group);
         }
         if (this._resourceObserved) {
           this._emitResource('resource.released', group, {
@@ -1867,6 +1874,7 @@ export class FyflowTask {
         while (this.wakePending.size > 0) {
           const next: string = this.wakePending.values().next().value!;
           this.wakePending.delete(next);
+          this.wakingQueue = next;
           if (next.startsWith(SWEEP_PREFIX)) this._sweepWaitSets(next.slice(SWEEP_PREFIX.length));
           else this._wakeQueue(next);
         }
@@ -2153,7 +2161,7 @@ export class FyflowTask {
       const toQueueId = this._blockedQueueId(to.id, toKey ?? FyflowScheduler._waitSetOf(to.group, to.request));
       if (from.at(0) === task) from.shift();
       else from.remove(task);
-      const target = this._blockedQueue(toQueueId);
+      const target = this._blockedQueue(toQueueId, true);
       target.push(task);
       task._blockedSeq = ++this.blockedSeq;
       if (toResident) this._noteResidentWait(task);
@@ -2586,18 +2594,32 @@ export class FyflowTask {
      *
      * The scheduler's own releases wake directly, and a `slot-released` from
      * inside one is ignored, so the hot path pays one listener call and a
-     * comparison. Wakes requested in one turn are deduplicated, so a burst
-     * of events is one wake per queue.
+     * lookup. So is one a group emits while the scheduler is waking that
+     * group's waiters - from `canRun`, say: that wake is asking the group
+     * already, and honoured, a group emitting on every `canRun` would wake
+     * its queue from inside each wake, a microtask chain that never yields.
+     * Wakes requested in one turn are deduplicated, so a burst of events is
+     * one wake per queue.
+     *
+     * `detail.key` counts only for a keyed group. Any other group keeps its
+     * waiters under no key, so a key would name a queue that does not exist.
      */
     _setupGroupEventListeners() {
       for (const [groupId, group] of Object.entries(this.groups)) {
         if (typeof (group as any)?.addEventListener !== 'function') continue;
         this._addInternalListener(group, 'slot-released', (e: Event) => {
-          if (this.releasing > 0 || this.shutDown) return;
-          const key = (e as CustomEvent).detail?.key;
+          if (this.shutDown || this.releasingGroups.has(group)) return;
+          if (this.waking && this._groupOfQueue(this.wakingQueue) === groupId) return;
+          const key = group.keyed ? (e as CustomEvent).detail?.key : undefined;
           this._queueGroupWake(groupId, typeof key === 'string' && key !== '' ? key : undefined);
         });
       }
+    }
+
+    /** The group a blocked queue id, or a sweep id, belongs to. */
+    private _groupOfQueue(queueId: string): string {
+      if (queueId.startsWith(SWEEP_PREFIX)) return queueId.slice(SWEEP_PREFIX.length);
+      return this._splitQueueId(queueId).groupId;
     }
 
     /**
@@ -2632,18 +2654,21 @@ export class FyflowTask {
     /**
      * Ask `queueId`'s group when it has room again, and wake the queue then.
      *
-     * Asked once per wait: when the queue is created, and when a wake leaves
-     * waiters in it with no time pending. Not again while one is pending - a
-     * rate window's time only moves later as tasks start and finish, and a
-     * release wakes the queue anyway. So it costs one `nextCapacityAt` per
-     * queue per window, not per waiter or per event.
-     */
-    /**
-     * @param refused the wake that just ran admitted nobody. If the group
-     *   then says it has room, the two answers disagree - `Date.now()` is not
-     *   monotonic, and on Windows a timer firing at 219 met a `canRun` that
-     *   read 218 - and with no time pending nothing would wake the queue
-     *   again. That is treated as a time already due.
+     * Asked when a waiter joins the queue, and when a wake leaves waiters in
+     * it - in both cases only while no time is pending. Not again while one
+     * is - a rate window's time only moves later as tasks start and finish,
+     * and a release wakes the queue anyway. So it costs one `nextCapacityAt`
+     * per queue per window, not per waiter or per event.
+     *
+     * @param refused the group has just refused this queue's waiter - at the
+     *   push, or in a wake that admitted nobody. If the group then says it
+     *   has room, the two answers disagree - `Date.now()` is not monotonic,
+     *   on Windows a timer firing at 219 met a `canRun` that read 218, and a
+     *   window's last millisecond can pass between the two calls - and with
+     *   no time pending nothing would wake the queue again. When `canRun`
+     *   agrees there is room now, that is treated as a time already due.
+     *   When it still refuses, only a release can make room, and the queue
+     *   is left to it.
      */
     private _armTimeWake(queueId: string, refused = false): void {
       if (!this.timeWakeGroups || this.shutDown || this.timeWakes.has(queueId)) return;
@@ -2663,8 +2688,8 @@ export class FyflowTask {
         }
         return;
       }
-      // Room now, yet the wake just before refused: try again shortly
-      if (at === undefined && refused) at = Date.now();
+      // Room now, yet the group refused just before: try again shortly
+      if (at === undefined && refused && group.canRun(key, 1)) at = Date.now();
       if (typeof at !== 'number' || !Number.isFinite(at)) return;
       let wakeAt: number = at;
       // A time already due is real at a millisecond boundary - refused at t,
@@ -2690,7 +2715,10 @@ export class FyflowTask {
       if (this.timeWakeTimer !== null && this.timeWakeTimerAt <= at) return;
       if (this.timeWakeTimer !== null) clearTimeout(this.timeWakeTimer);
       this.timeWakeTimerAt = at;
-      this.timeWakeTimer = setTimeout(() => this._onTimeWake(), Math.max(1, at - Date.now()));
+      // Capped: a longer delay overflows, and runtimes fire it after 1 ms -
+      // a month-long window would wake every millisecond. Capped, the fire
+      // finds nothing due and sets the timer again
+      this.timeWakeTimer = setTimeout(() => this._onTimeWake(), Math.min(MAX_TIMER_MS, Math.max(1, at - Date.now())));
     }
 
     /**

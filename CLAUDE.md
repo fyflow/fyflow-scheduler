@@ -124,7 +124,7 @@ first. Run `deno install` (or `pnpm install`) before it in a fresh checkout.
 
 ## Testing
 
-Eleven suites, 320 tests, all in the default `deno task test` run:
+Eleven suites, 327 tests, all in the default `deno task test` run:
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -138,7 +138,7 @@ Eleven suites, 320 tests, all in the default `deno task test` run:
 | grants | 25 | what a group's `onStart` returns, in `context.grants` and `workerContext.grants`: `UnitGroup`, resident units from the constructor on, retries and restarts granted afresh, custom and keyed grants, opt-in grants, uncloneable grants, the forced stop, re-entry while a worker is created; requests for particular units, per-set queues, FIFO across sets, resident requests |
 | cancellation | 34 | `cancel()` in every place a task can be, the signal, the forced stop, counters, cancelling 50K tasks |
 | docs | 55 | **executes every snippet in README.md and AGENTS.md** |
-| admission | 59 | wake paths with the heartbeat off (including a worker becoming ready, and a free slot for a task waiting on a new worker), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task, unit requests, a group throwing at dispatch; time-based wakes (rate windows, `slot-released`, a raised limit) and what they cost the main loop |
+| admission | 66 | wake paths with the heartbeat off (including a worker becoming ready, and a free slot for a task waiting on a new worker), threaded bursts, migration, resident head-of-line, admission cost per task, blocked-queue lifetime, fold invariants under mixed contention, re-entry from `resource.acquired`, several keys per task, unit requests, a group throwing at dispatch; time-based wakes (rate windows, `slot-released`, a raised limit) and what they cost the main loop |
 
 `deno task test:scripts` is separate and not included in `deno task test`. It
 unit-tests `scripts/` and the known-gap rules in `tests/harness.ts`.

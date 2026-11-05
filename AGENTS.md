@@ -1202,8 +1202,10 @@ Two mechanisms, and knowing which applies explains the latency you see:
   closely as the runtime's timers allow, not on the next heartbeat. Timers
   on Windows can run 10-15ms late.
 - **When a group says so.** A group emitting `slot-released` has its waiters
-  woken a microtask later - those of `detail.key`, if it names one.
-  `ConcurrentLimitGroup` emits it when you **raise** its `limit`.
+  woken a microtask later - for a keyed group, those of `detail.key`, if it
+  names one. An unkeyed group's waiters are all woken, whatever the detail
+  says. `ConcurrentLimitGroup` emits it when you **raise** its `limit`, even
+  from inside another group's release.
 - **On the heartbeat**, every `periodicRetryIntervalMs` (default 50ms), for
   anything none of these covers: a custom group whose capacity changes
   without saying so. Also one deliberate case: a pool at the head of a
@@ -1227,10 +1229,12 @@ ignored, and that queue falls back to the heartbeat. A time already due is
 woken at once - it is real at a millisecond boundary, or when an arrival
 took the room first - but again and again with no waiter admitted, each
 repeat waits twice as long, up to `periodicRetryIntervalMs`. The same goes
-for a group that refuses a wake and then says it has room: `Date.now()` can
-step back a millisecond, and the two answers can come from either side of
-it. With no group
-that names a time, none of this runs.
+for a group that refuses a waiter and then says it has room, provided
+`canRun` agrees: `Date.now()` can step back a millisecond, or a window's
+last millisecond pass between the two calls. A group that names no time and
+still refuses is left to its release, and is not polled. A time further off
+than a timer can wait - a window over about 24.8 days - is waited for in
+24.8-day steps. With no group that names a time, none of this runs.
 
 A custom group whose capacity comes back by itself can take part:
 
@@ -1256,9 +1260,12 @@ class QuotaGroup extends EventTarget {
   should emit `slot-released` when it does
 - If it throws, the scheduler warns once per group and leaves that group to
   the heartbeat. It is a hint, so no task fails over it
-- A `slot-released` emitted from inside the scheduler's own release - the
-  library's groups emit one from `onFinish` - wakes nothing twice: that
-  release has woken those waiters already
+- A `slot-released` emitted from inside the scheduler's own release of that
+  group - the library's groups emit one from `onFinish` - wakes nothing
+  twice: that release has woken those waiters already. So is one emitted
+  while the scheduler is waking that group's waiters, from `canRun`, say:
+  that wake is asking the group already. Emit it when room comes back from
+  outside, not on every check
 
 A release admits only what it freed. One finished task admits one waiter, and a
 weighted release admits as many as now fit. The cost of a release does not

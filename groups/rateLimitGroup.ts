@@ -300,6 +300,8 @@ export function windowFreesAt(
   windowMs: number,
   now: number
 ): number | undefined {
+  // A limit of 0 or less admits nothing, whatever falls out: no time frees it
+  if (!(limit > 0)) return undefined;
   const stamp = (entry: number | readonly [number, number]) => typeof entry === 'number' ? entry : entry[0];
   const windowStart = now - windowMs;
   // Both lists are oldest first, so what has fallen out is a prefix of each
